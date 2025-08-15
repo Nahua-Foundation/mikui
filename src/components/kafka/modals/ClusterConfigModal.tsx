@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Button } from '../../ui/button';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
 import { KafkaCluster } from '../types';
+import { invoke } from '@tauri-apps/api/core';
 
 interface ClusterConfigModalProps {
   open: boolean;
@@ -16,6 +17,7 @@ interface ClusterConfigModalProps {
   mode: 'create' | 'edit';
   onBack?: () => void;
   onSave?: (cluster: Partial<KafkaCluster>) => void;
+  onConnected?: (topics: string[]) => void;
 }
 
 export function ClusterConfigModal({ 
@@ -24,7 +26,8 @@ export function ClusterConfigModal({
   cluster, 
   mode,
   onBack,
-  onSave 
+  onSave,
+  onConnected,
 }: ClusterConfigModalProps) {
   const [name, setName] = useState<string>('');
   const [brokers, setBrokers] = useState<string>('localhost:9092');
@@ -36,6 +39,9 @@ export function ClusterConfigModal({
   const [truststorePath, setTruststorePath] = useState<string>('');
   const [truststorePassword, setTruststorePassword] = useState<string>('');
   const [saslMechanism, setSaslMechanism] = useState<string>('PLAIN');
+
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [isTesting, setIsTesting] = useState<boolean>(false);
 
   // Load cluster data when editing
   useEffect(() => {
@@ -65,26 +71,66 @@ export function ClusterConfigModal({
     }
   }, [cluster, mode, open]);
 
-  const handleConnect = () => {
-    const clusterData: Partial<KafkaCluster> = {
+  const handleConnect = async () => {
+    const clusterData = {
       name,
       brokers,
-      securityProtocol,
-      saslMechanism: isSASLRequired ? saslMechanism : undefined,
+      security_protocol: securityProtocol,
+      sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
-      keystorePath: isSSLRequired ? keystorePath : undefined,
-      keystorePassword: isSSLRequired ? keystorePassword : undefined,
-      truststorePath: isSSLRequired ? truststorePath : undefined,
-      truststorePassword: isSSLRequired ? truststorePassword : undefined,
+      keystore_path: isSSLRequired ? keystorePath : undefined,
+      keystore_password: isSSLRequired ? keystorePassword : undefined,
+      truststore_path: isSSLRequired ? truststorePath : undefined,
+      truststore_password: isSSLRequired ? truststorePassword : undefined,
     };
 
-    toast.success('Connected to Kafka cluster');
-    onOpenChange(false);
+    try {
+      setIsConnecting(true);
+      await invoke('cluster_connect', { payload: clusterData });
+      // After successful connect, fetch topics from backend
+      try {
+        const topics = await invoke<string[]>('get_topics');
+        if (onConnected) {
+          onConnected(topics);
+        }
+      } catch (err) {
+        console.error('Failed to fetch topics after connect', err);
+      }
+      toast.success('Connected to Kafka cluster');
+      onOpenChange(false);
+    } catch (e) {
+      console.error(e);
+      toast.error('Failed to connect to Kafka cluster');
+    } finally {
+      setIsConnecting(false);
+    }
   };
 
-  const handleTestConnection = () => {
-    toast.success('Connection test successful');
+  const handleTestConnection = async () => {
+    const clusterData = {
+      name,
+      brokers,
+      security_protocol: securityProtocol,
+      sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
+      username: isSASLRequired ? username : undefined,
+      password: isSASLRequired ? password : undefined,
+      keystore_path: isSSLRequired ? keystorePath : undefined,
+      keystore_password: isSSLRequired ? keystorePassword : undefined,
+      truststore_path: isSSLRequired ? truststorePath : undefined,
+      truststore_password: isSSLRequired ? truststorePassword : undefined,
+    };
+
+    try {
+      setIsTesting(true);
+      await invoke('cluster_test', { payload: clusterData });
+      toast.success('Connection test successful');
+    } catch (e) {
+      console.error(e);
+      toast.error('Connection test failed');
+    } finally {
+      setIsTesting(false);
+    }
   };
 
   const handleSave = () => {
@@ -317,22 +363,27 @@ export function ClusterConfigModal({
           <Button
             onClick={handleTestConnection}
             variant="outline"
-            className="flex-1 bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif]"
+            disabled={isTesting || isConnecting}
+            className="flex-1 bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif] disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Test
+            {isTesting && <Loader2 className="size-4 animate-spin" />}
+            {isTesting ? 'Testing…' : 'Test'}
           </Button>
           <Button
             onClick={handleSave}
             variant="outline"
-            className="flex-1 bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif]"
+            disabled={isConnecting}
+            className="flex-1 bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif] disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Save
           </Button>
           <Button
             onClick={handleConnect}
-            className="flex-1 bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860] font-['Fira_Code:Retina',_sans-serif]"
+            disabled={isConnecting || isTesting}
+            className="flex-1 bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860] font-['Fira_Code:Retina',_sans-serif] disabled:opacity-70 disabled:cursor-not-allowed"
           >
-            Connect
+            {isConnecting && <Loader2 className="size-4 animate-spin" />}
+            {isConnecting ? 'Connecting…' : 'Connect'}
           </Button>
         </div>
       </DialogContentNoClose>

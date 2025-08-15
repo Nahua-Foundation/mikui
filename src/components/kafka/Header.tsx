@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, Filter, RefreshCw, Play, Pause, Folder } from 'lucide-react';
+import { ChevronDown, Filter, RefreshCw, Play, Pause, Folder, Search } from 'lucide-react';
 import { Button } from '../ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../ui/dropdown-menu';
 import { Input } from '../ui/input';
@@ -37,6 +37,7 @@ export function HeaderDesktop({
 }: HeaderDesktopProps) {
   const partitions = topic ? Array.from({ length: topic.partitions }, (_, i) => i) : [];
   const [localFilters, setLocalFilters] = useState<MessageFilters>(filters);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const handleApplyFilters = () => {
     onFiltersChange(localFilters);
@@ -70,6 +71,22 @@ export function HeaderDesktop({
       </div>
       
       <div className="box-border content-stretch flex flex-row items-center justify-start p-0 relative shrink-0">
+        {/* Search field (left of partitions) */}
+        {topic && (
+          <MenuItem borderSide="none">
+            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 transform -translate-y-1/2 size-4 text-[#62748E]" />
+                <Input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search"
+                  className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E] pl-8 w-64"
+                />
+              </div>
+            </div>
+          </MenuItem>
+        )}
         {/* Partitions Dropdown */}
         {topic && (
           <MenuItem borderSide="none">

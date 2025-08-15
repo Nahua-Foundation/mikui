@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { toast } from 'sonner';
 import { Topic, KafkaMessage, FavoriteMessage, MessageFilters, KafkaCluster } from './kafka';
-import { mockTopics, mockMessages, mockFavorites, mockClusters } from './kafka';
+import { mockFavorites, mockClusters } from './kafka';
 import { HeaderDesktop } from './kafka';
 import { TopicsPanel } from './kafka';
 import { MessagesPanel } from './kafka';
@@ -10,6 +10,7 @@ import { TopicConfigModal } from './kafka';
 import { ClusterConfigModal } from './kafka';
 import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
 import { FavoritesModal } from './kafka';
+import { invoke } from '@tauri-apps/api/core';
 
 type ClusterConfigMode = 'create' | 'edit';
 
@@ -26,13 +27,16 @@ export function KafkaExplorerPortfolio() {
   const [filters, setFilters] = useState<MessageFilters>({ key: '', message: '' });
   const [isStreaming, setIsStreaming] = useState(false);
   const [favorites, setFavorites] = useState<FavoriteMessage[]>(mockFavorites);
+  const [topics, setTopics] = useState<Topic[]>([]);
+  const [messages, setMessages] = useState<KafkaMessage[]>([]);
+  const [isLoadingMessages, setIsLoadingMessages] = useState<boolean>(false);
   
   // Cluster management state
   const [clusters, setClusters] = useState<KafkaCluster[]>(mockClusters);
   const [selectedCluster, setSelectedCluster] = useState<KafkaCluster | null>(null);
   const [clusterConfigMode, setClusterConfigMode] = useState<ClusterConfigMode>('create');
 
-  const filteredMessages = mockMessages.filter(msg => {
+  const filteredMessages = messages.filter(msg => {
     // Filter by partition
     if (selectedPartition !== null && msg.partition !== selectedPartition) {
       return false;
@@ -76,6 +80,37 @@ export function KafkaExplorerPortfolio() {
     setClusterConfigMode('edit');
     setIsClusterConfigModalOpen(true);
   };
+
+  // Load messages when a topic is selected
+  useEffect(() => {
+    const fetchMessages = async () => {
+      if (!selectedTopic) {
+        setMessages([]);
+        return;
+      }
+      setIsLoadingMessages(true);
+      try {
+        const res = await invoke<KafkaMessage[]>('get_messages', {
+          params: {
+            topic_name: selectedTopic.name,
+            limit: 50,
+            start_from: 'newest',
+            offset: 0,
+          },
+        });
+        setMessages(res);
+      } catch (e) {
+        console.error('Failed to load messages', e);
+        toast.error('Failed to load messages');
+        setMessages([]);
+      } finally {
+        setIsLoadingMessages(false);
+      }
+    };
+
+    fetchMessages();
+    // Only refetch when topic changes (as per requirement)
+  }, [selectedTopic]);
 
   const handleConnectToCluster = (cluster: KafkaCluster) => {
     // Update cluster status
@@ -126,7 +161,7 @@ export function KafkaExplorerPortfolio() {
 
   const handleRefresh = () => {
     toast.success('Messages refreshed');
-    // В реальном приложении здесь был бы вызов API для обновления сообщений
+    // In a real app, you might re-fetch here; for now we keep last loaded messages
   };
 
   const handleToggleStream = () => {
@@ -178,21 +213,22 @@ export function KafkaExplorerPortfolio() {
       />
       
       {/* Main Content */}
-      <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1">
+      <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">
         {/* Left Panel - Topics */}
         <TopicsPanel
-          topics={mockTopics}
+          topics={topics.length > 0 ? topics : []}
           selectedTopic={selectedTopic}
           onTopicSelect={setSelectedTopic}
           onTopicConfig={handleConfigClick}
         />
         
         {/* Center Panel - Messages Table */}
-        <div className="flex-1 flex flex-col">
+        <div className="flex-1 min-h-0 flex flex-col h-full">
           {selectedTopic && (
             <MessagesPanel
               messages={filteredMessages}
               onSelectMessage={handleSelectMessage}
+              isLoading={isLoadingMessages}
             />
           )}
         </div>
@@ -232,6 +268,10 @@ export function KafkaExplorerPortfolio() {
         mode={clusterConfigMode}
         onBack={handleBackToArchive}
         onSave={handleSaveCluster}
+        onConnected={(topicNames: string[]) => {
+          const mapped: Topic[] = topicNames.map(name => ({ name, partitions: 1 }));
+          setTopics(mapped);
+        }}
       />
       
       {/* Favorites Modal */}

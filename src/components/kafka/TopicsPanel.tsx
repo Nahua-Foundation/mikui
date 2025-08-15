@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Search, Edit } from 'lucide-react';
 import { Input } from '../ui/input';
 import { Topic } from './types';
+import { Virtuoso } from 'react-virtuoso';
 
 interface TopicItemProps {
   topic: Topic; 
@@ -66,25 +67,32 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
         </div>
       </div>
       
-      {/* Topics List with scroll */}
-      <div className="flex-1 overflow-auto">
-        <div className="box-border content-stretch flex flex-col gap-1 items-start justify-start p-2 relative w-full">
-          {filteredTopics.map((topic) => (
-            <div key={topic.name} className="relative shrink-0 w-full" data-name="topic item">
-              <TopicItem
-                topic={topic}
-                isSelected={selectedTopic?.name === topic.name}
-                onClick={() => onTopicSelect(topic)}
-                onConfigClick={onTopicConfig}
-              />
-            </div>
-          ))}
-          {filteredTopics.length === 0 && topicFilter && (
-            <div className="flex items-center justify-center py-4 text-[#62748E] font-['Fira_Code:Retina',_sans-serif] text-sm">
-              No topics match "{topicFilter}"
-            </div>
-          )}
-        </div>
+      {/* Topics List with Virtuoso */}
+      <div className="flex-1 min-h-0">
+        {filteredTopics.length === 0 && topicFilter ? (
+          <div className="flex items-center justify-center py-4 text-[#62748E] font-['Fira_Code:Retina',_sans-serif] text-sm">
+            No topics match "{topicFilter}"
+          </div>
+        ) : (
+          <Virtuoso
+            className="h-full"
+            totalCount={filteredTopics.length}
+            itemContent={(index) => (
+              <div
+                key={filteredTopics[index].name}
+                className="relative shrink-0 w-full p-2"
+                data-name="topic item"
+              >
+                <TopicItem
+                  topic={filteredTopics[index]}
+                  isSelected={selectedTopic?.name === filteredTopics[index].name}
+                  onClick={() => onTopicSelect(filteredTopics[index])}
+                  onConfigClick={onTopicConfig}
+                />
+              </div>
+            )}
+          />
+        )}
       </div>
     </div>
   );
