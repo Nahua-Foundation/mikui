@@ -19,6 +19,6 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["time"] }
 chrono = { version = "0.4", features = ["clock"] }
-
+rdkafka = { version = "0.36", features = ["ssl", "sasl"] }
+tauri-plugin-dialog = "2"

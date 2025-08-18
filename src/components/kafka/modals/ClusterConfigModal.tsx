@@ -9,6 +9,7 @@ import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
 import { KafkaCluster } from '../types';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 interface ClusterConfigModalProps {
   open: boolean;
@@ -38,6 +39,7 @@ export function ClusterConfigModal({
   const [keystorePassword, setKeystorePassword] = useState<string>('');
   const [truststorePath, setTruststorePath] = useState<string>('');
   const [truststorePassword, setTruststorePassword] = useState<string>('');
+  const [sslCaBundlePath, setSslCaBundlePath] = useState<string>('');
   const [saslMechanism, setSaslMechanism] = useState<string>('PLAIN');
 
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
@@ -51,6 +53,7 @@ export function ClusterConfigModal({
       setSecurityProtocol(cluster.securityProtocol);
       setUsername(cluster.username || '');
       setPassword(cluster.password || '');
+      setSslCaBundlePath(cluster.sslCaBundlePath || '');
       setKeystorePath(cluster.keystorePath || '');
       setKeystorePassword(cluster.keystorePassword || '');
       setTruststorePath(cluster.truststorePath || '');
@@ -63,6 +66,7 @@ export function ClusterConfigModal({
       setSecurityProtocol('PLAINTEXT');
       setUsername('');
       setPassword('');
+      setSslCaBundlePath('');
       setKeystorePath('');
       setKeystorePassword('');
       setTruststorePath('');
@@ -79,6 +83,7 @@ export function ClusterConfigModal({
       sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
+      ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
       keystore_path: isSSLRequired ? keystorePath : undefined,
       keystore_password: isSSLRequired ? keystorePassword : undefined,
       truststore_path: isSSLRequired ? truststorePath : undefined,
@@ -101,7 +106,7 @@ export function ClusterConfigModal({
       onOpenChange(false);
     } catch (e) {
       console.error(e);
-      toast.error('Failed to connect to Kafka cluster');
+      toast.error('Failed to connect to Kafka cluster: ' + (e as Error).message);
     } finally {
       setIsConnecting(false);
     }
@@ -115,6 +120,7 @@ export function ClusterConfigModal({
       sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
+      ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
       keystore_path: isSSLRequired ? keystorePath : undefined,
       keystore_password: isSSLRequired ? keystorePassword : undefined,
       truststore_path: isSSLRequired ? truststorePath : undefined,
@@ -142,6 +148,7 @@ export function ClusterConfigModal({
       saslMechanism: isSASLRequired ? saslMechanism : undefined,
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
+      sslCaBundlePath: isSSLRequired ? sslCaBundlePath : undefined,
       keystorePath: isSSLRequired ? keystorePath : undefined,
       keystorePassword: isSSLRequired ? keystorePassword : undefined,
       truststorePath: isSSLRequired ? truststorePath : undefined,
@@ -292,59 +299,97 @@ export function ClusterConfigModal({
             {isSSLRequired && (
               <div className="space-y-4 border border-[#314158] rounded-lg p-4">
                 <h3 className="font-['Fira_Code:Retina',_sans-serif] text-[#ffb86a] text-sm">SSL Configuration</h3>
-                
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
-                      Keystore Path
-                    </Label>
-                    <Input
-                      value={keystorePath}
-                      onChange={(e) => setKeystorePath(e.target.value)}
-                      placeholder="/path/to/client.keystore.jks"
-                      className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
-                      Keystore Password
-                    </Label>
-                    <Input
-                      type="password"
-                      value={keystorePassword}
-                      onChange={(e) => setKeystorePassword(e.target.value)}
-                      placeholder="keystore password"
-                      className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
-                    />
-                  </div>
-                </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
+                <div className="grid grid-cols-1 gap-1">
+                  <div className="space-y-1">
                     <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
-                      Truststore Path
+                      CA bundle
                     </Label>
-                    <Input
-                      value={truststorePath}
-                      onChange={(e) => setTruststorePath(e.target.value)}
-                      placeholder="/path/to/client.truststore.jks"
-                      className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
-                      Truststore Password
-                    </Label>
-                    <Input
-                      type="password"
-                      value={truststorePassword}
-                      onChange={(e) => setTruststorePassword(e.target.value)}
-                      placeholder="truststore password"
-                      className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
-                    />
+                    <div className="flex items-center gap-3">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif]"
+                        onClick={async () => {
+                          const selected = await openDialog({
+                            title: 'Select CA bundle file',
+                            multiple: false,
+                            filters: [
+                              { name: 'Certificates', extensions: ['crt', 'pem', 'cer'] },
+                              { name: 'All Files', extensions: ['*'] },
+                            ],
+                          });
+                          if (typeof selected === 'string') {
+                            setSslCaBundlePath(selected);
+                          }
+                        }}
+                      >
+                        {sslCaBundlePath ? 'Choose another file' : 'Choose file'}
+                      </Button>
+                      {sslCaBundlePath && (
+                        <div className="text-xs text-[#90a1b9] truncate max-w-[260px]" title={sslCaBundlePath}>
+                          Selected: <span className="text-slate-50">{(sslCaBundlePath.split('\\').pop() || '').split('/').pop()}</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
+              // <div className="space-y-4 border border-[#314158] rounded-lg p-4">
+              //   <h3 className="font-['Fira_Code:Retina',_sans-serif] text-[#ffb86a] text-sm">SSL Configuration</h3>
+              //
+              //   <div className="grid grid-cols-2 gap-4">
+              //     <div className="space-y-2">
+              //       <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+              //         Keystore Path
+              //       </Label>
+              //       <Input
+              //         value={keystorePath}
+              //         onChange={(e) => setKeystorePath(e.target.value)}
+              //         placeholder="/path/to/client.keystore.jks"
+              //         className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
+              //       />
+              //     </div>
+              //     <div className="space-y-2">
+              //       <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+              //         Keystore Password
+              //       </Label>
+              //       <Input
+              //         type="password"
+              //         value={keystorePassword}
+              //         onChange={(e) => setKeystorePassword(e.target.value)}
+              //         placeholder="keystore password"
+              //         className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
+              //       />
+              //     </div>
+              //   </div>
+              //
+              //   <div className="grid grid-cols-2 gap-4">
+              //     <div className="space-y-2">
+              //       <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+              //         Truststore Path
+              //       </Label>
+              //       <Input
+              //         value={truststorePath}
+              //         onChange={(e) => setTruststorePath(e.target.value)}
+              //         placeholder="/path/to/client.truststore.jks"
+              //         className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
+              //       />
+              //     </div>
+              //     <div className="space-y-2">
+              //       <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+              //         Truststore Password
+              //       </Label>
+              //       <Input
+              //         type="password"
+              //         value={truststorePassword}
+              //         onChange={(e) => setTruststorePassword(e.target.value)}
+              //         placeholder="truststore password"
+              //         className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
+              //       />
+              //     </div>
+              //   </div>
+              // </div>
             )}
           </div>
         </div>

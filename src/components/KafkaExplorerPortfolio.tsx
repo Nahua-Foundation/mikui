@@ -138,6 +138,7 @@ export function KafkaExplorerPortfolio() {
         saslMechanism: clusterData.saslMechanism,
         username: clusterData.username,
         password: clusterData.password,
+        sslCaBundlePath: clusterData.sslCaBundlePath,
         keystorePath: clusterData.keystorePath,
         keystorePassword: clusterData.keystorePassword,
         truststorePath: clusterData.truststorePath,

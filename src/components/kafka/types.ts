@@ -30,6 +30,7 @@ export interface KafkaCluster {
   saslMechanism?: string;
   username?: string;
   password?: string;
+  sslCaBundlePath?: string;
   keystorePath?: string;
   keystorePassword?: string;
   truststorePath?: string;
