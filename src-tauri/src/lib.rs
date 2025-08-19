@@ -2,6 +2,7 @@
 
 mod helpers;
 
+use std::collections::HashMap;
 use rdkafka::{admin::AdminClient, client::DefaultClientContext, consumer::BaseConsumer};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -15,6 +16,7 @@ use crate::helpers::get_cluster_config;
 pub struct App {
     consumer: Option<BaseConsumer>,
     admin_client: Option<AdminClient<DefaultClientContext>>,
+    topics_partitions_metadata: Option<HashMap<String, usize>>,
 }
 
 #[derive(Deserialize)]
@@ -96,7 +98,7 @@ impl App {
     }
 
     // Async implementation with 3-second delay to simulate work without blocking UI
-    pub fn cluster_test(&self, payload: ClusterConnectPayload) -> Result<(), String> {
+    pub fn cluster_test(&mut self, payload: ClusterConnectPayload) -> Result<(), String> {
         let conf = get_cluster_config(&payload);
         let _consumer: BaseConsumer = conf
             .create()
@@ -104,18 +106,28 @@ impl App {
         let _admin_client: AdminClient<_> = conf
             .create()
             .map_err(|e| format!("can't create AdminClient: {}", e.to_string()))?;
+        self.topics_partitions_metadata = None;
         Ok(())
     }
 
     // Returns a list of topics. For now, mock data with slight delay to simulate fetching.
-    pub fn get_topics(&self) -> Result<Vec<String>, String> {
-        sleep(Duration::from_secs(1));
-        Ok(vec![
-            "orders".to_string(),
-            "payments".to_string(),
-            "users".to_string(),
-            "events".to_string(),
-        ])
+    pub fn get_topics(&mut self) -> Result<Vec<String>, String> {
+        let md = match self.consumer.as_ref().unwrap().fetch_metadata(None, Duration::from_secs(1)) {
+            Ok(md) => md,
+            Err(e) => {
+                return Err(format!("can't load cluster metadata: {}", e.to_string()));
+            }
+        };
+        let mut topics = Vec::with_capacity(md.topics().len());
+        let mut topics_metadata_cache = HashMap::with_capacity(topics.len());
+        md.topics().iter().for_each(|t| {
+            let topic_name = t.name().to_string();
+            topics.push(topic_name.clone());
+            topics_metadata_cache.insert(topic_name, t.partitions().len());
+        });
+
+        self.topics_partitions_metadata = Some(topics_metadata_cache);
+        Ok(topics)
     }
 
     // Returns a vector of messages for a topic with basic pagination and filtering (mocked).
@@ -195,13 +207,13 @@ async fn cluster_test(
     state: tauri::State<'_, Mutex<App>>,
     payload: ClusterConnectPayload,
 ) -> Result<(), String> {
-    let app = state.lock().map_err(|_| "lock poisoned".to_string())?;
+    let mut app = state.lock().map_err(|_| "lock poisoned".to_string())?;
     app.cluster_test(payload)
 }
 
 #[tauri::command]
 async fn get_topics(state: tauri::State<'_, Mutex<App>>) -> Result<Vec<String>, String> {
-    let app = state.lock().map_err(|_| "lock poisoned".to_string())?;
+    let mut app = state.lock().map_err(|_| "lock poisoned".to_string())?;
     app.get_topics()
 }
 

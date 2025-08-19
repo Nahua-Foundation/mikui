@@ -30,7 +30,7 @@ function TopicItem({ topic, isSelected, onClick, onConfigClick }: TopicItemProps
           <div className={`basis-0 font-['Fira_Code:Retina',_sans-serif] font-[450] grow leading-[0] min-h-px min-w-px relative shrink-0 text-[14px] text-left ${
             isSelected ? 'text-slate-50' : 'text-[#90a1b9] hover:text-slate-50'
           }`}>
-            <p className="block leading-[20px]">{topic.name}</p>
+            <p className="block leading-[20px]" style={{whiteSpace: "nowrap"}}>{topic.name}</p>
           </div>
         </div>
       </div>
@@ -48,9 +48,13 @@ interface TopicsPanelProps {
 export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfig }: TopicsPanelProps) {
   const [topicFilter, setTopicFilter] = useState('');
 
-  const filteredTopics = topics.filter(topic => 
-    topic.name.toLowerCase().includes(topicFilter.toLowerCase())
-  );
+  const filteredTopics = topicFilter ?
+      topics.filter(topic =>
+        topic.name.toLowerCase().includes(topicFilter.toLowerCase())
+      ).
+      sort((a, b) => a.name.length - b.name.length)
+      :
+      topics.sort((a, b) => a.name.localeCompare(b.name));
 
   return (
     <div className="w-[220px] flex flex-col h-full border-r border-[#314158]">

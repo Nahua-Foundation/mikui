@@ -20,7 +20,7 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
     cc.set("enable.partition.eof", "false");
 
     // Оптимизации для быстрого получения данных
-    cc.set("fetch.wait.max.ms", "20");
+    cc.set("fetch.wait.max.ms", "50");
     cc.set("fetch.min.bytes", "1048576");
     cc.set("fetch.max.bytes", "52428800");
 
@@ -48,7 +48,14 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
             // }
         }
         "SASL_SSL" => {
-            println!("{:?}, {:?}, {:?}", conf.ssl_ca_bundle_path, conf.username, conf.password);
+            let mech = conf
+                .sasl_mechanism
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("SCRAM-SHA-512");
+            cc.set("sasl.mechanism", mech);
+            cc.set("security.protocol", "SASL_SSL");
             if let Some(ssl_ca_bundle_path) = &conf.ssl_ca_bundle_path {
                 cc.set("ssl.ca.location", ssl_ca_bundle_path);
             }
