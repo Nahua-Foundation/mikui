@@ -4,13 +4,58 @@ import { Copy, Star } from 'lucide-react';
 import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
-import { KafkaMessage } from '../types';
+import { FullMessage, MessageHeader } from '../types';
+
+/** Потолок отрисовки. Тело на 10 МБ иначе положило бы вкладку на лопатки
+ *  ещё до того, как пользователь что-то увидит. */
+const MAX_RENDERED_LINES = 2000;
+
+/** Токены JSON: ключ, строка, число, пунктуация. */
+const JSON_TOKEN = /("(?:\\.|[^"\\])*")\s*:|("(?:\\.|[^"\\])*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([{}[\],:])/g;
+
+/**
+ * Раскрашивает строку JSON несколькими span-ами.
+ *
+ * Раньше здесь был `line.split('')` с одним `<span>` на КАЖДЫЙ символ: тело
+ * в 100 КБ превращалось в сотню тысяч DOM-узлов и намертво вешало окно.
+ * Теперь на строку приходится несколько узлов вместо сотни.
+ */
+function highlightLine(line: string) {
+  const parts: React.ReactNode[] = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+
+  JSON_TOKEN.lastIndex = 0;
+  while ((match = JSON_TOKEN.exec(line)) !== null) {
+    if (match.index > last) {
+      parts.push(<span key={`t${last}`} className="text-soft">{line.slice(last, match.index)}</span>);
+    }
+    const [full, propertyKey, str, num, punct] = match;
+    const key = `m${match.index}`;
+    if (propertyKey !== undefined) {
+      parts.push(<span key={key} className="text-brand">{propertyKey}</span>);
+      parts.push(<span key={`${key}c`} className="text-syntax-brace">{full.slice(propertyKey.length)}</span>);
+    } else if (str !== undefined) {
+      parts.push(<span key={key} className="text-soft">{str}</span>);
+    } else if (num !== undefined) {
+      parts.push(<span key={key} className="text-syntax-bracket">{num}</span>);
+    } else if (punct !== undefined) {
+      parts.push(<span key={key} className="text-syntax-brace">{punct}</span>);
+    }
+    last = match.index + full.length;
+  }
+
+  if (last < line.length) {
+    parts.push(<span key={`t${last}`} className="text-soft">{line.slice(last)}</span>);
+  }
+  return parts.length > 0 ? parts : <span className="text-soft">{line}</span>;
+}
 
 interface MessageDetailsModalProps {
-  message: KafkaMessage | null; 
+  message: FullMessage | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onAddToFavorite?: (message: KafkaMessage) => void;
+  onAddToFavorite?: (message: FullMessage) => void;
 }
 
 export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavorite }: MessageDetailsModalProps) {
@@ -21,11 +66,8 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
     toast.success('Copied to clipboard');
   };
 
-  const copyHeadersToClipboard = (headers: Record<string, string>) => {
-    const headersText = Object.entries(headers)
-      .map(([key, value]) => `${key}: ${value}`)
-      .join('\n');
-    copyToClipboard(headersText);
+  const copyHeadersToClipboard = (headers: MessageHeader[]) => {
+    copyToClipboard(headers.map((h) => `${h.key}: ${h.value}`).join('\n'));
   };
 
   const formatJson = (jsonString: string) => {
@@ -38,7 +80,7 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
 
   const handleCopy = () => {
     if (activeTab === 'payload') {
-      copyToClipboard(message!.message);
+      copyToClipboard(message!.value);
     } else {
       copyHeadersToClipboard(message!.headers);
     }
@@ -52,7 +94,9 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
 
   if (!message) return null;
 
-  const lines = formatJson(message.message).split('\n');
+  const allLines = formatJson(message.value).split('\n');
+  const lines = allLines.slice(0, MAX_RENDERED_LINES);
+  const hiddenLines = allLines.length - lines.length;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -83,7 +127,7 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
             </div>
             <div>
               <div className="font-mono text-sm text-soft mb-1">Timestamp</div>
-              <div className="font-mono text-slate-50">{message.timestamp}</div>
+              <div className="font-mono text-slate-50">{message.timestamp ? new Date(message.timestamp).toLocaleString() : '—'}</div>
             </div>
           </div>
           
@@ -153,28 +197,21 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
                   {/* JSON content */}
                   <div className="font-mono leading-6 flex-1">
                     {lines.map((line, index) => (
-                      <div key={index}>
-                        {line.split('').map((char, charIndex) => {
-                          if (char === '"' && line.includes(':')) {
-                            return <span key={charIndex} className="text-brand">{char}</span>;
-                          }
-                          if (char === '{' || char === '}' || char === '[' || char === ']' || char === ',' || char === ':') {
-                            return <span key={charIndex} className="text-syntax-brace">{char}</span>;
-                          }
-                          if (/\d/.test(char) && !line.includes('"')) {
-                            return <span key={charIndex} className="text-syntax-bracket">{char}</span>;
-                          }
-                          return <span key={charIndex} className="text-soft">{char}</span>;
-                        })}
-                      </div>
+                      <div key={index}>{highlightLine(line)}</div>
                     ))}
+                    {hiddenLines > 0 && (
+                      <div className="text-dim pt-2">
+                        … {hiddenLines.toLocaleString()} more lines not rendered ({message.value_size.toLocaleString()} bytes total).
+                        Use Copy to get the full payload.
+                      </div>
+                    )}
                   </div>
                 </div>
               ) : (
                 <div>
-                  {Object.keys(message.headers).length > 0 ? (
+                  {message.headers.length > 0 ? (
                     <div className="space-y-2">
-                      {Object.entries(message.headers).map(([key, value], index) => (
+                      {message.headers.map(({ key, value }, index) => (
                         <div key={index} className="flex gap-4 font-mono leading-6">
                           <div className="text-brand min-w-0 flex-shrink-0">
                             {key}:

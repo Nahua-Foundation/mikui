@@ -1,25 +1,73 @@
-export interface KafkaMessage {
-  partition: number;
-  key: string;
-  offset: number;
-  message: string;
-  timestamp: string;
-  headers: Record<string, string>;
-}
-
-export interface FavoriteMessage extends KafkaMessage {
-  topicName: string;
-  savedAt: string;
-}
+// DTO, пересекающие границу IPC, названы в snake_case — ровно так, как их
+// сериализует Rust. Промежуточный слой переименований только добавил бы место,
+// где можно ошибиться.
 
 export interface Topic {
   name: string;
   partitions: number;
 }
 
-export interface MessageFilters {
+/** Строка таблицы. Тело обрезано бэкендом; полное берётся по `index`. */
+export interface RowPreview {
+  /** Индекс в текущем отфильтрованном представлении на стороне Rust. */
+  index: number;
+  partition: number;
+  offset: number;
+  /** Unix millis. Форматируется лениво и только для видимых строк. */
+  timestamp: number;
   key: string;
-  message: string;
+  preview: string;
+  value_size: number;
+  /** Тело не является валидным UTF-8: Avro, Protobuf, произвольные байты. */
+  binary: boolean;
+}
+
+export interface MessageHeader {
+  key: string;
+  value: string;
+}
+
+/** Полное сообщение. Запрашивается только когда пользователь его открыл. */
+export interface FullMessage {
+  partition: number;
+  offset: number;
+  timestamp: number;
+  key: string;
+  value: string;
+  value_size: number;
+  binary: boolean;
+  headers: MessageHeader[];
+}
+
+export interface FavoriteMessage extends FullMessage {
+  topicName: string;
+  savedAt: string;
+}
+
+/** Применяется в Rust по сырым байтам, до пересечения границы IPC. */
+export interface MessageFilter {
+  key: string;
+  value: string;
+  case_sensitive: boolean;
+}
+
+export const EMPTY_FILTER: MessageFilter = {
+  key: '',
+  value: '',
+  case_sensitive: false,
+};
+
+export type StartFrom = 'oldest' | 'newest';
+
+export interface OpenTopicResult {
+  /** Число видимых строк с учётом фильтра — это totalCount для списка. */
+  total: number;
+  /** Сколько всего вычитано в буфер до фильтрации. */
+  loaded: number;
+  /** Размер арены в байтах. */
+  buffer_bytes: number;
+  /** Упёрлись в лимит или таймаут — в топике есть ещё. */
+  truncated: boolean;
 }
 
 export interface KafkaCluster {
@@ -31,10 +79,6 @@ export interface KafkaCluster {
   username?: string;
   password?: string;
   sslCaBundlePath?: string;
-  keystorePath?: string;
-  keystorePassword?: string;
-  truststorePath?: string;
-  truststorePassword?: string;
   createdAt: string;
   lastUsed?: string;
   isActive?: boolean;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { Search, Edit } from 'lucide-react';
 import { Input } from '../ui/input';
 import { Topic } from './types';
@@ -11,7 +11,12 @@ interface TopicItemProps {
   onConfigClick: (topic: Topic) => void;
 }
 
-function TopicItem({ topic, isSelected, onClick, onConfigClick }: TopicItemProps) {
+const TopicItem = memo(function TopicItem({
+  topic,
+  isSelected,
+  onClick,
+  onConfigClick,
+}: TopicItemProps) {
   const handleEditClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     onConfigClick(topic);
@@ -36,7 +41,7 @@ function TopicItem({ topic, isSelected, onClick, onConfigClick }: TopicItemProps
       </div>
     </div>
   );
-}
+});
 
 interface TopicsPanelProps {
   topics: Topic[];
@@ -45,16 +50,26 @@ interface TopicsPanelProps {
   onTopicConfig: (topic: Topic) => void;
 }
 
+/** Один экземпляр на модуль: `localeCompare` создаёт коллатор на каждый вызов,
+ *  что на тысячах топиков заметно. */
+const COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
 export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfig }: TopicsPanelProps) {
   const [topicFilter, setTopicFilter] = useState('');
 
-  const filteredTopics = topicFilter ?
-      topics.filter(topic =>
-        topic.name.toLowerCase().includes(topicFilter.toLowerCase())
-      ).
-      sort((a, b) => a.name.length - b.name.length)
-      :
-      topics.sort((a, b) => a.name.localeCompare(b.name));
+  // useMemo: раньше фильтрация и сортировка гонялись на каждый рендер —
+  // включая рендеры, вызванные подгрузкой сообщений в соседней панели.
+  // И `topics.sort()` мутировал пропс на месте.
+  const filteredTopics = useMemo(() => {
+    const needle = topicFilter.trim().toLowerCase();
+    if (!needle) {
+      return [...topics].sort((a, b) => COLLATOR.compare(a.name, b.name));
+    }
+    return topics
+      .filter((topic) => topic.name.toLowerCase().includes(needle))
+      // При активном поиске короткие совпадения обычно релевантнее.
+      .sort((a, b) => a.name.length - b.name.length || COLLATOR.compare(a.name, b.name));
+  }, [topics, topicFilter]);
 
   return (
     <div className="w-[220px] flex flex-col h-full border-r border-edge">

@@ -2,14 +2,14 @@ import { Button } from '../../ui/button';
 import { Star, Trash2 } from 'lucide-react';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
-import { FavoriteMessage, KafkaMessage } from '../types';
+import { FavoriteMessage, FullMessage } from '../types';
 
 interface FavoritesModalProps {
   favorites: FavoriteMessage[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onRemoveFavorite: (message: FavoriteMessage) => void;
-  onSelectMessage: (message: KafkaMessage) => void;
+  onSelectMessage: (message: FullMessage) => void;
 }
 
 export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite, onSelectMessage }: FavoritesModalProps) {
@@ -76,13 +76,13 @@ export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite
                   
                   {/* Third row: Saved timestamp */}
                   <div className="font-mono text-dim text-sm mb-3">
-                    Saved: {favorite.savedAt}
+                    Saved: {new Date(favorite.savedAt).toLocaleString()}
                   </div>
                   
                   {/* Fourth row: Message content */}
                   <div className="bg-sunken border border-edge rounded-lg p-3 max-h-32 overflow-auto">
                     <div className="font-mono text-sm text-soft truncate">
-                      {favorite.message}
+                      {favorite.value}
                     </div>
                   </div>
                 </div>

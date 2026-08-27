@@ -1,4 +1,4 @@
-use crate::ClusterConnectPayload;
+use crate::kafka::ClusterConnectPayload;
 use rdkafka::ClientConfig;
 
 /// Механизмы SASL, которые реально поддержаны текущей сборкой.

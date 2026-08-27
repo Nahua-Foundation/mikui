@@ -1,132 +1,196 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { KafkaMessage } from './types';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { RowPreview } from './types';
 import { Virtuoso } from 'react-virtuoso';
 
-interface MessageRowProps {
-  message: KafkaMessage; 
-  onClick: () => void;
-  gridTemplate: string;
+const COLUMNS = ['partition', 'key', 'offset', 'timestamp', 'message'] as const;
+const DEFAULT_WIDTHS = ['80px', '120px', '100px', '190px', '1fr'];
+const MIN_COLUMN_PX = 60;
+
+/** Один экземпляр на приложение: пересоздавать форматтер на каждую строку
+ *  заметно дороже самого форматирования. */
+const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+function formatTimestamp(millis: number): string {
+  if (!millis) return '—';
+  return TIME_FORMAT.format(new Date(millis));
 }
 
-function MessageRow({ message, onClick, gridTemplate }: MessageRowProps) {
+interface MessageRowProps {
+  row: RowPreview;
+  onSelect: (index: number) => void;
+}
+
+/** memo: при подгрузке чанка перерисовываются только новые строки,
+ *  а не весь видимый список. */
+const MessageRow = memo(function MessageRow({ row, onSelect }: MessageRowProps) {
   return (
-    <div 
-      className="border-b border-edge cursor-pointer hover:bg-elevated"
-      onClick={onClick}
+    <div
+      className="border-b border-edge cursor-pointer hover:bg-elevated grid gap-4 p-3 text-sm"
+      style={{ gridTemplateColumns: 'var(--mikui-grid)' }}
+      onClick={() => onSelect(row.index)}
     >
-      <div
-        className="grid gap-4 p-3 text-sm"
-        style={{ gridTemplateColumns: gridTemplate }}
-      >
-        <div className="font-mono text-brand">
-          {message.partition}
-        </div>
-        <div className="font-mono text-soft truncate">
-          {message.key}
-        </div>
-        <div className="font-mono text-soft">
-          {message.offset}
-        </div>
-        <div className="font-mono text-soft truncate">
-          {message.timestamp}
-        </div>
-        <div className="font-mono text-soft truncate">
-          {message.message}
-        </div>
+      <div className="font-mono text-brand">{row.partition}</div>
+      <div className="font-mono text-soft truncate">{row.key}</div>
+      <div className="font-mono text-soft">{row.offset}</div>
+      <div className="font-mono text-soft truncate">{formatTimestamp(row.timestamp)}</div>
+      <div className="font-mono text-soft truncate">
+        {row.binary && (
+          <span
+            className="text-brand mr-2"
+            title={`${row.value_size} bytes, not valid UTF-8`}
+          >
+            [binary]
+          </span>
+        )}
+        {row.preview}
       </div>
+    </div>
+  );
+});
+
+/** Строка, чей чанк ещё летит. Появляется редко — соседние чанки подгружаются
+ *  заранее, — но пустоту вместо строки показывать нельзя. */
+function PlaceholderRow() {
+  return (
+    <div
+      className="border-b border-edge grid gap-4 p-3 text-sm"
+      style={{ gridTemplateColumns: 'var(--mikui-grid)' }}
+    >
+      {COLUMNS.map((c) => (
+        <div key={c} className="h-4 rounded bg-edge/40 animate-pulse" />
+      ))}
     </div>
   );
 }
 
 interface MessagesPanelProps {
-  messages: KafkaMessage[];
-  onSelectMessage: (message: KafkaMessage) => void;
-  isLoading?: boolean;
+  total: number;
+  getRow: (index: number) => RowPreview | undefined;
+  onRangeChanged: (startIndex: number, endIndex: number) => void;
+  onSelectMessage: (index: number) => void;
+  isLoading: boolean;
+  /** Растёт при подгрузке чанка — сигнал перерисовать видимые строки. */
+  version: number;
 }
 
-export function MessagesPanel({ messages, onSelectMessage, isLoading }: MessagesPanelProps) {
-  // column widths: [partition, key, offset, timestamp, message]
-  const [colWidths, setColWidths] = useState<(string)[]>([
-    '80px', '120px', '100px', '150px', '1fr'
-  ]);
-
-  const minPx = 60; // minimal width in px for resizable columns
+export function MessagesPanel({
+  total,
+  getRow,
+  onRangeChanged,
+  onSelectMessage,
+  isLoading,
+  version,
+}: MessagesPanelProps) {
+  const [colWidths, setColWidths] = useState<string[]>(DEFAULT_WIDTHS);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef<{ index: number; startX: number; startW: number } | null>(null);
+  const pendingWidths = useRef<string[] | null>(null);
 
   const gridTemplate = useMemo(() => colWidths.join(' '), [colWidths]);
 
-  const dragging = useRef<{ index: number; startX: number; startW: number } | null>(null);
-
-  const onMouseMove = useCallback((e: MouseEvent) => {
-    if (!dragging.current) return;
-    const { index, startX, startW } = dragging.current;
-    const dx = e.clientX - startX;
-    const newW = Math.max(minPx, startW + dx);
-    setColWidths(prev => {
-      const next = [...prev];
-      next[index] = `${newW}px`;
-      return next;
-    });
+  // Ширины колонок живут в CSS-переменной. Раньше здесь был setState на каждый
+  // mousemove, то есть полная перерисовка таблицы на каждое движение мыши.
+  // Теперь во время перетаскивания React не участвует вообще, а в state
+  // результат попадает один раз — на отпускании кнопки.
+  const applyGrid = useCallback((template: string) => {
+    rootRef.current?.style.setProperty('--mikui-grid', template);
   }, []);
+
+  useEffect(() => applyGrid(gridTemplate), [gridTemplate, applyGrid]);
+
+  const onMouseMove = useCallback(
+    (e: MouseEvent) => {
+      const drag = dragging.current;
+      if (!drag) return;
+      const width = Math.max(MIN_COLUMN_PX, drag.startW + (e.clientX - drag.startX));
+      const next = [...colWidths];
+      next[drag.index] = `${width}px`;
+      pendingWidths.current = next;
+      applyGrid(next.join(' '));
+    },
+    [colWidths, applyGrid],
+  );
 
   const stopDragging = useCallback(() => {
     if (!dragging.current) return;
     dragging.current = null;
     window.removeEventListener('mousemove', onMouseMove);
     window.removeEventListener('mouseup', stopDragging);
+    if (pendingWidths.current) {
+      setColWidths(pendingWidths.current);
+      pendingWidths.current = null;
+    }
   }, [onMouseMove]);
 
-  const startDragging = useCallback((index: number, e: React.MouseEvent) => {
-    // do not allow dragging for the last column (message) which is 1fr by default
-    if (index >= colWidths.length - 1) return;
-    const target = e.currentTarget as HTMLDivElement;
-    const rect = target.parentElement?.getBoundingClientRect();
-    // compute current pixel width of the column
-    // We trust colWidths[index] if it's in px; otherwise read from DOM
-    let startW = 0;
-    const current = colWidths[index];
-    if (current.endsWith('px')) {
-      startW = parseInt(current, 10) || 0;
-    }
-    if (!startW && rect) {
-      // fallback: approximate by dividing header cell offsetWidth
-      const headerCell = target.parentElement as HTMLElement;
-      startW = headerCell.offsetWidth;
-    }
-    dragging.current = { index, startX: e.clientX, startW };
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', stopDragging);
-    e.preventDefault();
-    e.stopPropagation();
-  }, [colWidths, onMouseMove, stopDragging]);
+  const startDragging = useCallback(
+    (index: number, e: React.MouseEvent) => {
+      // Последняя колонка растягивается на всё оставшееся место, её не тянем.
+      if (index >= COLUMNS.length - 1) return;
+      const current = colWidths[index];
+      const startW = current.endsWith('px')
+        ? parseInt(current, 10) || MIN_COLUMN_PX
+        : MIN_COLUMN_PX;
+      dragging.current = { index, startX: e.clientX, startW };
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', stopDragging);
+      e.preventDefault();
+      e.stopPropagation();
+    },
+    [colWidths, onMouseMove, stopDragging],
+  );
 
-  useEffect(() => {
-    return () => {
+  useEffect(
+    () => () => {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', stopDragging);
-    };
-  }, [onMouseMove, stopDragging]);
+    },
+    [onMouseMove, stopDragging],
+  );
+
+  const handleRangeChanged = useCallback(
+    ({ startIndex, endIndex }: { startIndex: number; endIndex: number }) =>
+      onRangeChanged(startIndex, endIndex),
+    [onRangeChanged],
+  );
+
+  const renderItem = useCallback(
+    (index: number) => {
+      const row = getRow(index);
+      return row ? <MessageRow row={row} onSelect={onSelectMessage} /> : <PlaceholderRow />;
+    },
+    // version в зависимостях намеренно: подгрузился чанк — перерисовываем.
+    [getRow, onSelectMessage, version],
+  );
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col h-full">
-      {/* Header */}
+    <div
+      ref={rootRef}
+      className="flex-1 min-h-0 flex flex-col h-full"
+      style={{ '--mikui-grid': gridTemplate } as React.CSSProperties}
+    >
       <div className="border-b border-edge bg-surface">
         <div
           className="grid gap-4 p-3 text-sm font-mono text-soft select-none"
-          style={{ gridTemplateColumns: gridTemplate }}
+          style={{ gridTemplateColumns: 'var(--mikui-grid)' }}
         >
-          {["partition", "key", "offset", "timestamp", "message"].map((label, i) => (
+          {COLUMNS.map((label, i) => (
             <div key={label} className="relative">
               <div>{label}</div>
-              {/* Resizer handle for all except the last column */}
-              {i < colWidths.length - 1 && (
+              {i < COLUMNS.length - 1 && (
                 <div
                   onMouseDown={(e) => startDragging(i, e)}
                   className="absolute top-0 right-[-8px] h-full w-4 cursor-col-resize"
                   style={{
-                    // create a visible thin line centered in the 4px handle
-                    // using a pseudo-line via background gradient
                     backgroundImage:
-                      'linear-gradient(to right, transparent 7px, #314158 7px, #314158 8px, transparent 8px)'
+                      'linear-gradient(to right, transparent 7px, var(--color-edge) 7px, var(--color-edge) 8px, transparent 8px)',
                   }}
                   title="Drag to resize"
                 />
@@ -135,29 +199,20 @@ export function MessagesPanel({ messages, onSelectMessage, isLoading }: Messages
           ))}
         </div>
       </div>
-      
-      {/* Messages */}
+
       <div className="flex-1 min-h-0 overflow-hidden h-full">
-        {isLoading && (
-          <div className="p-4 text-center text-soft font-mono">Loading messages…</div>
+        {isLoading ? (
+          <div className="p-4 text-center text-soft font-mono">Reading from Kafka…</div>
+        ) : total === 0 ? (
+          <div className="p-4 text-center text-dim font-mono">No messages</div>
+        ) : (
+          <Virtuoso
+            style={{ height: '100%' }}
+            totalCount={total}
+            rangeChanged={handleRangeChanged}
+            itemContent={renderItem}
+          />
         )}
-        <Virtuoso
-          style={{ height: '100%' }}
-          data={messages}
-          itemContent={(index, message) => (
-            <MessageRow
-              key={`${message.partition}-${message.offset}-${index}`}
-              message={message}
-              onClick={() => onSelectMessage(message)}
-              gridTemplate={gridTemplate}
-            />
-          )}
-          components={{
-            EmptyPlaceholder: () => (!isLoading ? (
-              <div className="p-4 text-center text-dim font-mono">No messages</div>
-            ) : null)
-          }}
-        />
       </div>
     </div>
   );

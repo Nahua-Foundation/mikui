@@ -39,10 +39,6 @@ export function ClusterConfigModal({
   const [securityProtocol, setSecurityProtocol] = useState<string>('PLAINTEXT');
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
-  const [keystorePath, setKeystorePath] = useState<string>('');
-  const [keystorePassword, setKeystorePassword] = useState<string>('');
-  const [truststorePath, setTruststorePath] = useState<string>('');
-  const [truststorePassword, setTruststorePassword] = useState<string>('');
   const [sslCaBundlePath, setSslCaBundlePath] = useState<string>('');
   const [saslMechanism, setSaslMechanism] = useState<string>('PLAIN');
 
@@ -67,10 +63,6 @@ export function ClusterConfigModal({
       setUsername(cluster.username || '');
       setPassword(cluster.password || '');
       setSslCaBundlePath(cluster.sslCaBundlePath || '');
-      setKeystorePath(cluster.keystorePath || '');
-      setKeystorePassword(cluster.keystorePassword || '');
-      setTruststorePath(cluster.truststorePath || '');
-      setTruststorePassword(cluster.truststorePassword || '');
       setSaslMechanism(cluster.saslMechanism || 'PLAIN');
     } else {
       // Reset form for create mode
@@ -80,10 +72,6 @@ export function ClusterConfigModal({
       setUsername('');
       setPassword('');
       setSslCaBundlePath('');
-      setKeystorePath('');
-      setKeystorePassword('');
-      setTruststorePath('');
-      setTruststorePassword('');
       setSaslMechanism('PLAIN');
     }
   }, [cluster, mode, open]);
@@ -97,10 +85,6 @@ export function ClusterConfigModal({
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
       ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
-      keystore_path: isSSLRequired ? keystorePath : undefined,
-      keystore_password: isSSLRequired ? keystorePassword : undefined,
-      truststore_path: isSSLRequired ? truststorePath : undefined,
-      truststore_password: isSSLRequired ? truststorePassword : undefined,
     };
 
     try {
@@ -134,10 +118,6 @@ export function ClusterConfigModal({
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
       ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
-      keystore_path: isSSLRequired ? keystorePath : undefined,
-      keystore_password: isSSLRequired ? keystorePassword : undefined,
-      truststore_path: isSSLRequired ? truststorePath : undefined,
-      truststore_password: isSSLRequired ? truststorePassword : undefined,
     };
 
     try {
@@ -162,10 +142,6 @@ export function ClusterConfigModal({
       username: isSASLRequired ? username : undefined,
       password: isSASLRequired ? password : undefined,
       sslCaBundlePath: isSSLRequired ? sslCaBundlePath : undefined,
-      keystorePath: isSSLRequired ? keystorePath : undefined,
-      keystorePassword: isSSLRequired ? keystorePassword : undefined,
-      truststorePath: isSSLRequired ? truststorePath : undefined,
-      truststorePassword: isSSLRequired ? truststorePassword : undefined,
       createdAt: cluster?.createdAt || new Date().toISOString(),
     };
 
@@ -347,61 +323,6 @@ export function ClusterConfigModal({
                   </div>
                 </div>
               </div>
-              // <div className="space-y-4 border border-edge rounded-lg p-4">
-              //   <h3 className="font-mono text-brand text-sm">SSL Configuration</h3>
-              //
-              //   <div className="grid grid-cols-2 gap-4">
-              //     <div className="space-y-2">
-              //       <Label className="font-mono text-sm text-soft">
-              //         Keystore Path
-              //       </Label>
-              //       <Input
-              //         value={keystorePath}
-              //         onChange={(e) => setKeystorePath(e.target.value)}
-              //         placeholder="/path/to/client.keystore.jks"
-              //         className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-              //       />
-              //     </div>
-              //     <div className="space-y-2">
-              //       <Label className="font-mono text-sm text-soft">
-              //         Keystore Password
-              //       </Label>
-              //       <Input
-              //         type="password"
-              //         value={keystorePassword}
-              //         onChange={(e) => setKeystorePassword(e.target.value)}
-              //         placeholder="keystore password"
-              //         className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-              //       />
-              //     </div>
-              //   </div>
-              //
-              //   <div className="grid grid-cols-2 gap-4">
-              //     <div className="space-y-2">
-              //       <Label className="font-mono text-sm text-soft">
-              //         Truststore Path
-              //       </Label>
-              //       <Input
-              //         value={truststorePath}
-              //         onChange={(e) => setTruststorePath(e.target.value)}
-              //         placeholder="/path/to/client.truststore.jks"
-              //         className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-              //       />
-              //     </div>
-              //     <div className="space-y-2">
-              //       <Label className="font-mono text-sm text-soft">
-              //         Truststore Password
-              //       </Label>
-              //       <Input
-              //         type="password"
-              //         value={truststorePassword}
-              //         onChange={(e) => setTruststorePassword(e.target.value)}
-              //         placeholder="truststore password"
-              //         className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-              //       />
-              //     </div>
-              //   </div>
-              // </div>
             )}
           </div>
         </div>

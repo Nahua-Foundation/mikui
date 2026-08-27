@@ -1,8 +1,11 @@
 // Types
 export * from './types';
 
-// Mock Data
+// Стартовые данные (без персистентности — см. Фазу 3)
 export * from './mockData';
+
+// Hooks
+export { useMessageWindow } from './useMessageWindow';
 
 // Components
 export { DialogContentNoClose } from './DialogContentNoClose';
