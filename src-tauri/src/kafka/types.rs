@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ClusterConnectPayload {
+    /// Идентификатор сохранённого кластера, если подключаемся к такому.
+    /// Нужен, чтобы достать пароль из keychain, не гоняя его через IPC.
+    #[serde(default)]
+    pub id: Option<String>,
     pub brokers: String,
     pub security_protocol: String,
     pub sasl_mechanism: Option<String>,

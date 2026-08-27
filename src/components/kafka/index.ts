@@ -1,8 +1,9 @@
 // Types
 export * from './types';
 
-// Стартовые данные (без персистентности — см. Фазу 3)
-export * from './mockData';
+
+// API-слой
+export * as api from './api';
 
 // Hooks
 export { useMessageWindow } from './useMessageWindow';

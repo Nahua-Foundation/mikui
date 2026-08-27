@@ -1,6 +1,5 @@
 import { Button } from '../../ui/button';
 import { Plus, Edit, Trash2 } from 'lucide-react';
-import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { KafkaCluster } from '../types';
@@ -10,27 +9,23 @@ interface ClusterArchiveModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   clusters: KafkaCluster[];
-  onClustersChange: (clusters: KafkaCluster[]) => void;
+  connectedClusterId: string | null;
+  onDeleteCluster: (id: string) => void;
   onCreateNew: () => void;
   onEditCluster: (cluster: KafkaCluster) => void;
   onConnectToCluster: (cluster: KafkaCluster) => void;
 }
 
-export function ClusterArchiveModal({ 
-  open, 
-  onOpenChange, 
-  clusters, 
-  onClustersChange, 
-  onCreateNew, 
-  onEditCluster, 
-  onConnectToCluster 
+export function ClusterArchiveModal({
+  open,
+  onOpenChange,
+  clusters,
+  connectedClusterId,
+  onDeleteCluster,
+  onCreateNew,
+  onEditCluster,
+  onConnectToCluster,
 }: ClusterArchiveModalProps) {
-  const handleDeleteCluster = (clusterId: string) => {
-    const updatedClusters = clusters.filter(cluster => cluster.id !== clusterId);
-    onClustersChange(updatedClusters);
-    toast.success('Cluster deleted successfully');
-  };
-
   const handleConnectAndClose = (cluster: KafkaCluster) => {
     onConnectToCluster(cluster);
     onOpenChange(false);
@@ -70,8 +65,20 @@ export function ClusterArchiveModal({
                     onClick={() => handleConnectAndClose(cluster)}
                   >
                     <TableCell className="py-4">
-                      <div className="font-mono text-slate-50">
-                        {cluster.name}
+                      <div className="flex items-center gap-2">
+                        {cluster.id === connectedClusterId && (
+                          <span
+                            className="size-2 rounded-full bg-green-500 shrink-0"
+                            title="Connected"
+                          />
+                        )}
+                        <span className="font-mono text-slate-50">{cluster.name}</span>
+                      </div>
+                      <div className="font-mono text-xs text-dim mt-1">
+                        {cluster.brokers}
+                        {' · '}
+                        {cluster.security_protocol}
+                        {cluster.has_password && ' · password saved'}
                       </div>
                     </TableCell>
                     <TableCell className="py-4 text-right">
@@ -89,7 +96,7 @@ export function ClusterArchiveModal({
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleDeleteCluster(cluster.id);
+                            onDeleteCluster(cluster.id);
                           }}
                           className="p-1 text-dim hover:text-red-400 transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
                           title="Delete cluster"

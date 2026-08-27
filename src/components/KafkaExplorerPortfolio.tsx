@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   Topic,
+  ClusterConnectPayload,
   FavoriteMessage,
   FullMessage,
   MessageFilter,
@@ -9,7 +10,7 @@ import {
   OpenTopicResult,
   EMPTY_FILTER,
 } from './kafka';
-import { mockClusters } from './kafka';
+import * as api from './kafka/api';
 import { HeaderDesktop } from './kafka';
 import { TopicsPanel } from './kafka';
 import { MessagesPanel } from './kafka';
@@ -52,9 +53,22 @@ export function KafkaExplorerPortfolio() {
   const [generation, setGeneration] = useState(0);
   const { ensureRange, getRow, version } = useMessageWindow(generation);
 
-  const [clusters, setClusters] = useState<KafkaCluster[]>(mockClusters);
+  const [clusters, setClusters] = useState<KafkaCluster[]>([]);
   const [selectedCluster, setSelectedCluster] = useState<KafkaCluster | null>(null);
+  const [connectedClusterId, setConnectedClusterId] = useState<string | null>(null);
   const [clusterConfigMode, setClusterConfigMode] = useState<ClusterConfigMode>('create');
+
+  // Сохранённые подключения читаются с диска при старте. Раньше список жил
+  // только в React state, поэтому добавленный кластер исчезал при перезапуске.
+  useEffect(() => {
+    api
+      .listClusters()
+      .then(setClusters)
+      .catch((e) => {
+        console.error('Failed to load clusters', e);
+        toast.error(`Failed to load saved clusters: ${e}`);
+      });
+  }, []);
 
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
@@ -160,47 +174,61 @@ export function KafkaExplorerPortfolio() {
     setIsClusterConfigModalOpen(true);
   }, []);
 
-  const handleConnectToCluster = useCallback((cluster: KafkaCluster) => {
-    setClusters((prev) =>
-      prev.map((c) => ({
-        ...c,
-        isActive: c.id === cluster.id,
-        lastUsed: c.id === cluster.id ? new Date().toISOString() : c.lastUsed,
-      })),
-    );
-    toast.success(`Connected to ${cluster.name}`);
+  /**
+   * Единственный путь подключения — им пользуются и кнопка Connect в форме,
+   * и клик по строке в архиве. Раньше клик по архиву только красил строку и
+   * показывал «Connected», ничего не подключая.
+   */
+  const connect = useCallback(async (payload: ClusterConnectPayload, label: string) => {
+    try {
+      await api.clusterConnect(payload);
+      const loaded = await api.getTopics();
+      setTopics(loaded);
+      setSelectedTopic(null);
+      setConnectedClusterId(payload.id ?? null);
+      // last_used обновил бэкенд — перечитываем список, чтобы порядок совпадал.
+      api.listClusters().then(setClusters).catch(() => {});
+      toast.success(`Connected to ${label} · ${loaded.length} topics`);
+    } catch (e) {
+      console.error('Connect failed', e);
+      toast.error(`Failed to connect: ${e}`);
+      throw e;
+    }
   }, []);
+
+  const handleConnectToCluster = useCallback(
+    (cluster: KafkaCluster) => {
+      connect(api.clusterToPayload(cluster), cluster.name).catch(() => {});
+    },
+    [connect],
+  );
 
   const handleBackToArchive = useCallback(() => {
     setIsClusterConfigModalOpen(false);
     setIsClusterArchiveModalOpen(true);
   }, []);
 
-  const handleSaveCluster = useCallback(
-    (clusterData: Partial<KafkaCluster>) => {
-      if (clusterConfigMode === 'create') {
-        setClusters((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            name: clusterData.name || 'Untitled Cluster',
-            brokers: clusterData.brokers || 'localhost:9092',
-            securityProtocol: clusterData.securityProtocol || 'PLAINTEXT',
-            saslMechanism: clusterData.saslMechanism,
-            username: clusterData.username,
-            password: clusterData.password,
-            sslCaBundlePath: clusterData.sslCaBundlePath,
-            createdAt: new Date().toISOString(),
-            isActive: false,
-          },
-        ]);
-      } else if (selectedCluster) {
-        setClusters((prev) =>
-          prev.map((c) => (c.id === selectedCluster.id ? { ...c, ...clusterData } : c)),
-        );
+  /** Кластер уже записан на диск бэкендом — здесь только обновляем список. */
+  const handleClusterSaved = useCallback((saved: KafkaCluster) => {
+    setClusters((prev) => {
+      const known = prev.some((c) => c.id === saved.id);
+      return known ? prev.map((c) => (c.id === saved.id ? saved : c)) : [...prev, saved];
+    });
+  }, []);
+
+  const handleDeleteCluster = useCallback(
+    async (id: string) => {
+      try {
+        await api.deleteCluster(id);
+        setClusters((prev) => prev.filter((c) => c.id !== id));
+        if (connectedClusterId === id) setConnectedClusterId(null);
+        toast.success('Cluster deleted');
+      } catch (e) {
+        console.error('Failed to delete cluster', e);
+        toast.error(`Failed to delete cluster: ${e}`);
       }
     },
-    [clusterConfigMode, selectedCluster],
+    [connectedClusterId],
   );
 
   const handleRefresh = useCallback(() => {
@@ -284,7 +312,8 @@ export function KafkaExplorerPortfolio() {
         open={isClusterArchiveModalOpen}
         onOpenChange={setIsClusterArchiveModalOpen}
         clusters={clusters}
-        onClustersChange={setClusters}
+        connectedClusterId={connectedClusterId}
+        onDeleteCluster={handleDeleteCluster}
         onCreateNew={handleCreateNewCluster}
         onEditCluster={handleEditCluster}
         onConnectToCluster={handleConnectToCluster}
@@ -296,11 +325,8 @@ export function KafkaExplorerPortfolio() {
         cluster={selectedCluster}
         mode={clusterConfigMode}
         onBack={handleBackToArchive}
-        onSave={handleSaveCluster}
-        onConnected={(loaded: Topic[]) => {
-          setTopics(loaded);
-          setSelectedTopic(null);
-        }}
+        onSaved={handleClusterSaved}
+        onConnect={connect}
       />
 
       <FavoritesModal

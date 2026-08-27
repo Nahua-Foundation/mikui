@@ -70,16 +70,39 @@ export interface OpenTopicResult {
   truncated: boolean;
 }
 
+/**
+ * Сохранённое подключение — ровно то, что лежит в clusters.json.
+ *
+ * Поля пароля здесь нет намеренно: он живёт в системном keychain, и при
+ * подключении к сохранённому кластеру фронт передаёт только `id`.
+ * `has_password` — признак того, что пароль там есть, а не сам пароль.
+ */
 export interface KafkaCluster {
   id: string;
   name: string;
   brokers: string;
-  securityProtocol: string;
-  saslMechanism?: string;
+  security_protocol: string;
+  sasl_mechanism?: string;
+  username?: string;
+  ssl_ca_bundle_path?: string;
+  created_at: string;
+  last_used?: string;
+  has_password: boolean;
+}
+
+/** Параметры подключения. `password` заполняется только для несохранённой формы. */
+export interface ClusterConnectPayload {
+  id?: string;
+  brokers: string;
+  security_protocol: string;
+  sasl_mechanism?: string;
   username?: string;
   password?: string;
-  sslCaBundlePath?: string;
-  createdAt: string;
-  lastUsed?: string;
-  isActive?: boolean;
+  ssl_ca_bundle_path?: string;
+}
+
+/** Файл настроек. Своих полей пока нет — see config/types.rs. */
+export interface Settings {
+  version: number;
+  [key: string]: unknown;
 }

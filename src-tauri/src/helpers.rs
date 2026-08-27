@@ -18,10 +18,18 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
     cc.set("bootstrap.servers", &conf.brokers);
     cc.set("client.id", "mikui");
 
-    // group.id уникален на процесс: несколько пользователей mikui больше не
-    // толкаются в одной группе. В Фазе 1 переходим на assign() с явными
-    // офсетами, и группа уходит совсем — вместе с JoinGroup/heartbeat/rebalance.
-    cc.set("group.id", format!("mikui-{}", std::process::id()));
+    // group.id НЕ задаётся сознательно, и это важно.
+    //
+    // Мы читаем только через assign() с явными офсетами, потребительская группа
+    // нам не нужна ни для чего. Но librdkafka заводит объект группы при любом
+    // непустом group.id (rdkafka.c: `if (RD_KAFKAP_STR_LEN(rk_group_id) > 0)`)
+    // и начинает ходить к координатору. На кластере, где у пользователя нет ACL
+    // на группы, это валится в GroupAuthorizationFailed прямо во время poll —
+    // хотя сами сообщения читать право есть.
+    //
+    // Без group.id librdkafka идёт по ветке «legacy consumer»: ни
+    // FindCoordinator, ни JoinGroup, ни heartbeat, ни rebalance. Меньше
+    // трафика, меньше задержек и никаких требований к правам на группу.
 
     // --- Метаданные -------------------------------------------------------
     // Было 10_000: метаданные всего кластера перезапрашивались каждые 10 секунд.
@@ -30,6 +38,8 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
 
     // --- Сеть -------------------------------------------------------------
     cc.set("socket.timeout.ms", "10000"); // fail fast: UI не должен висеть минуту
+    // session.timeout.ms не задаём: это параметр потребительской группы,
+    // которой у нас нет.
     cc.set("socket.nagle.disable", "true"); // мелкие запросы уходят сразу
     // Было 30_000: каждые 30 секунд простоя соединение рвалось, и следующий
     // запрос платил заново за TCP + TLS handshake. Держим чуть меньше
@@ -56,15 +66,14 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
     cc.set("queued.max.messages.kbytes", "16384");
 
     // --- Офсеты -----------------------------------------------------------
-    cc.set("enable.auto.commit", "false");
-    cc.set("enable.auto.offset.store", "false");
     // Просмотрщику незачем создавать топики побочным эффектом.
     cc.set("allow.auto.create.topics", "false");
-    // TODO(Фаза 1): убрать вместе с group.id — офсеты задаём явным seek().
-    cc.set("auto.offset.reset", "earliest");
     // Нужно, чтобы понимать «партиция вычитана до конца» и прекращать опрос,
-    // а не крутиться вхолостую. Фаза 1 опирается на этот сигнал.
+    // а не крутиться вхолостую.
     cc.set("enable.partition.eof", "true");
+    // enable.auto.commit / enable.auto.offset.store / auto.offset.reset здесь
+    // не нужны: без группы коммитить некуда, а стартовый офсет мы задаём явно
+    // в assign() через OffsetTail или Beginning.
 
     apply_security(&mut cc, conf);
 

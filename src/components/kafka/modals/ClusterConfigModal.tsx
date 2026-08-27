@@ -7,13 +7,17 @@ import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
-import { KafkaCluster, Topic } from '../types';
-import { invoke } from '@tauri-apps/api/core';
+import { ClusterConnectPayload, KafkaCluster } from '../types';
+import * as api from '../api';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 /** Запасной список на случай, если бэкенд не ответил. GSSAPI сюда не входит:
  *  он есть не в каждой сборке (Cyrus SASL линкуется только фичей `gssapi`). */
 const FALLBACK_MECHANISMS = ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512', 'OAUTHBEARER'];
+
+/** Плейсхолдер вместо сохранённого пароля: показывать сам пароль в поле незачем,
+ *  а вот сообщить, что он есть, полезно. */
+const KEPT_PASSWORD = '';
 
 interface ClusterConfigModalProps {
   open: boolean;
@@ -21,18 +25,18 @@ interface ClusterConfigModalProps {
   cluster?: KafkaCluster | null;
   mode: 'create' | 'edit';
   onBack?: () => void;
-  onSave?: (cluster: Partial<KafkaCluster>) => void;
-  onConnected?: (topics: Topic[]) => void;
+  onSaved?: (cluster: KafkaCluster) => void;
+  onConnect?: (payload: ClusterConnectPayload, name: string) => Promise<void>;
 }
 
-export function ClusterConfigModal({ 
-  open, 
-  onOpenChange, 
-  cluster, 
+export function ClusterConfigModal({
+  open,
+  onOpenChange,
+  cluster,
   mode,
   onBack,
-  onSave,
-  onConnected,
+  onSaved,
+  onConnect,
 }: ClusterConfigModalProps) {
   const [name, setName] = useState<string>('');
   const [brokers, setBrokers] = useState<string>('localhost:9092');
@@ -49,7 +53,8 @@ export function ClusterConfigModal({
   // Какие механизмы доступны, знает только бэкенд: GSSAPI требует Cyrus SASL,
   // который линкуется не во всех сборках. Спрашиваем один раз за жизнь модалки.
   useEffect(() => {
-    invoke<string[]>('sasl_mechanisms')
+    api
+      .saslMechanisms()
       .then(setMechanisms)
       .catch((e) => console.error('Failed to load SASL mechanisms', e));
   }, []);
@@ -59,11 +64,13 @@ export function ClusterConfigModal({
     if (cluster && mode === 'edit') {
       setName(cluster.name);
       setBrokers(cluster.brokers);
-      setSecurityProtocol(cluster.securityProtocol);
+      setSecurityProtocol(cluster.security_protocol);
       setUsername(cluster.username || '');
-      setPassword(cluster.password || '');
-      setSslCaBundlePath(cluster.sslCaBundlePath || '');
-      setSaslMechanism(cluster.saslMechanism || 'PLAIN');
+      // Пароль из keychain сюда не тянем: он не нужен форме и незачем гонять
+      // его через IPC. Пустое поле означает «оставить как есть».
+      setPassword(KEPT_PASSWORD);
+      setSslCaBundlePath(cluster.ssl_ca_bundle_path || '');
+      setSaslMechanism(cluster.sasl_mechanism || 'PLAIN');
     } else {
       // Reset form for create mode
       setName('');
@@ -76,81 +83,65 @@ export function ClusterConfigModal({
     }
   }, [cluster, mode, open]);
 
-  const handleConnect = async () => {
-    const clusterData = {
-      name,
-      brokers,
-      security_protocol: securityProtocol,
-      sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
-      username: isSASLRequired ? username : undefined,
-      password: isSASLRequired ? password : undefined,
-      ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
-    };
+  const buildPayload = (): ClusterConnectPayload => ({
+    id: cluster?.id,
+    brokers,
+    security_protocol: securityProtocol,
+    sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
+    username: isSASLRequired ? username : undefined,
+    // Пустой пароль у сохранённого кластера — сигнал «возьми из keychain».
+    password: isSASLRequired && password ? password : undefined,
+    ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
+  });
 
+  const buildConfig = (): KafkaCluster => ({
+    id: cluster?.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: name.trim() || 'Untitled Cluster',
+    brokers,
+    security_protocol: securityProtocol,
+    sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
+    username: isSASLRequired ? username : undefined,
+    ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
+    created_at: cluster?.created_at || new Date().toISOString(),
+    last_used: cluster?.last_used,
+    has_password: cluster?.has_password ?? false,
+  });
+
+  const handleConnect = async () => {
+    if (!onConnect) return;
     try {
       setIsConnecting(true);
-      await invoke('cluster_connect', { payload: clusterData });
-      // After successful connect, fetch topics from backend
-      try {
-        const topics = await invoke<Topic[]>('get_topics');
-        if (onConnected) {
-          onConnected(topics);
-        }
-      } catch (err) {
-        console.error('Failed to fetch topics after connect', err);
-      }
-      toast.success('Connected to Kafka cluster');
+      await onConnect(buildPayload(), name || brokers);
       onOpenChange(false);
-    } catch (e) {
-      console.error(e);
-      toast.error('Failed to connect to Kafka cluster: ' + (e as Error).message);
     } finally {
       setIsConnecting(false);
     }
   };
 
   const handleTestConnection = async () => {
-    const clusterData = {
-      name,
-      brokers,
-      security_protocol: securityProtocol,
-      sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
-      username: isSASLRequired ? username : undefined,
-      password: isSASLRequired ? password : undefined,
-      ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
-    };
-
     try {
       setIsTesting(true);
-      await invoke('cluster_test', { payload: clusterData });
+      await api.clusterTest(buildPayload());
       toast.success('Connection test successful');
     } catch (e) {
       console.error(e);
-      toast.error('Connection test failed');
+      toast.error(`Connection test failed: ${e}`);
     } finally {
       setIsTesting(false);
     }
   };
 
-  const handleSave = () => {
-    const clusterData: Partial<KafkaCluster> = {
-      id: cluster?.id,
-      name,
-      brokers,
-      securityProtocol,
-      saslMechanism: isSASLRequired ? saslMechanism : undefined,
-      username: isSASLRequired ? username : undefined,
-      password: isSASLRequired ? password : undefined,
-      sslCaBundlePath: isSSLRequired ? sslCaBundlePath : undefined,
-      createdAt: cluster?.createdAt || new Date().toISOString(),
-    };
-
-    if (onSave) {
-      onSave(clusterData);
+  const handleSave = async () => {
+    try {
+      // undefined — не трогать сохранённый пароль; иначе записать введённый.
+      const saved = await api.saveCluster(buildConfig(), password ? password : undefined);
+      onSaved?.(saved);
+      toast.success(mode === 'create' ? 'Cluster created' : 'Cluster updated');
+      onOpenChange(false);
+    } catch (e) {
+      console.error(e);
+      toast.error(`Failed to save cluster: ${e}`);
     }
-    
-    toast.success(mode === 'create' ? 'Cluster created successfully' : 'Cluster updated successfully');
-    onOpenChange(false);
   };
 
   const handleBack = () => {
@@ -275,7 +266,9 @@ export function ClusterConfigModal({
                       type="password"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      placeholder="Enter password"
+                      placeholder={
+                        cluster?.has_password ? 'Saved in keychain — leave blank to keep' : 'Enter password'
+                      }
                       className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
                     />
                   </div>
