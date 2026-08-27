@@ -23,12 +23,12 @@ function TopicItem({ topic, isSelected, onClick, onConfigClick }: TopicItemProps
         <div className="box-border content-stretch flex flex-row gap-1.5 items-center justify-start px-2 py-1 relative w-full">
           <button
             onClick={handleEditClick}
-            className="size-4 text-[#62748E] hover:text-[#ffb86a] transition-colors cursor-pointer p-0 border-none bg-transparent"
+            className="size-4 text-dim hover:text-brand transition-colors cursor-pointer p-0 border-none bg-transparent"
           >
             <Edit className="size-4" />
           </button>
-          <div className={`basis-0 font-['Fira_Code:Retina',_sans-serif] font-[450] grow leading-[0] min-h-px min-w-px relative shrink-0 text-[14px] text-left ${
-            isSelected ? 'text-slate-50' : 'text-[#90a1b9] hover:text-slate-50'
+          <div className={`basis-0 font-mono font-[450] grow leading-[0] min-h-px min-w-px relative shrink-0 text-[14px] text-left ${
+            isSelected ? 'text-slate-50' : 'text-soft hover:text-slate-50'
           }`}>
             <p className="block leading-[20px]" style={{whiteSpace: "nowrap"}}>{topic.name}</p>
           </div>
@@ -57,16 +57,16 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
       topics.sort((a, b) => a.name.localeCompare(b.name));
 
   return (
-    <div className="w-[220px] flex flex-col h-full border-r border-[#314158]">
+    <div className="w-[220px] flex flex-col h-full border-r border-edge">
       {/* Topics Filter */}
-      <div className="p-2 border-b border-[#314158]">
+      <div className="p-2 border-b border-edge">
         <div className="relative">
-          <Search className="absolute left-2 top-1/2 transform -translate-y-1/2 size-4 text-[#62748E]" />
+          <Search className="absolute left-2 top-1/2 transform -translate-y-1/2 size-4 text-dim" />
           <Input
             value={topicFilter}
             onChange={(e) => setTopicFilter(e.target.value)}
             placeholder="Filter topics..."
-            className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E] pl-8"
+            className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8"
           />
         </div>
       </div>
@@ -74,7 +74,7 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
       {/* Topics List with Virtuoso */}
       <div className="flex-1 min-h-0">
         {filteredTopics.length === 0 && topicFilter ? (
-          <div className="flex items-center justify-center py-4 text-[#62748E] font-['Fira_Code:Retina',_sans-serif] text-sm">
+          <div className="flex items-center justify-center py-4 text-dim font-mono text-sm">
             No topics match "{topicFilter}"
           </div>
         ) : (

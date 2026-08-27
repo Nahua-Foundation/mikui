@@ -2,6 +2,37 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* mikui design tokens.
+   Имена намеренно не пересекаются с shadcn-токенами из блока `@theme inline` ниже
+   (accent / muted / border / background / ... уже заняты им). */
+@theme {
+  /* "Fira Code VF" первым — тогда промежуточные веса вроде font-[450] (Retina,
+     тот самый вес из макета) берутся из вариативного файла, а не синтезируются. */
+  --font-mono: "Fira Code VF", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Поверхности, от самой глубокой к приподнятой */
+  --color-sunken: #020618;   /* блоки с телом сообщения */
+  --color-surface: #0f172b;  /* основной фон приложения */
+  --color-elevated: #1e293b; /* hover по строке/карточке */
+  --color-edge: #314158;     /* границы и активный фон пунктов меню */
+
+  /* Текст */
+  --color-dim: #62748e;      /* плейсхолдеры, третичный текст */
+  --color-soft: #90a1b9;     /* вторичный текст, основной для интерфейса */
+
+  /* Акцент */
+  --color-brand: #ffb86a;
+  --color-brand-hover: #e5a860;
+
+  /* Состояния */
+  --color-danger: #ef4444;
+  --color-danger-hover: #f87171;
+
+  /* Подсветка JSON в просмотре сообщения */
+  --color-syntax-brace: #c27aff;
+  --color-syntax-bracket: #615fff;
+}
+
 :root {
   --font-size: 14px;
   --background: #ffffff;

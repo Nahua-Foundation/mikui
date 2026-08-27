@@ -19,12 +19,6 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
   const [messageType, setMessageType] = useState<string>('JSON');
   const [schemaRegistry, setSchemaRegistry] = useState<string>('');
   const [password, setPassword] = useState<string>('');
-  const [username, setUsername] = useState<string>('');
-  const [keystorePath, setKeystorePath] = useState<string>('');
-  const [keystorePassword, setKeystorePassword] = useState<string>('');
-  const [truststorePath, setTruststorePath] = useState<string>('');
-  const [truststorePassword, setTruststorePassword] = useState<string>('');
-  const [saslMechanism, setSaslMechanism] = useState<string>('PLAIN');
 
   const handleLoadFiles = () => {
     const input = document.createElement('input');
@@ -45,33 +39,26 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
     onOpenChange(false);
   };
 
-  const handleTestConnection = () => {
-    toast.success('Connection test successful');
-  };
-
   const handleAddToFavorites = () => {
     toast.success(`Added "${topic?.name}" to favorites`);
   };
-
-  const isSSLRequired = messageType === 'Avro';
-  const isSASLRequired = messageType === 'Avro';
 
   if (!topic) return null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContentNoClose 
-        className="max-w-md bg-[#0f172b] border-[#314158] text-slate-50"
+        className="max-w-md bg-surface border-edge text-slate-50"
         aria-describedby={undefined}
       >
-        <DialogHeader className="border-b border-[#314158] pb-4">
+        <DialogHeader className="border-b border-edge pb-4">
           <div className="flex items-center justify-between">
-            <DialogTitle className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-lg">
+            <DialogTitle className="font-mono text-soft text-lg">
               {topic.name}
             </DialogTitle>
             <button
               onClick={handleAddToFavorites}
-              className="p-1 text-[#62748E] hover:text-[#ffb86a] transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+              className="p-1 text-dim hover:text-brand transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
               title="Add to favorites"
             >
               <Bookmark className="size-4" />
@@ -82,18 +69,18 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
         <div className="space-y-6 pt-4">
           {/* Message Type */}
           <div className="space-y-2">
-            <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+            <Label className="font-mono text-sm text-soft">
               Message Type
             </Label>
             <Select value={messageType} onValueChange={setMessageType}>
-              <SelectTrigger className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif]">
+              <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className="bg-[#0f172b] border-[#314158]">
-                <SelectItem value="JSON" className="text-slate-50 font-['Fira_Code:Retina',_sans-serif] focus:bg-[#314158]">JSON</SelectItem>
-                <SelectItem value="Text" className="text-slate-50 font-['Fira_Code:Retina',_sans-serif] focus:bg-[#314158]">Text</SelectItem>
-                <SelectItem value="Proto" className="text-slate-50 font-['Fira_Code:Retina',_sans-serif] focus:bg-[#314158]">Proto</SelectItem>
-                <SelectItem value="Avro" className="text-slate-50 font-['Fira_Code:Retina',_sans-serif] focus:bg-[#314158]">Avro</SelectItem>
+              <SelectContent className="bg-surface border-edge">
+                <SelectItem value="JSON" className="text-slate-50 font-mono focus:bg-edge">JSON</SelectItem>
+                <SelectItem value="Text" className="text-slate-50 font-mono focus:bg-edge">Text</SelectItem>
+                <SelectItem value="Proto" className="text-slate-50 font-mono focus:bg-edge">Proto</SelectItem>
+                <SelectItem value="Avro" className="text-slate-50 font-mono focus:bg-edge">Avro</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -102,13 +89,13 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
           {messageType === 'Proto' && (
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+                <Label className="font-mono text-sm text-soft">
                   Proto Files
                 </Label>
                 <Button
                   onClick={handleLoadFiles}
                   variant="outline"
-                  className="w-full bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif]"
+                  className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
                 >
                   <Upload className="size-4 mr-2" />
                   Load Proto Files
@@ -121,18 +108,18 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
           {messageType === 'Avro' && (
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+                <Label className="font-mono text-sm text-soft">
                   Schema Registry URL
                 </Label>
                 <Input
                   value={schemaRegistry}
                   onChange={(e) => setSchemaRegistry(e.target.value)}
                   placeholder="http://localhost:8081"
-                  className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
+                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
                 />
               </div>
               <div className="space-y-2">
-                <Label className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9]">
+                <Label className="font-mono text-sm text-soft">
                   Password
                 </Label>
                 <Input
@@ -140,7 +127,7 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Enter password"
-                  className="bg-[#0f172b] border-[#314158] text-slate-50 font-['Fira_Code:Retina',_sans-serif] placeholder:text-[#62748E]"
+                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
                 />
               </div>
             </div>
@@ -151,13 +138,13 @@ export function TopicConfigModal({ topic, open, onOpenChange }: TopicConfigModal
             <Button
               onClick={() => onOpenChange(false)}
               variant="outline"
-              className="flex-1 bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50 font-['Fira_Code:Retina',_sans-serif]"
+              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
             >
               Cancel
             </Button>
             <Button
               onClick={handleSave}
-              className="flex-1 bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860] font-['Fira_Code:Retina',_sans-serif]"
+              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono"
             >
               Save
             </Button>

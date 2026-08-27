@@ -196,11 +196,10 @@ export function KafkaExplorerPortfolio() {
   };
 
   return (
-    <div className="bg-[#0f172b] box-border content-stretch flex flex-col items-start justify-start p-0 relative w-full h-full" data-name="kafka-explorer-portfolio">
+    <div className="bg-surface box-border content-stretch flex flex-col items-start justify-start p-0 relative w-full h-full" data-name="kafka-explorer-portfolio">
       
       {/* Header */}
-      <HeaderDesktop 
-        selectedTopic={selectedTopic?.name || null} 
+      <HeaderDesktop
         selectedPartition={selectedPartition}
         onSelectPartition={setSelectedPartition}
         topic={selectedTopic}
@@ -269,10 +268,7 @@ export function KafkaExplorerPortfolio() {
         mode={clusterConfigMode}
         onBack={handleBackToArchive}
         onSave={handleSaveCluster}
-        onConnected={(topicNames: string[]) => {
-          const mapped: Topic[] = topicNames.map(name => ({ name, partitions: 1 }));
-          setTopics(mapped);
-        }}
+        onConnected={setTopics}
       />
       
       {/* Favorites Modal */}

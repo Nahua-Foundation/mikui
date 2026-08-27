@@ -38,20 +38,20 @@ export function ClusterArchiveModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-4xl max-h-[80vh] bg-[#0f172b] border-[#314158] text-slate-50">
-        <DialogHeader className="border-b border-[#314158] pb-4">
+      <DialogContentNoClose className="max-w-4xl max-h-[80vh] bg-surface border-edge text-slate-50">
+        <DialogHeader className="border-b border-edge pb-4">
           <div className="flex items-center justify-between">
             <div>
-              <DialogTitle className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-xl">
+              <DialogTitle className="font-mono text-soft text-xl">
                 Cluster Archive
               </DialogTitle>
-              <DialogDescription className="text-sm text-[#62748E]">
+              <DialogDescription className="text-sm text-dim">
                 Manage your Kafka cluster connections
               </DialogDescription>
             </div>
             <Button
               onClick={onCreateNew}
-              className="bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860] font-['Fira_Code:Retina',_sans-serif]"
+              className="bg-brand text-surface hover:bg-brand-hover font-mono"
             >
               <Plus className="size-4 mr-2" />
               Create New
@@ -60,17 +60,17 @@ export function ClusterArchiveModal({
         </DialogHeader>
 
         <div className="flex-1 overflow-auto pt-4">
-          <div className="bg-[#0f172b] border border-[#314158] rounded-lg overflow-hidden">
+          <div className="bg-surface border border-edge rounded-lg overflow-hidden">
             <Table>
               <TableBody>
                 {clusters.map((cluster) => (
                   <TableRow
                     key={cluster.id}
-                    className="border-[#314158] hover:bg-[#314158]/20 cursor-pointer transition-colors"
+                    className="border-edge hover:bg-edge/20 cursor-pointer transition-colors"
                     onClick={() => handleConnectAndClose(cluster)}
                   >
                     <TableCell className="py-4">
-                      <div className="font-['Fira_Code:Retina',_sans-serif] text-slate-50">
+                      <div className="font-mono text-slate-50">
                         {cluster.name}
                       </div>
                     </TableCell>
@@ -81,7 +81,7 @@ export function ClusterArchiveModal({
                             e.stopPropagation();
                             onEditCluster(cluster);
                           }}
-                          className="p-1 text-[#62748E] hover:text-[#ffb86a] transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+                          className="p-1 text-dim hover:text-brand transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
                           title="Edit cluster"
                         >
                           <Edit className="size-4" />
@@ -91,7 +91,7 @@ export function ClusterArchiveModal({
                             e.stopPropagation();
                             handleDeleteCluster(cluster.id);
                           }}
-                          className="p-1 text-[#62748E] hover:text-red-400 transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+                          className="p-1 text-dim hover:text-red-400 transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
                           title="Delete cluster"
                         >
                           <Trash2 className="size-4" />
@@ -106,12 +106,12 @@ export function ClusterArchiveModal({
 
           {clusters.length === 0 && (
             <div className="text-center py-12">
-              <div className="text-[#62748E] font-['Fira_Code:Retina',_sans-serif] mb-4">
+              <div className="text-dim font-mono mb-4">
                 No clusters configured yet
               </div>
               <Button
                 onClick={onCreateNew}
-                className="bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860] font-['Fira_Code:Retina',_sans-serif]"
+                className="bg-brand text-surface hover:bg-brand-hover font-mono"
               >
                 <Plus className="size-4 mr-2" />
                 Create Your First Cluster

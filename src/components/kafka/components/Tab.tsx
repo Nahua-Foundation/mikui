@@ -5,8 +5,8 @@ export function Tab({ title, active = false, onClick }: { title: string; active?
       data-name="tab"
       onClick={onClick}
     >
-      <div className={`font-['Fira_Code:Retina',_sans-serif] font-[450] leading-[0] relative shrink-0 text-[16px] text-left text-nowrap ${
-        active ? 'text-slate-50' : 'text-[#90a1b9] hover:text-slate-50'
+      <div className={`font-mono font-[450] leading-[0] relative shrink-0 text-[16px] text-left text-nowrap ${
+        active ? 'text-slate-50' : 'text-soft hover:text-slate-50'
       }`}>
         <p className="block leading-[24px] whitespace-pre">{title}</p>
       </div>

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Kerberos/GSSAPI тянет Cyrus SASL, который собирается только здесь.
+          - os: ubuntu-latest
+            cargo_features: --features gssapi
+          # Windows и macOS собираются без Cyrus: SCRAM/PLAIN/OAUTHBEARER
+          # librdkafka умеет сама поверх вендоренного OpenSSL.
+          # CMake на windows-latest уже предустановлен — он нужен rdkafka-sys,
+          # потому что дефолтный build.rs гоняет ./configure и под MSVC не работает.
+          - os: windows-latest
+            cargo_features: ''
+          - os: macos-latest
+            cargo_features: ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Системные зависимости Tauri и сборки GSSAPI (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev librsvg2-dev patchelf \
+            autoconf automake libtool bison flex
+
+      - run: npm ci
+
+      # tsc + vite. Обязательно до cargo: generate_context! вкомпилирует
+      # содержимое ../dist, и без него сборка бэкенда не пройдёт.
+      - run: npm run build
+
+      - name: cargo build
+        run: cargo build --manifest-path src-tauri/Cargo.toml --locked ${{ matrix.cargo_features }}

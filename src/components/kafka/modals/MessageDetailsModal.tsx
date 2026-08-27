@@ -56,12 +56,12 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-4xl max-h-[90vh] bg-[#0f172b] border-[#314158] text-slate-50">
-        <DialogHeader className="border-b border-[#314158] pb-4">
-          <DialogTitle className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-lg">
+      <DialogContentNoClose className="max-w-4xl max-h-[90vh] bg-surface border-edge text-slate-50">
+        <DialogHeader className="border-b border-edge pb-4">
+          <DialogTitle className="font-mono text-soft text-lg">
             Message Details
           </DialogTitle>
-          <DialogDescription className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-sm">
+          <DialogDescription className="font-mono text-soft text-sm">
             View details of the selected message
           </DialogDescription>
         </DialogHeader>
@@ -70,20 +70,20 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
           {/* Message Metadata */}
           <div className="grid grid-cols-2 gap-6">
             <div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9] mb-1">Partition</div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-[#ffb86a]">{message.partition}</div>
+              <div className="font-mono text-sm text-soft mb-1">Partition</div>
+              <div className="font-mono text-brand">{message.partition}</div>
             </div>
             <div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9] mb-1">Offset</div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-[#ffb86a]">{message.offset}</div>
+              <div className="font-mono text-sm text-soft mb-1">Offset</div>
+              <div className="font-mono text-brand">{message.offset}</div>
             </div>
             <div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9] mb-1">Key</div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-slate-50">{message.key}</div>
+              <div className="font-mono text-sm text-soft mb-1">Key</div>
+              <div className="font-mono text-slate-50">{message.key}</div>
             </div>
             <div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9] mb-1">Timestamp</div>
-              <div className="font-['Fira_Code:Retina',_sans-serif] text-slate-50">{message.timestamp}</div>
+              <div className="font-mono text-sm text-soft mb-1">Timestamp</div>
+              <div className="font-mono text-slate-50">{message.timestamp}</div>
             </div>
           </div>
           
@@ -94,10 +94,10 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
                 <Button
                   variant="ghost"
                   size="sm"
-                  className={`font-['Fira_Code:Retina',_sans-serif] px-3 py-1 h-auto ${
+                  className={`font-mono px-3 py-1 h-auto ${
                     activeTab === 'payload' 
-                      ? 'bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860]' 
-                      : 'bg-transparent text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50'
+                      ? 'bg-brand text-surface hover:bg-brand-hover' 
+                      : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
                   }`}
                   onClick={() => setActiveTab('payload')}
                 >
@@ -106,10 +106,10 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
                 <Button
                   variant="ghost"
                   size="sm"
-                  className={`font-['Fira_Code:Retina',_sans-serif] px-3 py-1 h-auto ${
+                  className={`font-mono px-3 py-1 h-auto ${
                     activeTab === 'headers' 
-                      ? 'bg-[#ffb86a] text-[#0f172b] hover:bg-[#e5a860]' 
-                      : 'bg-transparent text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50'
+                      ? 'bg-brand text-surface hover:bg-brand-hover' 
+                      : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
                   }`}
                   onClick={() => setActiveTab('headers')}
                 >
@@ -121,7 +121,7 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
                   <Button 
                     variant="outline" 
                     size="sm"
-                    className="bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50"
+                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
                     onClick={handleSave}
                   >
                     <Star className="size-4 mr-1" />
@@ -131,7 +131,7 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
                 <Button 
                   variant="outline" 
                   size="sm"
-                  className="bg-transparent border-[#314158] text-[#90a1b9] hover:bg-[#314158] hover:text-slate-50"
+                  className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
                   onClick={handleCopy}
                 >
                   <Copy className="size-4 mr-1" />
@@ -140,31 +140,31 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
               </div>
             </div>
             
-            <div className="bg-[#020618] border border-[#314158] rounded-lg p-4 max-h-96 overflow-auto">
+            <div className="bg-sunken border border-edge rounded-lg p-4 max-h-96 overflow-auto">
               {activeTab === 'payload' ? (
                 <div className="flex gap-4">
                   {/* Line numbers */}
-                  <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-right leading-6 select-none">
+                  <div className="font-mono text-soft text-right leading-6 select-none">
                     {lines.map((_, index) => (
                       <div key={index}>{index + 1}</div>
                     ))}
                   </div>
                   
                   {/* JSON content */}
-                  <div className="font-['Fira_Code:Retina',_sans-serif] leading-6 flex-1">
+                  <div className="font-mono leading-6 flex-1">
                     {lines.map((line, index) => (
                       <div key={index}>
                         {line.split('').map((char, charIndex) => {
                           if (char === '"' && line.includes(':')) {
-                            return <span key={charIndex} className="text-[#ffb86a]">{char}</span>;
+                            return <span key={charIndex} className="text-brand">{char}</span>;
                           }
                           if (char === '{' || char === '}' || char === '[' || char === ']' || char === ',' || char === ':') {
-                            return <span key={charIndex} className="text-[#c27aff]">{char}</span>;
+                            return <span key={charIndex} className="text-syntax-brace">{char}</span>;
                           }
                           if (/\d/.test(char) && !line.includes('"')) {
-                            return <span key={charIndex} className="text-[#615fff]">{char}</span>;
+                            return <span key={charIndex} className="text-syntax-bracket">{char}</span>;
                           }
-                          return <span key={charIndex} className="text-[#90a1b9]">{char}</span>;
+                          return <span key={charIndex} className="text-soft">{char}</span>;
                         })}
                       </div>
                     ))}
@@ -175,18 +175,18 @@ export function MessageDetailsModal({ message, open, onOpenChange, onAddToFavori
                   {Object.keys(message.headers).length > 0 ? (
                     <div className="space-y-2">
                       {Object.entries(message.headers).map(([key, value], index) => (
-                        <div key={index} className="flex gap-4 font-['Fira_Code:Retina',_sans-serif] leading-6">
-                          <div className="text-[#ffb86a] min-w-0 flex-shrink-0">
+                        <div key={index} className="flex gap-4 font-mono leading-6">
+                          <div className="text-brand min-w-0 flex-shrink-0">
                             {key}:
                           </div>
-                          <div className="text-[#90a1b9] break-all">
+                          <div className="text-soft break-all">
                             {value}
                           </div>
                         </div>
                       ))}
                     </div>
                   ) : (
-                    <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-center py-8">
+                    <div className="font-mono text-soft text-center py-8">
                       No headers found
                     </div>
                   )}

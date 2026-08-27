@@ -13,22 +13,14 @@ interface FavoritesModalProps {
 }
 
 export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite, onSelectMessage }: FavoritesModalProps) {
-  const formatJson = (jsonString: string) => {
-    try {
-      return JSON.stringify(JSON.parse(jsonString), null, 2);
-    } catch {
-      return jsonString;
-    }
-  };
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-5xl max-h-[90vh] bg-[#0f172b] border-[#314158] text-slate-50">
-        <DialogHeader className="border-b border-[#314158] pb-4">
-          <DialogTitle className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-lg">
+      <DialogContentNoClose className="max-w-5xl max-h-[90vh] bg-surface border-edge text-slate-50">
+        <DialogHeader className="border-b border-edge pb-4">
+          <DialogTitle className="font-mono text-soft text-lg">
             Favorite Messages ({favorites.length})
           </DialogTitle>
-          <DialogDescription className="font-['Fira_Code:Retina',_sans-serif] text-[#62748E] text-sm">
+          <DialogDescription className="font-mono text-dim text-sm">
             Add messages to your favorites by clicking the star icon in message details
           </DialogDescription>
         </DialogHeader>
@@ -37,11 +29,11 @@ export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite
           {favorites.length === 0 ? (
             <div className="flex items-center justify-center py-16">
               <div className="text-center">
-                <Star className="size-12 text-[#62748E] mx-auto mb-4" />
-                <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-lg mb-2">
+                <Star className="size-12 text-dim mx-auto mb-4" />
+                <div className="font-mono text-soft text-lg mb-2">
                   No favorite messages yet
                 </div>
-                <div className="font-['Fira_Code:Retina',_sans-serif] text-[#62748E] text-sm">
+                <div className="font-mono text-dim text-sm">
                   Add messages to your favorites by clicking the star icon in message details
                 </div>
               </div>
@@ -51,12 +43,12 @@ export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite
               {favorites.map((favorite, index) => (
                 <div 
                   key={`${favorite.topicName}-${favorite.partition}-${favorite.offset}-${index}`} 
-                  className="border border-[#314158] rounded-lg p-4 hover:bg-[#1e293b] transition-colors cursor-pointer"
+                  className="border border-edge rounded-lg p-4 hover:bg-elevated transition-colors cursor-pointer"
                   onClick={() => onSelectMessage(favorite)}
                 >
                   {/* First row: Topic name (left) + Delete button (right) */}
                   <div className="flex items-center justify-between mb-2">
-                    <div className="font-['Fira_Code:Retina',_sans-serif] text-[#ffb86a]">
+                    <div className="font-mono text-brand">
                       {favorite.topicName}
                     </div>
                     <Button
@@ -66,7 +58,7 @@ export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite
                       }}
                       variant="outline"
                       size="sm"
-                      className="bg-transparent border-[#314158] text-[#ef4444] hover:bg-[#314158] hover:text-[#f87171]"
+                      className="bg-transparent border-edge text-danger hover:bg-edge hover:text-danger-hover"
                     >
                       <Trash2 className="size-4" />
                     </Button>
@@ -74,22 +66,22 @@ export function FavoritesModal({ favorites, open, onOpenChange, onRemoveFavorite
                   
                   {/* Second row: partition and offset */}
                   <div className="flex items-center gap-4 mb-2">
-                    <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-sm">
+                    <div className="font-mono text-soft text-sm">
                       partition: {favorite.partition}
                     </div>
-                    <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] text-sm">
+                    <div className="font-mono text-soft text-sm">
                       offset: {favorite.offset}
                     </div>
                   </div>
                   
                   {/* Third row: Saved timestamp */}
-                  <div className="font-['Fira_Code:Retina',_sans-serif] text-[#62748E] text-sm mb-3">
+                  <div className="font-mono text-dim text-sm mb-3">
                     Saved: {favorite.savedAt}
                   </div>
                   
                   {/* Fourth row: Message content */}
-                  <div className="bg-[#020618] border border-[#314158] rounded-lg p-3 max-h-32 overflow-auto">
-                    <div className="font-['Fira_Code:Retina',_sans-serif] text-sm text-[#90a1b9] truncate">
+                  <div className="bg-sunken border border-edge rounded-lg p-3 max-h-32 overflow-auto">
+                    <div className="font-mono text-sm text-soft truncate">
                       {favorite.message}
                     </div>
                   </div>

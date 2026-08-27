@@ -11,26 +11,26 @@ interface MessageRowProps {
 function MessageRow({ message, onClick, gridTemplate }: MessageRowProps) {
   return (
     <div 
-      className="border-b border-[#314158] cursor-pointer hover:bg-[#1e293b]"
+      className="border-b border-edge cursor-pointer hover:bg-elevated"
       onClick={onClick}
     >
       <div
         className="grid gap-4 p-3 text-sm"
         style={{ gridTemplateColumns: gridTemplate }}
       >
-        <div className="font-['Fira_Code:Retina',_sans-serif] text-[#ffb86a]">
+        <div className="font-mono text-brand">
           {message.partition}
         </div>
-        <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] truncate">
+        <div className="font-mono text-soft truncate">
           {message.key}
         </div>
-        <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9]">
+        <div className="font-mono text-soft">
           {message.offset}
         </div>
-        <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] truncate">
+        <div className="font-mono text-soft truncate">
           {message.timestamp}
         </div>
-        <div className="font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] truncate">
+        <div className="font-mono text-soft truncate">
           {message.message}
         </div>
       </div>
@@ -109,9 +109,9 @@ export function MessagesPanel({ messages, onSelectMessage, isLoading }: Messages
   return (
     <div className="flex-1 min-h-0 flex flex-col h-full">
       {/* Header */}
-      <div className="border-b border-[#314158] bg-[#0f172b]">
+      <div className="border-b border-edge bg-surface">
         <div
-          className="grid gap-4 p-3 text-sm font-['Fira_Code:Retina',_sans-serif] text-[#90a1b9] select-none"
+          className="grid gap-4 p-3 text-sm font-mono text-soft select-none"
           style={{ gridTemplateColumns: gridTemplate }}
         >
           {["partition", "key", "offset", "timestamp", "message"].map((label, i) => (
@@ -139,7 +139,7 @@ export function MessagesPanel({ messages, onSelectMessage, isLoading }: Messages
       {/* Messages */}
       <div className="flex-1 min-h-0 overflow-hidden h-full">
         {isLoading && (
-          <div className="p-4 text-center text-[#90a1b9] font-['Fira_Code:Retina',_sans-serif]">Loading messages…</div>
+          <div className="p-4 text-center text-soft font-mono">Loading messages…</div>
         )}
         <Virtuoso
           style={{ height: '100%' }}
@@ -154,7 +154,7 @@ export function MessagesPanel({ messages, onSelectMessage, isLoading }: Messages
           )}
           components={{
             EmptyPlaceholder: () => (!isLoading ? (
-              <div className="p-4 text-center text-[#62748E] font-['Fira_Code:Retina',_sans-serif]">No messages</div>
+              <div className="p-4 text-center text-dim font-mono">No messages</div>
             ) : null)
           }}
         />

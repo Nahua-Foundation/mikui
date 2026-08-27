@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use rdkafka::{admin::AdminClient, client::DefaultClientContext, consumer::BaseConsumer};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use std::thread::sleep;
 use std::time::Duration;
 use rdkafka::consumer::Consumer;
 use crate::helpers::get_cluster_config;
@@ -62,6 +61,12 @@ pub struct GetMessagesParams {
 }
 
 #[derive(Serialize)]
+pub struct TopicInfo {
+    pub name: String,
+    pub partitions: usize,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct KafkaMessage {
     pub partition: i32,
@@ -89,12 +94,12 @@ impl App {
         Ok(())
     }
 
-    pub async fn cluster_disconnect(&mut self) -> Result<(), String> {
-        self.consumer
-            .take()
-            .and_then(move |c| Some(c.unsubscribe()));
+    pub fn cluster_disconnect(&mut self) {
+        if let Some(consumer) = self.consumer.take() {
+            consumer.unsubscribe();
+        }
         drop(self.admin_client.take());
-        Ok(())
+        self.topics_partitions_metadata = None;
     }
 
     // Async implementation with 3-second delay to simulate work without blocking UI
@@ -110,34 +115,41 @@ impl App {
         Ok(())
     }
 
-    // Returns a list of topics. For now, mock data with slight delay to simulate fetching.
-    pub fn get_topics(&mut self) -> Result<Vec<String>, String> {
-        let md = match self.consumer.as_ref().unwrap().fetch_metadata(None, Duration::from_secs(1)) {
-            Ok(md) => md,
-            Err(e) => {
-                return Err(format!("can't load cluster metadata: {}", e.to_string()));
-            }
-        };
-        let mut topics = Vec::with_capacity(md.topics().len());
-        let mut topics_metadata_cache = HashMap::with_capacity(topics.len());
-        md.topics().iter().for_each(|t| {
-            let topic_name = t.name().to_string();
-            topics.push(topic_name.clone());
-            topics_metadata_cache.insert(topic_name, t.partitions().len());
-        });
+    pub fn get_topics(&mut self) -> Result<Vec<TopicInfo>, String> {
+        let consumer = self
+            .consumer
+            .as_ref()
+            .ok_or("not connected to a cluster")?;
 
-        self.topics_partitions_metadata = Some(topics_metadata_cache);
+        // 1 секунды не хватало кластеру с тысячами топиков — метаданные просто
+        // не успевали приехать, и подключение выглядело как сломанное.
+        let md = consumer
+            .fetch_metadata(None, Duration::from_secs(10))
+            .map_err(|e| format!("can't load cluster metadata: {}", e))?;
+
+        // Раньше количество партиций считалось здесь, складывалось в кэш и
+        // выбрасывалось: наружу уходил голый Vec<String>, а фронт подставлял
+        // partitions: 1. Теперь отдаём то, что уже приехало по сети.
+        let mut topics = Vec::with_capacity(md.topics().len());
+        let mut partitions_cache = HashMap::with_capacity(md.topics().len());
+        for t in md.topics() {
+            let name = t.name().to_string();
+            let partitions = t.partitions().len();
+            partitions_cache.insert(name.clone(), partitions);
+            topics.push(TopicInfo { name, partitions });
+        }
+
+        self.topics_partitions_metadata = Some(partitions_cache);
         Ok(topics)
     }
 
-    // Returns a vector of messages for a topic with basic pagination and filtering (mocked).
+    // ЗАГЛУШКА. Настоящая вычитка — Фаза 1: выделенный Kafka-поток, assign() с
+    // явными офсетами, fetch_watermarks для «последних N», фильтрация в Rust
+    // и оконная выдача наружу. Пока генерируем синтетику.
     pub fn get_messages(
         &self,
         params: GetMessagesParams,
     ) -> Result<Vec<KafkaMessage>, String> {
-        // Simulate a short delay as if reading from Kafka
-        sleep(Duration::from_millis(300));
-
         let limit = params.limit.max(1).min(500); // cap to a reasonable number
         let start_from = params.start_from.unwrap_or(StartFrom::Newest);
         let base_partition = params.partition.unwrap_or(0);
@@ -212,7 +224,21 @@ async fn cluster_test(
 }
 
 #[tauri::command]
-async fn get_topics(state: tauri::State<'_, Mutex<App>>) -> Result<Vec<String>, String> {
+async fn cluster_disconnect(state: tauri::State<'_, Mutex<App>>) -> Result<(), String> {
+    let mut app = state.lock().map_err(|_| "lock poisoned".to_string())?;
+    app.cluster_disconnect();
+    Ok(())
+}
+
+/// Список механизмов SASL, поддержанных этой сборкой. Фронт рисует выпадашку
+/// по нему, чтобы не предлагать GSSAPI там, где Cyrus SASL не слинкован.
+#[tauri::command]
+fn sasl_mechanisms() -> Vec<&'static str> {
+    helpers::supported_sasl_mechanisms()
+}
+
+#[tauri::command]
+async fn get_topics(state: tauri::State<'_, Mutex<App>>) -> Result<Vec<TopicInfo>, String> {
     let mut app = state.lock().map_err(|_| "lock poisoned".to_string())?;
     app.get_topics()
 }
@@ -234,7 +260,9 @@ pub fn run() {
         .manage(Mutex::new(App::default()))
         .invoke_handler(tauri::generate_handler![
             cluster_connect,
+            cluster_disconnect,
             cluster_test,
+            sasl_mechanisms,
             get_topics,
             get_messages,
         ])

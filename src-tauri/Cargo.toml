@@ -20,5 +20,31 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
-rdkafka = { version = "0.36", features = ["ssl", "sasl"] }
 tauri-plugin-dialog = "2"
+
+# librdkafka.
+#
+# ssl-vendored — OpenSSL собирается из исходников вместо системного: на Windows
+#   системного просто нет, и сборка падала бы на openssl-sys.
+# libz + zstd — топики часто сжаты; без этих фич consume по такому топику
+#   отваливается. lz4 и snappy librdkafka несёт в себе.
+# default-features = false — снимает фичу `tokio`: мы работаем через BaseConsumer
+#   на выделенном потоке, futures-обёртки rdkafka не нужны.
+#
+# Фича `sasl` НЕ включена намеренно. В rdkafka-sys `sasl = ["gssapi"]`, а
+# `gssapi = ["ssl", "sasl2-sys"]`, то есть она тянет Cyrus SASL, который не
+# собирается под Windows. SCRAM-SHA-256/512, PLAIN и OAUTHBEARER librdkafka
+# умеет сама поверх OpenSSL, без Cyrus. Kerberos — через фичу `gssapi` ниже.
+[target.'cfg(not(windows))'.dependencies]
+rdkafka = { version = "0.36", default-features = false, features = ["libz", "zstd", "ssl-vendored"] }
+
+# Под Windows librdkafka собирается только через CMake: дефолтный build.rs
+# запускает ./configure (POSIX-скрипт), под MSVC это не работает.
+# Требует установленный cmake на машине сборки.
+[target.'cfg(windows)'.dependencies]
+rdkafka = { version = "0.36", default-features = false, features = ["libz", "zstd", "ssl-vendored", "cmake-build"] }
+
+[features]
+default = []
+# Kerberos/GSSAPI. Тянет Cyrus SASL (sasl2-sys) — только Linux-сборка.
+gssapi = ["rdkafka/gssapi-vendored"]
