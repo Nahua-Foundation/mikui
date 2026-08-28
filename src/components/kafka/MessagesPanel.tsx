@@ -2,8 +2,8 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RowPreview } from './types';
 import { Virtuoso } from 'react-virtuoso';
 
-const COLUMNS = ['partition', 'key', 'offset', 'timestamp', 'message'] as const;
-const DEFAULT_WIDTHS = ['80px', '120px', '100px', '190px', '1fr'];
+const COLUMNS = ['partition', 'offset', 'key', 'message', 'timestamp'] as const;
+const DEFAULT_WIDTHS = ['80px', '100px', '120px', '1fr', '190px'];
 const MIN_COLUMN_PX = 60;
 
 /** Один экземпляр на приложение: пересоздавать форматтер на каждую строку
@@ -38,9 +38,8 @@ const MessageRow = memo(function MessageRow({ row, onSelect }: MessageRowProps) 
       onClick={() => onSelect(row.index)}
     >
       <div className="font-mono text-brand">{row.partition}</div>
-      <div className="font-mono text-soft truncate">{row.key}</div>
       <div className="font-mono text-soft">{row.offset}</div>
-      <div className="font-mono text-soft truncate">{formatTimestamp(row.timestamp)}</div>
+      <div className="font-mono text-soft truncate">{row.key}</div>
       <div className="font-mono text-soft truncate">
         {row.binary && (
           <span
@@ -52,6 +51,7 @@ const MessageRow = memo(function MessageRow({ row, onSelect }: MessageRowProps) 
         )}
         {row.preview}
       </div>
+      <div className="font-mono text-soft truncate">{formatTimestamp(row.timestamp)}</div>
     </div>
   );
 });
@@ -91,7 +91,7 @@ export function MessagesPanel({
 }: MessagesPanelProps) {
   const [colWidths, setColWidths] = useState<string[]>(DEFAULT_WIDTHS);
   const rootRef = useRef<HTMLDivElement>(null);
-  const dragging = useRef<{ index: number; startX: number; startW: number } | null>(null);
+  const dragging = useRef<{ index: number; startX: number; startW: number; dir: 1 | -1 } | null>(null);
   const pendingWidths = useRef<string[] | null>(null);
 
   const gridTemplate = useMemo(() => colWidths.join(' '), [colWidths]);
@@ -110,7 +110,7 @@ export function MessagesPanel({
     (e: MouseEvent) => {
       const drag = dragging.current;
       if (!drag) return;
-      const width = Math.max(MIN_COLUMN_PX, drag.startW + (e.clientX - drag.startX));
+      const width = Math.max(MIN_COLUMN_PX, drag.startW + drag.dir * (e.clientX - drag.startX));
       const next = [...colWidths];
       next[drag.index] = `${width}px`;
       pendingWidths.current = next;
@@ -131,14 +131,14 @@ export function MessagesPanel({
   }, [onMouseMove]);
 
   const startDragging = useCallback(
-    (index: number, e: React.MouseEvent) => {
-      // Последняя колонка растягивается на всё оставшееся место, её не тянем.
-      if (index >= COLUMNS.length - 1) return;
+    (index: number, dir: 1 | -1, e: React.MouseEvent) => {
+      // Гибкая колонка растягивается на всё оставшееся место, её не тянем.
+      if (colWidths[index] === '1fr') return;
       const current = colWidths[index];
       const startW = current.endsWith('px')
         ? parseInt(current, 10) || MIN_COLUMN_PX
         : MIN_COLUMN_PX;
-      dragging.current = { index, startX: e.clientX, startW };
+      dragging.current = { index, startX: e.clientX, startW, dir };
       window.addEventListener('mousemove', onMouseMove);
       window.addEventListener('mouseup', stopDragging);
       e.preventDefault();
@@ -181,22 +181,41 @@ export function MessagesPanel({
           className="grid gap-4 p-3 text-sm font-mono text-soft select-none"
           style={{ gridTemplateColumns: 'var(--mikui-grid)' }}
         >
-          {COLUMNS.map((label, i) => (
-            <div key={label} className="relative">
-              <div>{label}</div>
-              {i < COLUMNS.length - 1 && (
-                <div
-                  onMouseDown={(e) => startDragging(i, e)}
-                  className="absolute top-0 right-[-8px] h-full w-4 cursor-col-resize"
-                  style={{
-                    backgroundImage:
-                      'linear-gradient(to right, transparent 7px, var(--color-edge) 7px, var(--color-edge) 8px, transparent 8px)',
-                  }}
-                  title="Drag to resize"
-                />
-              )}
-            </div>
-          ))}
+          {COLUMNS.map((label, i) => {
+            // Гибкая колонка (1fr) сама не тянется; всё, что до неё, растёт
+            // за счёт ручки справа, всё, что после — за счёт ручки слева
+            // (её правая ручка висела бы за пределами таблицы).
+            const flexIndex = colWidths.indexOf('1fr');
+            const showRightHandle = colWidths[i] !== '1fr' && (flexIndex === -1 || i < flexIndex);
+            const showLeftHandle = colWidths[i] !== '1fr' && flexIndex !== -1 && i > flexIndex;
+            return (
+              <div key={label} className="relative">
+                <div>{label}</div>
+                {showRightHandle && (
+                  <div
+                    onMouseDown={(e) => startDragging(i, 1, e)}
+                    className="absolute top-0 right-[-8px] h-full w-4 cursor-col-resize"
+                    style={{
+                      backgroundImage:
+                        'linear-gradient(to right, transparent 7px, var(--color-edge) 7px, var(--color-edge) 8px, transparent 8px)',
+                    }}
+                    title="Drag to resize"
+                  />
+                )}
+                {showLeftHandle && (
+                  <div
+                    onMouseDown={(e) => startDragging(i, -1, e)}
+                    className="absolute top-0 left-[-16px] h-full w-4 cursor-col-resize"
+                    style={{
+                      backgroundImage:
+                        'linear-gradient(to right, transparent 7px, var(--color-edge) 7px, var(--color-edge) 8px, transparent 8px)',
+                    }}
+                    title="Drag to resize"
+                  />
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
