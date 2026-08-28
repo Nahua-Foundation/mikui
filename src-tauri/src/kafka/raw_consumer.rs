@@ -19,8 +19,8 @@ use std::os::raw::{c_char, c_void};
 use std::slice;
 
 use rdkafka::bindings::{
-    rd_kafka_consume_queue, rd_kafka_consume_start_queue, rd_kafka_consume_stop, rd_kafka_err2str,
-    rd_kafka_header_get_all, rd_kafka_last_error, rd_kafka_message_destroy,
+    rd_kafka_consume_batch_queue, rd_kafka_consume_start_queue, rd_kafka_consume_stop,
+    rd_kafka_err2str, rd_kafka_header_get_all, rd_kafka_last_error, rd_kafka_message_destroy,
     rd_kafka_message_headers, rd_kafka_message_timestamp, rd_kafka_queue_destroy,
     rd_kafka_queue_new, rd_kafka_timestamp_type_t, rd_kafka_topic_destroy, rd_kafka_topic_new,
 };
@@ -156,15 +156,21 @@ pub struct RawMessage {
     ptr: *mut RDKafkaMessage,
 }
 
-/// Ждёт следующее событие в очереди. `None` — таймаут без событий, аналог
-/// `consumer.poll(timeout) -> None`.
-pub fn consume(queue: &RawQueue, timeout_ms: i32) -> Option<RawMessage> {
-    let ptr = unsafe { rd_kafka_consume_queue(queue.ptr, timeout_ms) };
-    if ptr.is_null() {
-        None
-    } else {
-        Some(RawMessage { ptr })
+/// Забирает разом до `max` событий из очереди — один FFI-вызов вместо `max`
+/// вызовов `consume()`. Ждёт до `timeout_ms`, если очередь пуста, но
+/// возвращается раньше, как только накопилось хоть что-то.
+pub fn consume_batch(queue: &RawQueue, timeout_ms: i32, max: usize) -> Vec<RawMessage> {
+    let mut slots: Vec<*mut RDKafkaMessage> = vec![std::ptr::null_mut(); max];
+    let filled =
+        unsafe { rd_kafka_consume_batch_queue(queue.ptr, timeout_ms, slots.as_mut_ptr(), max) };
+    if filled <= 0 {
+        return Vec::new();
     }
+    slots
+        .into_iter()
+        .take(filled as usize)
+        .map(|ptr| RawMessage { ptr })
+        .collect()
 }
 
 impl RawMessage {

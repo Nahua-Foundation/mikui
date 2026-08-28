@@ -70,6 +70,21 @@ export interface OpenTopicResult {
   truncated: boolean;
 }
 
+/** Сколько ещё сообщений вычитать на каждую ещё не исчерпанную партицию. */
+export interface LoadMoreParams {
+  additional: number;
+}
+
+/** Снимок хода ещё не завершённого `open_topic`/`load_more` — опрашивается
+ *  по таймеру, пока идёт загрузка. */
+export interface OpenTopicProgress {
+  loaded: number;
+  total: number;
+  truncated: boolean;
+  /** true — чтения в фоне уже нет, снимок финальный. */
+  done: boolean;
+}
+
 /**
  * Сохранённое подключение — ровно то, что лежит в clusters.json.
  *

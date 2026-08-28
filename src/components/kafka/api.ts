@@ -10,7 +10,9 @@ import {
   ClusterConnectPayload,
   FullMessage,
   KafkaCluster,
+  LoadMoreParams,
   MessageFilter,
+  OpenTopicProgress,
   OpenTopicResult,
   RowPreview,
   Settings,
@@ -71,6 +73,12 @@ export const openTopic = (params: {
   partition: number | null;
   filter: MessageFilter;
 }) => invoke<OpenTopicResult>('open_topic', { params });
+
+export const loadMore = (params: LoadMoreParams) =>
+  invoke<OpenTopicResult>('load_more', { params });
+
+export const getOpenTopicProgress = () =>
+  invoke<OpenTopicProgress>('get_open_topic_progress');
 
 export const setFilter = (filter: MessageFilter) => invoke<number>('set_filter', { filter });
 

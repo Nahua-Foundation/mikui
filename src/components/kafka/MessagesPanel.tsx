@@ -79,6 +79,10 @@ interface MessagesPanelProps {
   isLoading: boolean;
   /** Растёт при подгрузке чанка — сигнал перерисовать видимые строки. */
   version: number;
+  /** В топике есть ещё непрочитанные сообщения — показать кнопку. */
+  canLoadMore: boolean;
+  isLoadingMore: boolean;
+  onLoadMore: () => void;
 }
 
 export function MessagesPanel({
@@ -88,6 +92,9 @@ export function MessagesPanel({
   onSelectMessage,
   isLoading,
   version,
+  canLoadMore,
+  isLoadingMore,
+  onLoadMore,
 }: MessagesPanelProps) {
   const [colWidths, setColWidths] = useState<string[]>(DEFAULT_WIDTHS);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -170,6 +177,24 @@ export function MessagesPanel({
     [getRow, onSelectMessage, version],
   );
 
+  const Footer = useCallback(() => {
+    if (!canLoadMore) return null;
+    return (
+      <div className="p-3 flex justify-center">
+        <button
+          type="button"
+          onClick={onLoadMore}
+          disabled={isLoadingMore}
+          className="px-4 py-2 text-sm font-mono rounded border border-edge text-soft hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isLoadingMore ? 'Loading…' : 'Load more'}
+        </button>
+      </div>
+    );
+  }, [canLoadMore, isLoadingMore, onLoadMore]);
+
+  const virtuosoComponents = useMemo(() => ({ Footer }), [Footer]);
+
   return (
     <div
       ref={rootRef}
@@ -219,8 +244,13 @@ export function MessagesPanel({
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-hidden h-full">
-        {isLoading ? (
+      <div className="flex-1 min-h-0 overflow-hidden h-full flex flex-col">
+        {isLoading && total > 0 && (
+          <div className="px-3 py-1 text-xs font-mono text-soft border-b border-edge bg-surface shrink-0">
+            Loading… {total} so far
+          </div>
+        )}
+        {isLoading && total === 0 ? (
           <div className="p-4 text-center text-soft font-mono">Reading from Kafka…</div>
         ) : total === 0 ? (
           <div className="p-4 text-center text-dim font-mono">No messages</div>
@@ -230,6 +260,7 @@ export function MessagesPanel({
             totalCount={total}
             rangeChanged={handleRangeChanged}
             itemContent={renderItem}
+            components={virtuosoComponents}
           />
         )}
       </div>

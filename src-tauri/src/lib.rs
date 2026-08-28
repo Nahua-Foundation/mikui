@@ -186,6 +186,28 @@ async fn get_window(
         .await?
 }
 
+/// Дочитывает ещё по `additional` сообщений на каждую ещё не исчерпанную
+/// партицию текущего топика, продолжая с места, на котором остановилось
+/// предыдущее чтение.
+#[tauri::command]
+async fn load_more(
+    worker: tauri::State<'_, WorkerHandle>,
+    params: LoadMoreParams,
+) -> Result<OpenTopicResult, String> {
+    worker
+        .call(|reply| Command::LoadMore(params, reply))
+        .await?
+}
+
+/// Дешёвый снимок хода ещё не завершённого `open_topic`/`load_more` — фронт
+/// опрашивает эту команду по таймеру, пока идёт загрузка.
+#[tauri::command]
+async fn get_open_topic_progress(
+    worker: tauri::State<'_, WorkerHandle>,
+) -> Result<OpenTopicProgress, String> {
+    worker.call(Command::GetOpenTopicProgress).await?
+}
+
 /// Полное тело сообщения — только когда его открыли.
 #[tauri::command]
 async fn get_message_body(
@@ -218,6 +240,8 @@ pub fn run() {
             save_settings,
             get_topics,
             open_topic,
+            load_more,
+            get_open_topic_progress,
             set_filter,
             get_window,
             get_message_body,

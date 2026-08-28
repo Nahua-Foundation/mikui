@@ -172,12 +172,6 @@ impl MessageStore {
         }
     }
 
-    /// Обрезает хвост после сортировки: партиций может быть больше, чем нужно
-    /// строк, и мы слегка перечитываем.
-    pub fn truncate(&mut self, len: usize) {
-        self.index.truncate(len);
-    }
-
     fn append(&mut self, bytes: &[u8]) -> Span {
         let start = self.blob.len() as u32;
         self.blob.extend_from_slice(bytes);

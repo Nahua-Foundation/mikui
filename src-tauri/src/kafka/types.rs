@@ -59,12 +59,22 @@ impl MessageFilter {
 pub struct OpenTopicParams {
     pub topic: String,
     pub start_from: StartFrom,
-    /// Сколько сообщений вычитать в буфер. Не путать с размером окна выдачи.
+    /// Сколько сообщений вычитать на КАЖДУЮ партицию (не общий бюджет на
+    /// топик — при большом числе партиций итоговый объём в буфере кратно
+    /// больше). Не путать с размером окна выдачи.
     pub limit: usize,
     /// None — все партиции топика.
     pub partition: Option<i32>,
     #[serde(default)]
     pub filter: MessageFilter,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LoadMoreParams {
+    /// Сколько ещё сообщений вычитать на каждую партицию, которая ещё не
+    /// упёрлась в реальный EOF/начало топика.
+    pub additional: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +89,18 @@ pub struct OpenTopicResult {
     pub buffer_bytes: usize,
     /// true — упёрлись в лимит или таймаут, в топике есть ещё.
     pub truncated: bool,
+}
+
+/// Снимок хода ещё не завершённого чтения — опрашивается фронтом по таймеру,
+/// пока `open_topic`/`load_more` не ответили финальным `OpenTopicResult`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OpenTopicProgress {
+    pub loaded: usize,
+    pub total: usize,
+    pub truncated: bool,
+    /// true — чтения в фоне уже нет, снимок финальный.
+    pub done: bool,
 }
 
 /// Строка таблицы. Тело обрезано: таблица всё равно показывает его в одну
