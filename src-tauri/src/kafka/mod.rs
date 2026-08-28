@@ -1,4 +1,5 @@
 mod filter;
+mod raw_consumer;
 mod store;
 mod text;
 mod types;

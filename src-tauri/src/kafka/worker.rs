@@ -16,12 +16,11 @@ use std::time::{Duration, Instant};
 use rdkafka::admin::AdminClient;
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::KafkaError;
-use rdkafka::message::{Headers, Message};
-use rdkafka::{Offset, TopicPartitionList};
+use rdkafka::types::RDKafkaRespErr;
 use tokio::sync::oneshot;
 
 use super::filter::contains;
+use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
 use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
 use super::types::*;
@@ -30,8 +29,9 @@ use crate::helpers::get_cluster_config;
 /// Потолок времени на одно открытие топика. Без него пустой или медленный
 /// топик подвесил бы воркер навсегда.
 const READ_DEADLINE: Duration = Duration::from_secs(30);
-/// Шаг опроса. Достаточно мал, чтобы дедлайн срабатывал вовремя.
-const POLL_TICK: Duration = Duration::from_millis(200);
+/// Шаг опроса очереди, в миллисекундах — для `rd_kafka_consume_queue`.
+/// Достаточно мал, чтобы дедлайн срабатывал вовремя.
+const POLL_TICK_MS: i32 = 200;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Reply<T> = oneshot::Sender<T>;
@@ -84,27 +84,90 @@ impl WorkerHandle {
 }
 
 /// Перекладывает сообщение из буфера rdkafka в арену. Свободная функция, а не
-/// метод: во время чтения `store` заимствуется отдельно от `consumer`.
+/// метод: во время чтения `store` заимствуется отдельно от остального `Worker`.
 /// Возвращает false, когда бюджет буфера исчерпан.
-fn absorb(store: &mut MessageStore, msg: &rdkafka::message::BorrowedMessage<'_>) -> bool {
-    let headers: Vec<(&str, &[u8])> = match msg.headers() {
-        Some(h) => (0..h.count())
-            .map(|i| {
-                let header = h.get(i);
-                (header.key, header.value.unwrap_or(&[]))
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
+fn absorb(store: &mut MessageStore, msg: &RawMessage) -> bool {
+    let headers = msg.headers();
     store.push(
         msg.partition(),
         msg.offset(),
-        msg.timestamp().to_millis().unwrap_or(0),
+        msg.timestamp_millis(),
         msg.key().unwrap_or(&[]),
         msg.payload().unwrap_or(&[]),
         &headers,
     )
+}
+
+/// Читает из очереди, пока не наберётся `limit` сообщений или все партиции
+/// не дойдут до EOF. Возвращает `true`, если упёрлись в лимит буфера или
+/// дедлайн раньше, чем реально кончились данные.
+fn read_into_store(
+    queue: &RawQueue,
+    store: &mut MessageStore,
+    limit: usize,
+    partition_count: usize,
+) -> Result<bool, String> {
+    let mut eof: HashSet<i32> = HashSet::with_capacity(partition_count);
+    let deadline = Instant::now() + READ_DEADLINE;
+    let started = Instant::now();
+    let mut polls: u64 = 0;
+    let mut absorbed: u64 = 0;
+
+    eprintln!("[read_into_store] start limit={limit} partition_count={partition_count}");
+
+    while store.len() < limit && eof.len() < partition_count {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "[read_into_store] DEADLINE after {:?}: polls={polls} absorbed={absorbed} eof={}/{partition_count} store.len={}",
+                started.elapsed(),
+                eof.len(),
+                store.len()
+            );
+            return Ok(true);
+        }
+        polls += 1;
+        match raw_consumer::consume(queue, POLL_TICK_MS) {
+            None => continue,
+            Some(msg) => match msg.err() {
+                RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR => {
+                    absorbed += 1;
+                    if !absorb(store, &msg) {
+                        eprintln!(
+                            "[read_into_store] buffer budget hit after {:?}: polls={polls} absorbed={absorbed} eof={}/{partition_count}",
+                            started.elapsed(),
+                            eof.len()
+                        );
+                        return Ok(true);
+                    }
+                }
+                RDKafkaRespErr::RD_KAFKA_RESP_ERR__PARTITION_EOF => {
+                    eof.insert(msg.partition());
+                    eprintln!(
+                        "[read_into_store] partition {} EOF ({}/{partition_count}) after {:?}, absorbed so far={absorbed}",
+                        msg.partition(),
+                        eof.len(),
+                        started.elapsed()
+                    );
+                }
+                other => {
+                    let e = raw_consumer::err_str(other);
+                    eprintln!(
+                        "[read_into_store] READ ERROR after {:?}: {e} (polls={polls} absorbed={absorbed})",
+                        started.elapsed()
+                    );
+                    return Err(format!("read failed: {e}"));
+                }
+            },
+        }
+    }
+
+    eprintln!(
+        "[read_into_store] done after {:?}: polls={polls} absorbed={absorbed} eof={}/{partition_count} store.len={}",
+        started.elapsed(),
+        eof.len(),
+        store.len()
+    );
+    Ok(false)
 }
 
 #[derive(Default)]
@@ -196,9 +259,7 @@ impl Worker {
 
     fn disconnect(&mut self) {
         self.close_topic();
-        if let Some(consumer) = self.consumer.take() {
-            let _ = consumer.unassign();
-        }
+        drop(self.consumer.take());
         drop(self.admin.take());
         self.partition_counts.clear();
     }
@@ -220,12 +281,14 @@ impl Worker {
         Ok(topics)
     }
 
-    /// Вычитывает окно сообщений в арену.
+    /// Вычитывает окно сообщений в арену через group-less legacy consumer API
+    /// (`kafka::raw_consumer`) — партиции читаются напрямую, без объекта
+    /// консьюмер-группы и без связанных с ним ACL.
     ///
-    /// Ключевой момент — `Offset::OffsetTail(n)`: librdkafka сама вычисляет
-    /// `high_watermark - n` на своей стороне, поэтому «последние N» не требуют
-    /// ни обхода `fetch_watermarks` по каждой партиции, ни чтения топика
-    /// с начала.
+    /// Ключевой момент — `raw_consumer::offset_tail(n)`: librdkafka сама
+    /// вычисляет `high_watermark - n` на своей стороне, поэтому «последние N»
+    /// не требуют ни обхода `fetch_watermarks` по каждой партиции, ни чтения
+    /// топика с начала.
     fn open_topic(&mut self, params: OpenTopicParams) -> Result<OpenTopicResult, String> {
         let limit = params.limit.clamp(1, 500_000);
         let partition_count = *self
@@ -247,60 +310,60 @@ impl Worker {
         // лишнее срежется после сортировки.
         let per_partition = limit.div_ceil(partitions.len()).max(1) as i64;
         let start_offset = match params.start_from {
-            StartFrom::Newest => Offset::OffsetTail(per_partition),
-            StartFrom::Oldest => Offset::Beginning,
+            StartFrom::Newest => raw_consumer::offset_tail(per_partition),
+            StartFrom::Oldest => raw_consumer::OFFSET_BEGINNING,
         };
 
-        let mut tpl = TopicPartitionList::new();
-        for p in &partitions {
-            tpl.add_partition_offset(&params.topic, *p, start_offset)
-                .map_err(|e| format!("can't build assignment: {e}"))?;
-        }
+        eprintln!(
+            "[open_topic] {} partitions={partitions:?} start_from={:?} limit={limit} per_partition={per_partition} start_offset={start_offset}",
+            params.topic, params.start_from
+        );
 
-        // Заимствуем поля по отдельности: `consumer` живёт весь цикл чтения,
-        // а `store` в это же время мутируется. Через `&mut self` так нельзя,
-        // через раздельные поля — можно.
-        let Worker {
-            consumer, store, ..
-        } = self;
-        let consumer = consumer.as_ref().ok_or("not connected to a cluster")?;
-        consumer
-            .assign(&tpl)
-            .map_err(|e| format!("can't assign partitions: {e}"))?;
-
-        store.clear();
-
-        let mut eof: HashSet<i32> = HashSet::with_capacity(partitions.len());
-        let deadline = Instant::now() + READ_DEADLINE;
-        let mut hit_budget = false;
-
-        while store.len() < limit && eof.len() < partitions.len() {
-            if Instant::now() >= deadline {
-                hit_budget = true;
-                break;
+        let consumer = self.consumer.as_ref().ok_or("not connected to a cluster")?;
+        for &p in &partitions {
+            match consumer.fetch_watermarks(&params.topic, p, METADATA_TIMEOUT) {
+                Ok((low, high)) => eprintln!(
+                    "[open_topic] {} p{p} watermarks low={low} high={high} available={}",
+                    params.topic,
+                    high - low
+                ),
+                Err(e) => eprintln!(
+                    "[open_topic] {} p{p} fetch_watermarks FAILED: {e}",
+                    params.topic
+                ),
             }
-            match consumer.poll(POLL_TICK) {
-                None => continue,
-                Some(Err(KafkaError::PartitionEOF(p))) => {
-                    // Партиция вычитана до конца — включено enable.partition.eof.
-                    eof.insert(p);
+        }
+        let client_ptr = consumer.client().native_ptr();
+
+        let topic = RawTopic::new(client_ptr, &params.topic)?;
+        let queue = RawQueue::new(client_ptr)?;
+
+        let mut started: Vec<i32> = Vec::with_capacity(partitions.len());
+        for &p in &partitions {
+            match topic.consume_start_queue(p, start_offset, &queue) {
+                Ok(()) => {
+                    eprintln!("[open_topic] consume_start_queue p{p} offset={start_offset} ok");
+                    started.push(p);
                 }
-                Some(Err(e)) => {
-                    let _ = consumer.unassign();
-                    return Err(format!("read failed: {e}"));
-                }
-                Some(Ok(msg)) => {
-                    if !absorb(store, &msg) {
-                        hit_budget = true;
-                        break;
+                Err(e) => {
+                    eprintln!(
+                        "[open_topic] consume_start_queue p{p} offset={start_offset} FAILED: {e}"
+                    );
+                    for started_p in started {
+                        topic.consume_stop(started_p);
                     }
+                    return Err(format!("can't start reading partition {p}: {e}"));
                 }
             }
         }
 
-        // Снимаем назначение сразу после чтения: иначе librdkafka продолжит
-        // тянуть данные в фоне и жечь сеть, хотя всё нужное уже в арене.
-        let _ = consumer.unassign();
+        self.store.clear();
+        let read_result = read_into_store(&queue, &mut self.store, limit, partitions.len());
+
+        for &p in &partitions {
+            topic.consume_stop(p);
+        }
+        let hit_budget = read_result?;
 
         let truncated = hit_budget || self.store.len() >= limit;
         self.open_topic = Some(params.topic.clone());
@@ -310,6 +373,14 @@ impl Worker {
 
         self.filter = params.filter;
         self.rebuild_view();
+
+        eprintln!(
+            "[open_topic] {} result: loaded={} view={} bytes={} truncated={truncated}",
+            params.topic,
+            self.store.len(),
+            self.view.len(),
+            self.store.byte_size()
+        );
 
         Ok(OpenTopicResult {
             total: self.view.len(),
@@ -325,9 +396,10 @@ impl Worker {
     }
 
     fn close_topic(&mut self) {
-        if let Some(consumer) = self.consumer.as_ref() {
-            let _ = consumer.unassign();
-        }
+        // Раньше здесь снималось назначение консьюмер-группы (`unassign()`);
+        // legacy consumer API ничего не оставляет "подвешенным" между
+        // вызовами `open_topic` — `RawTopic`/`RawQueue` уже остановлены и
+        // уничтожены внутри него, снимать здесь нечего.
         self.open_topic = None;
         self.filter = MessageFilter::default();
         self.view.clear();
