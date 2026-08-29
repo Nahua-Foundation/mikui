@@ -1,4 +1,4 @@
-import { ChevronDown, Filter, RefreshCw, Play, Folder, Search } from 'lucide-react';
+import { ArrowDown, ArrowUp, ChevronDown, Filter, RefreshCw, Play, Folder, Search } from 'lucide-react';
 import { Button } from '../ui/button';
 import {
   DropdownMenu,
@@ -9,13 +9,23 @@ import {
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Checkbox } from '../ui/checkbox';
-import { Topic, MessageFilter, OpenTopicResult, EMPTY_FILTER } from './types';
+import { Topic, MessageFilter, OpenTopicResult, StartFrom, EMPTY_FILTER } from './types';
 import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
+
+/** Направление чтения — оно же порядок строк в таблице. Подпись объясняет
+ *  не только «с какого конца», но и что будет догружаться дальше: именно это
+ *  и определяет, куда поедет список во время фоновой подгрузки. */
+const START_FROM_OPTIONS: { value: StartFrom; label: string; hint: string }[] = [
+  { value: 'newest', label: 'newest first', hint: 'самые новые сверху, старые догружаются вниз' },
+  { value: 'oldest', label: 'oldest first', hint: 'самые старые сверху, новые догружаются вниз' },
+];
 
 interface HeaderDesktopProps {
   selectedPartition: number | null;
   onSelectPartition: (partition: number | null) => void;
+  startFrom: StartFrom;
+  onStartFromChange: (startFrom: StartFrom) => void;
   topic: Topic | null;
   onClusterClick: () => void;
   filters: MessageFilter;
@@ -34,6 +44,8 @@ function formatBytes(bytes: number): string {
 export function HeaderDesktop({
   selectedPartition,
   onSelectPartition,
+  startFrom,
+  onStartFromChange,
   topic,
   onClusterClick,
   filters,
@@ -69,6 +81,24 @@ export function HeaderDesktop({
             <div className="px-4 font-mono text-xs text-dim whitespace-nowrap">
               {stats.loaded.toLocaleString()} msg · {formatBytes(stats.buffer_bytes)}
               {stats.truncated && <span className="text-brand"> · truncated</span>}
+              {/* Скорость, которую даёт кластер. Без неё медленная загрузка
+                  неотличима от зависшего приложения — а на кластере с квотой
+                  на чтение она медленная всегда. */}
+              {stats.read_bytes_per_sec !== null && (
+                <span title="Read throughput the cluster actually allows">
+                  {' '}
+                  · {formatBytes(stats.read_bytes_per_sec)}/s
+                </span>
+              )}
+              {stats.peak_throttle_ms > 0 && (
+                <span
+                  className="text-brand"
+                  title={`The broker held responses back for up to ${stats.peak_throttle_ms} ms — a read quota is in effect`}
+                >
+                  {' '}
+                  · throttled
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -89,6 +119,42 @@ export function HeaderDesktop({
                   className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8 w-64"
                 />
               </div>
+            </div>
+          </MenuItem>
+        )}
+
+        {/* Направление чтения. Не косметика: топик перечитывается с другого
+            конца, поэтому селектор стоит рядом с партициями, а не в фильтрах. */}
+        {topic && (
+          <MenuItem>
+            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-8 py-4 relative shrink-0">
+              <DropdownMenu>
+                <DropdownMenuTrigger className="font-mono font-[450] text-[16px] text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-2 flex items-center border-none outline-none cursor-pointer">
+                  {startFrom === 'newest' ? (
+                    <ArrowDown className="size-4" />
+                  ) : (
+                    <ArrowUp className="size-4" />
+                  )}
+                  <span>{startFrom === 'newest' ? 'newest first' : 'oldest first'}</span>
+                  <ChevronDown className="size-4" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent className="bg-surface border-edge min-w-72" align="end">
+                  {START_FROM_OPTIONS.map((option) => (
+                    <DropdownMenuItem
+                      key={option.value}
+                      className={`font-mono cursor-pointer flex-col items-start gap-0.5 ${
+                        startFrom === option.value
+                          ? 'bg-edge text-slate-50'
+                          : 'text-soft hover:bg-edge hover:text-slate-50'
+                      }`}
+                      onClick={() => onStartFromChange(option.value)}
+                    >
+                      <span>{option.label}</span>
+                      <span className="text-xs text-dim">{option.hint}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </MenuItem>
         )}

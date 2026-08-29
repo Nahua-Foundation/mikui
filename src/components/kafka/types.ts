@@ -59,7 +59,22 @@ export const EMPTY_FILTER: MessageFilter = {
 
 export type StartFrom = 'oldest' | 'newest';
 
-export interface OpenTopicResult {
+/**
+ * Что кластер реально даёт по скорости — измеряется косвенно, по статистике
+ * librdkafka (см. kafka/quota.rs). Настроенную квоту спросить нельзя.
+ *
+ * Нужна в UI потому, что без неё медленное чтение неотличимо от зависшего
+ * приложения: пользователь видит замерший экран и винит mikui, хотя это брокер
+ * придерживает ответы по квоте.
+ */
+export interface QuotaInfo {
+  /** null — измерений пока недостаточно. */
+  read_bytes_per_sec: number | null;
+  /** Самая длинная задержка, наложенная брокером, мс. 0 — не придерживал. */
+  peak_throttle_ms: number;
+}
+
+export interface OpenTopicResult extends QuotaInfo {
   /** Число видимых строк с учётом фильтра — это totalCount для списка. */
   total: number;
   /** Сколько всего вычитано в буфер до фильтрации. */
@@ -77,8 +92,12 @@ export interface LoadMoreParams {
 
 /** Снимок хода ещё не завершённого `open_topic`/`load_more` — опрашивается
  *  по таймеру, пока идёт загрузка. */
-export interface OpenTopicProgress {
+export interface OpenTopicProgress extends QuotaInfo {
+  /** Топик, к которому относится снимок: ответ опроса может разминуться со
+   *  сменой топика, и без этой проверки счётчики перепутались бы. */
+  topic: string | null;
   loaded: number;
+  buffer_bytes: number;
   total: number;
   truncated: boolean;
   /** true — чтения в фоне уже нет, снимок финальный. */

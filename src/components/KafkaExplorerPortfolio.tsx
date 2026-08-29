@@ -8,6 +8,7 @@ import {
   MessageFilter,
   KafkaCluster,
   OpenTopicResult,
+  StartFrom,
   EMPTY_FILTER,
 } from './kafka';
 import * as api from './kafka/api';
@@ -32,10 +33,24 @@ const PROGRESS_POLL_MS = 250;
 /** Пауза перед отправкой фильтра. Фильтрация идёт по буферу в памяти и стоит
  *  единицы миллисекунд, но дёргать её на каждый символ всё равно незачем. */
 const FILTER_DEBOUNCE_MS = 200;
+/** Бэкенд отвечает так на чтение, отменённое сменой топика — см. worker.rs. */
+const READ_SUPERSEDED = 'read superseded';
+
+const isSuperseded = (e: unknown) => String(e).includes(READ_SUPERSEDED);
+
+/** Пустое или невнятное `e` превратилось бы в тост «Failed to …: », который
+ *  ничего не сообщает и выглядит как поломка самого приложения. */
+function describeError(e: unknown): string {
+  const text = e instanceof Error ? e.message : String(e ?? '');
+  return text.trim() || 'unknown error';
+}
 
 export function KafkaExplorerPortfolio() {
   const [selectedTopic, setSelectedTopic] = useState<Topic | null>(null);
   const [selectedPartition, setSelectedPartition] = useState<number | null>(null);
+  /** С какого конца топика читать. Определяет и порядок строк в таблице, и
+   *  направление, в котором догружаются следующие порции. */
+  const [startFrom, setStartFrom] = useState<StartFrom>('newest');
   const [selectedMessage, setSelectedMessage] = useState<FullMessage | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [configTopic, setConfigTopic] = useState<Topic | null>(null);
@@ -52,10 +67,18 @@ export function KafkaExplorerPortfolio() {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
 
-  // Растёт при любой смене содержимого списка. Сбрасывает кэш окон и
-  // обесценивает ответы на устаревшие запросы.
+  // Растёт, когда меняется САМ СПИСОК: другой топик, партиция, направление
+  // чтения, фильтр. Сбрасывает кэш окон и обесценивает ответы на устаревшие
+  // запросы. Фоновая догрузка сюда не относится — она только дописывает строки
+  // в конец, и сбрасывать из-за неё кэш нельзя (см. useMessageWindow).
   const [generation, setGeneration] = useState(0);
-  const { ensureRange, getRow, version } = useMessageWindow(generation);
+  const { ensureRange, getRow, version } = useMessageWindow(generation, total);
+
+  // Какой топик открыт ПРЯМО СЕЙЧАС — чтобы ответ на давно улетевший запрос
+  // не приехал в чужую таблицу. Ref, а не state: нужно значение на момент
+  // колбэка, а не на момент создания замыкания.
+  const topicRef = useRef<string | null>(null);
+  topicRef.current = selectedTopic?.name ?? null;
 
   const [clusters, setClusters] = useState<KafkaCluster[]>([]);
   const [selectedCluster, setSelectedCluster] = useState<KafkaCluster | null>(null);
@@ -86,33 +109,15 @@ export function KafkaExplorerPortfolio() {
 
     let cancelled = false;
     setIsLoadingMessages(true);
-
-    // Пока open_topic не ответил финальным результатом, чтение уже может идти
-    // прогрессивными шагами на бэкенде — опрашиваем прогресс, чтобы таблица
-    // наполнялась по ходу дела, а не одним скачком в конце. Порядок строк
-    // может ещё меняться до завершения (сортировка идёт по неполным данным),
-    // поэтому каждый тик поднимает generation, сбрасывая кэш чанков.
-    const progressTimer = window.setInterval(() => {
-      api
-        .getOpenTopicProgress()
-        .then((p) => {
-          if (cancelled || p.done) return;
-          setTotal(p.total);
-          setStats((prev) => ({
-            total: p.total,
-            loaded: p.loaded,
-            buffer_bytes: prev?.buffer_bytes ?? 0,
-            truncated: p.truncated,
-          }));
-          setGeneration((g) => g + 1);
-        })
-        .catch(() => {});
-    }, PROGRESS_POLL_MS);
+    // Список меняется целиком — обнуляем его ДО того, как приедут новые строки,
+    // иначе Virtuoso успеет отрисовать чужие данные под новым топиком.
+    setTotal(0);
+    setGeneration((g) => g + 1);
 
     invoke<OpenTopicResult>('open_topic', {
       params: {
         topic: selectedTopic.name,
-        start_from: 'newest',
+        start_from: startFrom,
         limit: DEFAULT_PARTITION_LIMIT,
         partition: selectedPartition,
         filter: filters,
@@ -122,20 +127,18 @@ export function KafkaExplorerPortfolio() {
         if (cancelled) return;
         setTotal(result.total);
         setStats(result);
-        setGeneration((g) => g + 1);
         if (result.truncated) {
           toast.info(`Loaded ${result.loaded} messages; the topic has more`);
         }
       })
       .catch((e) => {
-        if (cancelled) return;
+        if (cancelled || isSuperseded(e)) return;
         console.error('Failed to open topic', e);
-        toast.error(`Failed to read topic: ${e}`);
+        toast.error(`Failed to read topic: ${describeError(e)}`);
         setTotal(0);
         setStats(null);
       })
       .finally(() => {
-        window.clearInterval(progressTimer);
         if (!cancelled) setIsLoadingMessages(false);
       });
 
@@ -143,28 +146,66 @@ export function KafkaExplorerPortfolio() {
       // Пользователь переключил топик, пока летел ответ — результат больше
       // не нужен. Раньше здесь была гонка: старый ответ перезаписывал новый.
       cancelled = true;
-      window.clearInterval(progressTimer);
     };
     // filters здесь намеренно не в зависимостях: их применяет set_filter,
-    // без повторного чтения из Kafka.
+    // без повторного чтения из Kafka. А вот startFrom — в зависимостях:
+    // сменить направление можно только перечитав топик с другого конца.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTopic, selectedPartition]);
+  }, [selectedTopic, selectedPartition, startFrom]);
 
-  // "Загрузить ещё": продолжает уже открытый топик с того места, где
+  // Опрос хода чтения — общий для открытия топика и для "Load more".
+  //
+  // Раньше он жил внутри эффекта открытия, и во время "Load more" таблица
+  // стояла мёртвой до самого конца чтения: кнопка светила «Loading…» полминуты
+  // и выглядела как зависшая, хотя строки на бэкенде уже публиковались.
+  //
+  // Чтение публикует строки только в хвост, поэтому generation здесь НЕ
+  // трогаем — кэш окон остаётся валидным (см. useMessageWindow).
+  useEffect(() => {
+    if (!isLoadingMessages && !isLoadingMore) return;
+
+    const timer = window.setInterval(() => {
+      api
+        .getOpenTopicProgress()
+        .then((p) => {
+          if (p.done || p.topic !== topicRef.current) return;
+          setTotal(p.total);
+          setStats({
+            total: p.total,
+            loaded: p.loaded,
+            buffer_bytes: p.buffer_bytes,
+            truncated: p.truncated,
+            read_bytes_per_sec: p.read_bytes_per_sec,
+            peak_throttle_ms: p.peak_throttle_ms,
+          });
+        })
+        .catch(() => {});
+    }, PROGRESS_POLL_MS);
+
+    return () => window.clearInterval(timer);
+  }, [isLoadingMessages, isLoadingMore]);
+
+  // "Загрузить ещё": продолжает уже открытый топик с того окна, на котором
   // остановилось предыдущее чтение — без повторной вычитки уже показанного.
-  // generation НЕ поднимаем: новые сообщения при сортировке всегда попадают
-  // в хвост уже отображаемого порядка, позиции закэшированных строк не меняются.
+  // generation НЕ поднимаем: бэкенд публикует строки только в хвост,
+  // позиции закэшированных строк не меняются.
   const handleLoadMore = useCallback(() => {
+    const topicAtRequest = topicRef.current;
     setIsLoadingMore(true);
     api
       .loadMore({ additional: DEFAULT_PARTITION_LIMIT })
       .then((result) => {
+        if (topicRef.current !== topicAtRequest) return;
         setTotal(result.total);
         setStats(result);
       })
       .catch((e) => {
+        // Ушли с топика, пока дочитывалось — бэкенд отменил чтение намеренно.
+        // Показывать это как сбой значило бы пугать пользователя на ровном
+        // месте: ровно так раньше и вылезало "worker dropped the reply".
+        if (isSuperseded(e) || topicRef.current !== topicAtRequest) return;
         console.error('load_more failed', e);
-        toast.error(`Failed to load more messages: ${e}`);
+        toast.error(`Failed to load more messages: ${describeError(e)}`);
       })
       .finally(() => setIsLoadingMore(false));
   }, []);
@@ -311,6 +352,8 @@ export function KafkaExplorerPortfolio() {
       <HeaderDesktop
         selectedPartition={selectedPartition}
         onSelectPartition={setSelectedPartition}
+        startFrom={startFrom}
+        onStartFromChange={setStartFrom}
         topic={selectedTopic}
         onClusterClick={handleClusterClick}
         filters={filters}
@@ -338,7 +381,9 @@ export function KafkaExplorerPortfolio() {
               isLoading={isLoadingMessages}
               version={version}
               canLoadMore={!!stats?.truncated}
-              isLoadingMore={isLoadingMore}
+              // Пока идёт начальное чтение, воркер откажет ("a read is already
+              // in progress") — кнопку не предлагаем вовсе.
+              isLoadingMore={isLoadingMore || isLoadingMessages}
               onLoadMore={handleLoadMore}
             />
           )}

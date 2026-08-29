@@ -1,4 +1,5 @@
 mod filter;
+mod quota;
 mod raw_consumer;
 mod store;
 mod text;

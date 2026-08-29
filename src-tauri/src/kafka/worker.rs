@@ -9,25 +9,70 @@
 //! приезжают к нему по каналу, ответ уходит через oneshot, который
 //! Tauri-команда спокойно `.await`-ит, никого не блокируя.
 //!
-//! Долгая вычитка топика (`open_topic`/`load_more`) при этом не блокирует сам
-//! поток целиком: она разбита на шаги (`Command::ContinueRead`), между
-//! которыми воркер обслуживает остальные команды (`GetWindow`,
-//! `GetOpenTopicProgress`, новый `OpenTopic` и т.д.) — без единого мьютекса
-//! или второго потока, просто кооперативно уступая цикл `run()` после каждого
-//! шага. Это и даёт прогрессивную отрисовку: фронт опрашивает прогресс, пока
-//! `open_topic`/`load_more` ещё не ответили финальным результатом.
+//! # Чтение раундами
+//!
+//! Kafka умеет читать только ВПЕРЁД от заданного офсета. Наивная реализация
+//! «последние N сообщений» — сесть на `high_watermark - N` и читать до конца —
+//! выдаёт их в порядке от старых к новым, а показать надо наоборот. Прошлая
+//! версия решала это глобальной пересортировкой буфера после каждого шага:
+//! каждая новая порция втыкалась в НАЧАЛО таблицы и сдвигала всё вниз. Строки
+//! уезжали из-под курсора, фронту приходилось сбрасывать кэш окон, и вместо
+//! данных мигали плейсхолдеры.
+//!
+//! Здесь чтение разбито на раунды. Один раз, при открытии топика, снимаются
+//! watermarks — точные границы `[low, high)` каждой партиции. Дальше каждый
+//! раунд читает по одному ОКНУ на партицию:
+//!
+//! * `newest` — окна идут назад: `[high-C, high)`, `[high-2C, high-C)`, …
+//! * `oldest` — окна идут вперёд: `[low, low+C)`, `[low+C, low+2C)`, …
+//!
+//! Внутри окна librdkafka по-прежнему читает вперёд, но само окно уже стоит на
+//! своём месте в глобальном порядке. Порядок приезда данных совпадает с
+//! порядком показа, поэтому опубликованный префикс таблицы больше никогда не
+//! перестраивается (см. `MessageStore::committed`).
+//!
+//! Между окнами партиция НЕ останавливается: чтение открывается один раз на
+//! всё чтение, а окна меняются неблокирующим `RawTopic::seek`. В режиме
+//! `oldest` окна идут встык, так что там не делается даже seek. Причина
+//! принципиальная — `rd_kafka_consume_stop` ждёт брокерский поток бесконечно,
+//! и на кластере с квотой восемь таких остановок за раунд давали пол в 8–12
+//! секунд, не зависевший от размера окна вообще.
+//!
+//! Границу публикации задаёт `safe_frontier`: пока хоть одна партиция вычитана
+//! не так глубоко, как остальные, её «догоняющие» сообщения могли бы встать
+//! выше — такой хвост придерживается в отстойнике до следующего раунда. Это
+//! обычное k-way слияние отсортированных потоков, просто растянутое во времени.
+//!
+//! Размер окна не задан константой, а СЧИТАЕТСЯ (`next_window`) из
+//! измеренной пропускной способности кластера (`kafka::quota`) так, чтобы раунд
+//! занимал примерно `TARGET_ROUND_SECS`. Задать его числом нельзя: он зависит
+//! от размера сообщений (в соседних топиках одного кластера встречались и
+//! 400 байт, и 31 КБ), от плотности офсетов и от квоты брокера на чтение.
+//! Фиксированное окно на квотированном кластере давало шаг ровно в десять
+//! секунд — таблица замирала, дёргалась и снова замирала.
+//!
+//! Ни watermarks, ни раунды не блокируют поток целиком: и то, и другое разбито
+//! на шаги (`Command::ContinueRead`), между которыми воркер обслуживает
+//! остальные команды (`GetWindow`, `GetOpenTopicProgress`, новый `OpenTopic`) —
+//! без единого мьютекса и без второго потока, просто кооперативно уступая цикл
+//! `run()`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rdkafka::admin::AdminClient;
-use rdkafka::client::DefaultClientContext;
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::client::ClientContext;
+use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use rdkafka::error::KafkaError;
+use rdkafka::statistics::Statistics;
 use rdkafka::types::RDKafkaRespErr;
 use tokio::sync::oneshot;
 
 use super::filter::contains;
+use super::quota::{QuotaEstimate, QuotaMeter};
 use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
 use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
@@ -35,9 +80,14 @@ use super::types::*;
 use crate::helpers::get_cluster_config;
 
 /// Потолок времени на одно чтение (открытие топика или "загрузить ещё").
-/// Без него пустой или медленный топик подвесил бы чтение навсегда — партиции,
-/// не успевшие закончиться, просто принудительно закрываются.
+/// Проверяется НА ГРАНИЦЕ РАУНДА: чтение останавливается, не потеряв ни одного
+/// уже вычитанного сообщения. Остаток добирается кнопкой "Load more".
 const READ_DEADLINE: Duration = Duration::from_secs(30);
+/// Страховка от партиции, которая перестала отдавать данные и не даёт раунду
+/// закрыться. Раунд, не уложившийся в этот срок, выбрасывается целиком (см.
+/// `abort_round`), поэтому запас здесь щедрый: лучше подождать лишнее, чем
+/// выкинуть честно вычитанные мегабайты на медленном канале.
+const ROUND_DEADLINE: Duration = Duration::from_secs(20);
 /// Таймаут одного вызова `consume_batch` в шаге чтения, в миллисекундах.
 const POLL_TICK_MS: i32 = 200;
 /// Сколько сообщений забирать за один шаг кооперативного чтения. Между шагами
@@ -45,7 +95,97 @@ const POLL_TICK_MS: i32 = 200;
 /// `GetWindow`/`GetOpenTopicProgress` во время долгой вычитки, но тем больше
 /// накладных расходов на переключение.
 const BATCH_SIZE: usize = 500;
+/// Сколько ДОЛЖЕН длиться один раунд. Раунд — это шаг, которым растёт таблица;
+/// постоянной надо держать именно его длительность.
+///
+/// Размер окна для этого не выводится аналитически и не подбирается вслепую, а
+/// считается из измеренной пропускной способности (`kafka::quota`):
+///
+/// ```text
+/// офсетов в раунде = (байт/с × TARGET_ROUND_SECS) / байт на офсет
+/// ```
+///
+/// Обе величины берутся из одного измерения, поэтому в цену офсета сами собой
+/// входят и размер сообщений (в соседних топиках одного кластера встречались и
+/// 400 байт, и 31 КБ), и плотность офсетов, и то, что часть присланного мы
+/// выбрасываем при переходе к следующему окну — за неё квота списывается
+/// наравне с полезным.
+const TARGET_ROUND_SECS: f64 = 2.0;
+/// Окно первого раунда: про кластер ещё не известно ничего, поэтому пробуем
+/// заведомо мало — лишь бы первые строки появились быстро даже там, где одно
+/// сообщение весит десятки килобайт.
+const FIRST_ROUND_CHUNK: i64 = 10;
+/// Ниже этого окно не опускается даже на самом медленном канале: каждый раунд
+/// заново открывает чтение партиции, и дробить его до единиц сообщений — уже
+/// одни накладные расходы.
+const MIN_ROUND_CHUNK: i64 = 5;
+const MAX_ROUND_CHUNK: i64 = 5000;
+/// Во сколько раз окно может вырасти за один раунд.
+///
+/// Ограничение именно на РОСТ, и оно не косметическое. Kafka разрешает
+/// перебрать квоту, а потом расплатиться одной длинной паузой, поэтому первые
+/// секунды чтения идут на скорости, которой на самом деле нет. Пока измеритель
+/// не накопит окно шире квотного, оценка завышена — и без этого предела одна
+/// такая оценка превратилась бы в раунд, за который брокер заставит стоять
+/// десяток секунд. Вниз ограничения нет: ужиматься надо сразу.
+const CHUNK_GROWTH_LIMIT: i64 = 2;
+/// Во сколько раз расширять окно партиции, в котором не нашлось НИ ОДНОГО
+/// сообщения. Такое бывает на compacted-топиках: диапазон офсетов есть, а
+/// сообщений в нём не осталось. Ужимать окно там бессмысленно — за фетч мы
+/// платим в любом случае, — поэтому наоборот проскакиваем пустоту быстрее.
+const BARREN_GROWTH: u32 = 2;
+/// Потолок такого разгона, чтобы не улететь в окно на миллион офсетов.
+const BARREN_MAX_DOUBLINGS: u32 = 6;
+/// Сколько байт вычитывает ОДНО чтение, прежде чем остановиться и отдать
+/// управление пользователю. Без этого потолка `limit` в 1000 сообщений на
+/// партицию на "жирном" топике означает сотни мегабайт и минуты ожидания.
+const READ_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+/// Сколько партиций опрашивается на watermarks за один шаг подготовки. Каждый
+/// вызов — отдельный поход в сеть (на реальном кластере наблюдалось до 600 мс
+/// на партицию), а шаг блокирует воркер целиком — поэтому по чуть-чуть.
+const WATERMARK_BATCH: usize = 2;
+const WATERMARK_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Как часто librdkafka отдаёт статистику. Из неё измеритель квоты берёт
+/// принятые байты и наложенные брокером задержки — см. `kafka::quota`.
+const STATS_INTERVAL_MS: &str = "1000";
+
+/// Контекст клиента, единственная задача которого — сливать статистику
+/// librdkafka в измеритель квоты.
+#[derive(Clone)]
+struct MeteredContext {
+    meter: Arc<QuotaMeter>,
+}
+
+impl ClientContext for MeteredContext {
+    fn stats(&self, statistics: Statistics) {
+        self.meter.observe(&statistics);
+    }
+
+    /// Своя диагностика librdkafka по умолчанию уходит в крейт `log`, который
+    /// в приложении никем не инициализирован, — то есть в никуда. Ровно из-за
+    /// этой слепоты таймауты фетча пришлось вычислять по косвенным признакам:
+    /// библиотека всё это время писала о них, но её никто не слушал.
+    ///
+    /// Уровень `Notice` и ниже отбрасываем — иначе на каждое переподключение
+    /// придёт стена рутины.
+    fn log(&self, level: RDKafkaLogLevel, fac: &str, log_message: &str) {
+        if level as i32 <= RDKafkaLogLevel::Warning as i32 {
+            eprintln!("[rdkafka:{fac}] {log_message}");
+        }
+    }
+
+    fn error(&self, error: KafkaError, reason: &str) {
+        eprintln!("[rdkafka] {error}: {reason}");
+    }
+}
+
+impl ConsumerContext for MeteredContext {}
+
+/// Ответ на чтение, отменённое из-за того, что пользователь ушёл с топика.
+/// Фронт узнаёт его по строке и молчит: это не сбой, а нормальный ход событий.
+pub const READ_SUPERSEDED: &str = "read superseded";
 
 type Reply<T> = oneshot::Sender<T>;
 
@@ -117,49 +257,204 @@ fn absorb(store: &mut MessageStore, msg: &RawMessage) -> bool {
     )
 }
 
-/// Состояние одной партиции в рамках текущего чтения (`open_topic` или
-/// `load_more`).
+/// Что известно про партицию между раундами. Переживает завершение чтения:
+/// именно отсюда `load_more` узнаёт, куда возвращаться.
 struct PartitionCursor {
-    /// Сколько сообщений разрешено набрать в ЭТОМ чтении (не суммарно).
-    per_partition_limit: i64,
+    /// Границы партиции, снятые один раз при открытии топика.
+    low: i64,
+    /// Exclusive.
+    high: i64,
+    /// Куда сядет следующее окно: в режиме `newest` это его правая граница
+    /// (exclusive, окна ползут вниз), в `oldest` — левая (inclusive).
+    next: i64,
+    /// Сколько сообщений уже взято из этой партиции за все раунды.
     absorbed: i64,
-    oldest_offset_seen: Option<i64>,
-    newest_offset_seen: Option<i64>,
-    /// Только для "загрузить ещё" в режиме Newest: офсет, дойдя до которого
-    /// (`>=`), партиция уже пересекается с ранее загруженным диапазоном —
-    /// дальше читать незачем.
-    boundary_offset: Option<i64>,
-    /// Партиция больше не читается (не обязательно означает конец данных —
-    /// см. `eof`).
+    /// Потолок `absorbed` для текущего чтения. `load_more` его поднимает.
+    budget: i64,
+    /// Где стоит читатель прямо сейчас. Если следующее окно начинается ровно
+    /// здесь, переставлять его не нужно — а в режиме `oldest` окна как раз
+    /// идут встык, так что там seek не делается ни разу.
+    read_position: Option<i64>,
+    /// Дочитано до конца — до `low` в `newest`, до `high` в `oldest`.
+    exhausted: bool,
+    /// Самый старый (в `newest`) либо самый новый (в `oldest`) уже вычитанный
+    /// timestamp. Дальше эта партиция не выдаст ничего «за» этой отметкой,
+    /// поэтому именно она определяет, что безопасно публиковать.
+    frontier_ts: Option<i64>,
+    /// Сколько окон подряд не дали ни одного сообщения — см. `BARREN_GROWTH`.
+    barren_rounds: u32,
+}
+
+impl PartitionCursor {
+    /// Окно этой партиции для очередного раунда — полуинтервал `[start, end)`.
+    /// `None` — раунд ей не положен: дочитана до конца либо выбрала бюджет.
+    ///
+    /// Окна не пересекаются и всегда двигаются в одну сторону, поэтому раунды
+    /// гарантированно сходятся: в `newest` `next` строго убывает до `low`,
+    /// в `oldest` строго растёт до `high`.
+    fn next_window(&self, newest_first: bool, chunk: i64) -> Option<(i64, i64)> {
+        if self.exhausted || self.absorbed >= self.budget {
+            return None;
+        }
+        // Бюджет считается в СООБЩЕНИЯХ, а окно — в офсетах. На плотной
+        // партиции это одно и то же, на дырявой офсетов нужно больше, поэтому
+        // окно ограничивается остатком бюджета только до разгона по пустотам.
+        let chunk = chunk.min(self.budget - self.absorbed).max(MIN_ROUND_CHUNK)
+            * BARREN_GROWTH.pow(self.barren_rounds.min(BARREN_MAX_DOUBLINGS)) as i64;
+        let (start, end) = if newest_first {
+            ((self.next - chunk).max(self.low), self.next)
+        } else {
+            (self.next, (self.next + chunk).min(self.high))
+        };
+        if start >= end {
+            return None;
+        }
+        Some((start, end))
+    }
+
+    /// Двигает курсор на окно, вычитанное ЦЕЛИКОМ. Частично вычитанное окно
+    /// сюда попадать не должно — см. `Worker::abort_round`.
+    fn advance(&mut self, newest_first: bool, window: &RoundPartition) {
+        self.absorbed += window.absorbed;
+        // Окно вычитано целиком, значит читатель доехал до его правой границы.
+        self.read_position = Some(window.end);
+        self.barren_rounds = if window.absorbed == 0 {
+            self.barren_rounds + 1
+        } else {
+            0
+        };
+        if newest_first {
+            self.next = window.start;
+            self.exhausted |= window.start <= self.low;
+        } else {
+            self.next = window.end;
+            self.exhausted |= window.end >= self.high;
+        }
+    }
+
+    /// Обновляет отметку, за которую эта партиция уже точно ничего не выдаст.
+    fn observe(&mut self, newest_first: bool, timestamp: i64) {
+        self.frontier_ts = Some(match self.frontier_ts {
+            None => timestamp,
+            Some(prev) if newest_first => prev.min(timestamp),
+            Some(prev) => prev.max(timestamp),
+        });
+    }
+}
+
+/// Окно одной партиции в текущем раунде: полуинтервал `[start, end)`.
+struct RoundPartition {
+    start: i64,
+    end: i64,
+    absorbed: i64,
+    /// Окно вычитано целиком (дошли до `end` или до конца лога).
     done: bool,
-    /// true — партиция закрылась по-настоящему (`PARTITION_EOF`), то есть
-    /// вычитан весь доступный диапазон и грузить дальше нечего. false —
-    /// остановились из-за собственного лимита или общего дедлайна, то есть
-    /// данные ещё могут быть.
-    eof: bool,
+}
+
+enum ReadPhase {
+    /// Границы партиций ещё не сняты; в списке — те, что остались.
+    Watermarks(Vec<i32>),
+    /// Идёт раунд.
+    Reading(HashMap<i32, RoundPartition>),
+}
+
+/// Размер окна следующего раунда, в офсетах на партицию.
+///
+/// Тормозов два, и они независимы — это не перестраховка, а вывод из ошибки.
+///
+/// 1. **Измеренная квота** (`estimate`) — основной, принципиальный: прямой
+///    расчёт «сколько офсетов кластер успеет отдать за `TARGET_ROUND_SECS`».
+/// 2. **Длительность прошлого раунда** (`last_round`) — запасной, но всегда
+///    доступный. Не уложились в цель — расти нельзя вовсе, а ужаться надо
+///    пропорционально переработке.
+///
+/// Второй нужен именно потому, что первый может молча отсутствовать: колбэк
+/// статистики висел на неопрошенной очереди, `estimate` был вечным `None`, и
+/// окно, у которого не осталось ни одной обратной связи, удваивалось до упора —
+/// 20, 40, 80, 160, 320, 640, пока раунды не растянулись до десяти секунд.
+/// Наблюдаемая длительность раунда есть всегда и не зависит ни от какой
+/// внешней подсистемы.
+fn next_window(
+    previous: i64,
+    estimate: Option<QuotaEstimate>,
+    active: usize,
+    last_round: Option<Duration>,
+) -> i64 {
+    let ceiling = match last_round {
+        Some(elapsed) if elapsed.as_secs_f64() > TARGET_ROUND_SECS => {
+            let overrun = elapsed.as_secs_f64() / TARGET_ROUND_SECS;
+            (previous as f64 / overrun).round() as i64
+        }
+        _ => previous.saturating_mul(CHUNK_GROWTH_LIMIT),
+    };
+
+    let target = match estimate {
+        Some(est) => {
+            let bytes = est.bytes_per_sec * TARGET_ROUND_SECS;
+            let offsets = bytes / est.bytes_per_offset.max(1.0) / active.max(1) as f64;
+            offsets.round() as i64
+        }
+        None => ceiling,
+    };
+    target.min(ceiling).clamp(MIN_ROUND_CHUNK, MAX_ROUND_CHUNK)
+}
+
+/// Что публикация может себе позволить, см. `Worker::safe_frontier`.
+enum Frontier {
+    /// Читать больше не из чего — отстойник можно опубликовать целиком.
+    Everything,
+    /// Публикуем всё, что строго «за» этой отметкой времени.
+    Beyond(i64),
+    /// Есть партиция, о которой не известно ничего. Публиковать нельзя ничего.
+    Nothing,
 }
 
 /// Ещё не завершённое чтение — раскладывается по шагам через
 /// `Command::ContinueRead`.
 struct PendingRead {
     topic: RawTopic,
+    /// Одна на всё чтение. Партиции цепляются к ней один раз и живут до конца:
+    /// между окнами они не останавливаются, а переставляются через
+    /// `RawTopic::seek`, и хвосты «в полёте» отбрасывает сама librdkafka по
+    /// барьеру версии.
     queue: RawQueue,
-    cursors: HashMap<i32, PartitionCursor>,
+    /// Партиции, у которых чтение уже открыто. Открывать повторно нельзя, а
+    /// закрывать надо ровно один раз — и только в самом конце.
+    open_partitions: HashSet<i32>,
+    phase: ReadPhase,
     started: Instant,
+    /// Начало ТЕКУЩЕГО раунда — под собственный, короткий дедлайн.
+    round_started: Instant,
+    /// Размер арены на начало чтения: от него считается `READ_BYTE_BUDGET`.
+    bytes_at_start: usize,
     reply: Reply<Result<OpenTopicResult, String>>,
     topic_name: String,
+    /// Длина `store` на начало текущего раунда. Оборванный раунд — дырявое
+    /// окно, его добыча отматывается ровно сюда.
+    round_mark: usize,
+    /// Размер арены на начало раунда — только для диагностики.
+    round_mark_bytes: usize,
+    /// Стартовый бюджет партиции. Нужен только в фазе `Watermarks`: курсоров,
+    /// которым его можно проставить, до неё ещё не существует.
+    budget: i64,
 }
 
 struct Worker {
     /// Клон собственного отправителя — нужен, чтобы слать себе `ContinueRead`.
     tx: Sender<Command>,
-    consumer: Option<BaseConsumer>,
-    admin: Option<AdminClient<DefaultClientContext>>,
+    consumer: Option<BaseConsumer<MeteredContext>>,
+    admin: Option<AdminClient<MeteredContext>>,
+    /// Сколько байт в секунду кластер РЕАЛЬНО отдаёт. Живёт на уровне
+    /// подключения, а не чтения: квота — свойство пары «пользователь-кластер»,
+    /// и нащупывать её заново на каждое открытие топика значило бы каждый раз
+    /// платить теми же несколькими медленными раундами.
+    quota: Arc<QuotaMeter>,
     /// Количество партиций по топикам — приезжает с метаданными и переиспользуется,
     /// чтобы не ходить за ними повторно на каждое открытие топика.
     partition_counts: HashMap<String, usize>,
     store: MessageStore,
-    /// Индексы в `store` после применения фильтра. Это и есть то, что видит UI.
+    /// Индексы в опубликованной части `store` после применения фильтра.
+    /// Это и есть то, что видит UI.
     view: Vec<u32>,
     filter: MessageFilter,
     open_topic: Option<String>,
@@ -167,9 +462,19 @@ struct Worker {
     /// переиспользуется без изменений в `load_more` того же топика.
     newest_first: bool,
     pending_read: Option<PendingRead>,
-    /// Курсоры последнего ЗАВЕРШЁННОГО чтения по каждой партиции — точка
-    /// отсчёта для следующего `load_more`.
-    partition_cursors: HashMap<i32, PartitionCursor>,
+    /// Состояние партиций открытого топика. Живёт между чтениями.
+    cursors: HashMap<i32, PartitionCursor>,
+    /// Размер окна последнего раунда, в офсетах на партицию. Отправная точка
+    /// для следующего — см. `next_window`.
+    window: i64,
+    /// Сколько занял последний раунд. Запасная обратная связь на случай, когда
+    /// измерителю квоты нечего сказать.
+    last_round: Option<Duration>,
+    /// Хоть у одного вычитанного сообщения был непустой timestamp. Если нет
+    /// (совсем старый топик, брокер не отдаёт время), сортировать и придерживать
+    /// нечего по чему — публикуем в порядке приезда, иначе таблица осталась бы
+    /// пустой навсегда.
+    has_timestamps: bool,
 }
 
 impl Worker {
@@ -185,7 +490,11 @@ impl Worker {
             open_topic: None,
             newest_first: false,
             pending_read: None,
-            partition_cursors: HashMap::new(),
+            cursors: HashMap::new(),
+            quota: Arc::new(QuotaMeter::new()),
+            window: FIRST_ROUND_CHUNK,
+            last_round: None,
+            has_timestamps: false,
         }
     }
 
@@ -232,16 +541,37 @@ impl Worker {
                     let _ = reply.send(());
                 }
             }
+            // Без этого измеритель квоты не получает вообще ничего: колбэк
+            // статистики висит на главной очереди клиента, а её обслуживает
+            // только `rd_kafka_poll` — см. `raw_consumer::poll_main`.
+            self.drain_events();
+            // Часы измерителя идут только пока идёт чтение. Ставится здесь, а
+            // не в каждой ветке завершения: путей выхода из чтения много
+            // (штатный конец, дедлайн, ошибка, смена топика), и забыть один из
+            // них означало бы засчитать простой пользователя как нулевую
+            // скорость кластера.
+            self.quota.set_reading(self.pending_read.is_some());
         }
     }
 
     fn connect(&mut self, payload: ClusterConnectPayload) -> Result<(), String> {
-        let conf = get_cluster_config(&payload);
-        let consumer: BaseConsumer = conf
-            .create()
+        let mut conf = get_cluster_config(&payload);
+        // Статистика нужна только ради измерителя квоты, поэтому включается
+        // здесь, а не в общем конфиге: `cluster_test` поднимает клиента на
+        // одну проверку связи, и собирать для него JSON раз в секунду незачем.
+        conf.set("statistics.interval.ms", STATS_INTERVAL_MS);
+
+        // Другой кластер — другая квота.
+        self.quota.reset();
+        let context = MeteredContext {
+            meter: Arc::clone(&self.quota),
+        };
+
+        let consumer: BaseConsumer<MeteredContext> = conf
+            .create_with_context(context.clone())
             .map_err(|e| format!("can't create consumer: {e}"))?;
-        let admin: AdminClient<_> = conf
-            .create()
+        let admin: AdminClient<MeteredContext> = conf
+            .create_with_context(context)
             .map_err(|e| format!("can't create admin client: {e}"))?;
 
         self.consumer = Some(consumer);
@@ -288,33 +618,11 @@ impl Worker {
         Ok(topics)
     }
 
-    /// Останавливает уже идущее чтение (пользователь переключил топик или
-    /// закрыл его, пока предыдущее чтение ещё не закончилось). Партии, уже
-    /// закрытые (`done`), второй раз не трогаем. `reply` просто дропается —
-    /// это отклоняет старый `invoke()` на фронте, что уже сегодня спокойно
-    /// переживается флагом `cancelled` в эффекте открытия топика.
-    fn cancel_pending_read(&mut self) {
-        if let Some(pending) = self.pending_read.take() {
-            for (&p, cursor) in &pending.cursors {
-                if !cursor.done {
-                    pending.topic.consume_stop(p);
-                }
-            }
-            eprintln!(
-                "[worker] {} read cancelled (superseded) after {:?}",
-                pending.topic_name,
-                pending.started.elapsed()
-            );
-        }
-    }
+    // --- Запуск чтения ------------------------------------------------------
 
-    /// Вычитывает окно сообщений через group-less legacy consumer API
-    /// (`kafka::raw_consumer`) — партиции читаются напрямую, без объекта
-    /// консьюмер-группы и без связанных с ним ACL.
-    ///
-    /// Не блокирует воркер целиком: делает подготовку (валидация, офсеты,
-    /// `consume_start_queue`) и один первый шаг чтения, дальше эстафету
-    /// подхватывает `Command::ContinueRead`.
+    /// Открывает топик: сбрасывает буфер, снимает границы партиций и запускает
+    /// первый раунд. Долгая часть уходит в `continue_read`, поэтому сама
+    /// команда возвращается мгновенно, а `reply` уезжает уже с результатом.
     fn start_open_topic(
         &mut self,
         params: OpenTopicParams,
@@ -344,94 +652,56 @@ impl Worker {
             None => (0..partition_count as i32).collect(),
         };
 
-        let start_offset = match params.start_from {
-            StartFrom::Newest => raw_consumer::offset_tail(limit),
-            StartFrom::Oldest => raw_consumer::OFFSET_BEGINNING,
+        let (topic, queue) = match self.open_handles(&params.topic) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
         };
 
         eprintln!(
-            "[open_topic] {} partitions={partitions:?} start_from={:?} per_partition_limit={limit} start_offset={start_offset}",
-            params.topic, params.start_from
+            "[open_topic] {} partitions={} start_from={:?} per_partition_limit={limit}",
+            params.topic,
+            partitions.len(),
+            params.start_from
         );
-
-        let consumer = match self.consumer.as_ref() {
-            Some(c) => c,
-            None => {
-                let _ = reply.send(Err("not connected to a cluster".into()));
-                return;
-            }
-        };
-        let client_ptr = consumer.client().native_ptr();
-
-        let topic = match RawTopic::new(client_ptr, &params.topic) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
-        let queue = match RawQueue::new(client_ptr) {
-            Ok(q) => q,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
-
-        let mut cursors = HashMap::with_capacity(partitions.len());
-        let mut started: Vec<i32> = Vec::with_capacity(partitions.len());
-        for &p in &partitions {
-            match topic.consume_start_queue(p, start_offset, &queue) {
-                Ok(()) => {
-                    started.push(p);
-                    cursors.insert(
-                        p,
-                        PartitionCursor {
-                            per_partition_limit: limit,
-                            absorbed: 0,
-                            oldest_offset_seen: None,
-                            newest_offset_seen: None,
-                            boundary_offset: None,
-                            done: false,
-                            eof: false,
-                        },
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[open_topic] consume_start_queue p{p} offset={start_offset} FAILED: {e}"
-                    );
-                    for started_p in started {
-                        topic.consume_stop(started_p);
-                    }
-                    let _ = reply.send(Err(format!("can't start reading partition {p}: {e}")));
-                    return;
-                }
-            }
-        }
 
         self.store.clear();
         self.filter = params.filter;
-        self.open_topic = Some(params.topic.clone());
         self.newest_first = params.start_from == StartFrom::Newest;
-        self.partition_cursors.clear();
+        self.open_topic = Some(params.topic.clone());
+        self.cursors.clear();
+        // Скорость кластера измерителю переносить между топиками можно, а вот
+        // цену офсета — нет: в соседних топиках сообщения отличаются на два
+        // порядка. Поэтому окно начинается заново с малого и растёт не быстрее
+        // чем вдвое за раунд, пока в измерение не войдут данные нового топика.
+        self.window = FIRST_ROUND_CHUNK;
+        self.last_round = None;
+        self.has_timestamps = false;
         self.rebuild_view();
 
         self.pending_read = Some(PendingRead {
             topic,
             queue,
-            cursors,
+            open_partitions: HashSet::new(),
+            phase: ReadPhase::Watermarks(partitions),
             started: Instant::now(),
+            round_started: Instant::now(),
+            bytes_at_start: 0,
             reply,
             topic_name: params.topic,
+            round_mark: 0,
+            round_mark_bytes: 0,
+            budget: limit,
         });
 
-        self.continue_read();
+        let _ = self.tx.send(Command::ContinueRead);
     }
 
-    /// "Загрузить ещё": продолжает каждую ещё не исчерпанную (`!eof`)
-    /// партицию с того места, где остановилось предыдущее чтение — без
-    /// повторного похода за watermarks (см. `PartitionCursor`).
+    /// "Загрузить ещё": поднимает бюджет каждой ещё не исчерпанной партиции и
+    /// продолжает раунды с того окна, на котором остановилось предыдущее
+    /// чтение. Watermarks уже сняты, повторно за ними не ходим.
     fn start_load_more(
         &mut self,
         params: LoadMoreParams,
@@ -445,261 +715,617 @@ impl Worker {
             let _ = reply.send(Err("no topic is open".into()));
             return;
         };
-        if self.partition_cursors.is_empty() {
+        if self.cursors.is_empty() {
             let _ = reply.send(Err("nothing loaded yet".into()));
             return;
         }
 
         let additional = params.additional.clamp(1, 100_000) as i64;
-        let consumer = match self.consumer.as_ref() {
-            Some(c) => c,
-            None => {
-                let _ = reply.send(Err("not connected to a cluster".into()));
+        for cursor in self.cursors.values_mut() {
+            if !cursor.exhausted {
+                cursor.budget = cursor.absorbed + additional;
+            }
+        }
+
+        let (topic, queue) = match self.open_handles(&topic_name) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = reply.send(Err(e));
                 return;
             }
         };
+
+        eprintln!("[load_more] {topic_name} additional={additional} per partition");
+
+        let pending = PendingRead {
+            topic,
+            queue,
+            open_partitions: HashSet::new(),
+            phase: ReadPhase::Reading(HashMap::new()),
+            started: Instant::now(),
+            round_started: Instant::now(),
+            bytes_at_start: self.store.byte_size(),
+            reply,
+            topic_name,
+            round_mark: self.store.len(),
+            round_mark_bytes: self.store.byte_size(),
+            budget: additional,
+        };
+        self.begin_round(pending);
+    }
+
+    /// Хендлы legacy-консьюмера для топика. Живут ровно одно чтение:
+    /// освобождение делает `Drop`.
+    fn open_handles(&self, topic_name: &str) -> Result<(RawTopic, RawQueue), String> {
+        let consumer = self.consumer.as_ref().ok_or("not connected to a cluster")?;
         let client_ptr = consumer.client().native_ptr();
+        let topic = RawTopic::new(client_ptr, topic_name)?;
+        let queue = self.new_queue()?;
+        Ok((topic, queue))
+    }
 
-        let topic = match RawTopic::new(client_ptr, &topic_name) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
+    /// Разносит накопившиеся события клиента — прежде всего статистику, из
+    /// которой измеряется квота.
+    ///
+    /// Именно `BaseConsumer::poll`, а не `rd_kafka_poll`, и это не мелочь.
+    /// rdkafka-rust не ставит C-колбэк `rd_kafka_conf_set_stats_cb` вообще
+    /// никогда: `BaseConsumer::new` включает event API
+    /// (`rd_kafka_conf_set_events(... RD_KAFKA_EVENT_STATS ...)`), а при нём
+    /// librdkafka колбэки не зовёт — складывает событие в очередь. Прямой
+    /// `rd_kafka_poll` обслуживал `rk_rep`, где для статистики колбэка нет, и
+    /// просто выбрасывал её: измеритель квоты не получал ни одного снимка.
+    ///
+    /// Очередь здесь именно главная: `group.id` мы не задаём (см.
+    /// `helpers::get_cluster_config`), а без него `BaseConsumer::new` не
+    /// перенаправляет главную очередь в консьюмерскую и слушает первую.
+    ///
+    /// Сообщения топика сюда не попадают — они идут в нашу приватную очередь
+    /// через `consume_start_queue`, — так что результат ожидаемо пустой.
+    fn drain_events(&self) {
+        if let Some(consumer) = self.consumer.as_ref() {
+            let _ = consumer.poll(Duration::ZERO);
+        }
+    }
+
+    fn new_queue(&self) -> Result<RawQueue, String> {
+        let consumer = self.consumer.as_ref().ok_or("not connected to a cluster")?;
+        RawQueue::new(consumer.client().native_ptr())
+    }
+
+    /// Останавливает уже идущее чтение (пользователь переключил топик или
+    /// закрыл его, пока предыдущее чтение ещё не закончилось). `reply` просто
+    /// дропается — это отклоняет старый `invoke()` на фронте, что уже сегодня
+    /// спокойно переживается флагом `cancelled` в эффекте открытия топика.
+    fn cancel_pending_read(&mut self) {
+        if let Some(pending) = self.pending_read.take() {
+            Self::stop_all(&pending);
+            // Незавершённый раунд — дырявое окно; его добыча не годится.
+            self.store.truncate(pending.round_mark);
+            eprintln!(
+                "[worker] {} read cancelled (superseded) after {:?}",
+                pending.topic_name,
+                pending.started.elapsed()
+            );
+            // Раньше `reply` просто дропался, и на фронт прилетало
+            // "kafka worker dropped the reply" — сообщение про внутреннюю
+            // поломку там, где на самом деле пользователь просто ушёл с топика.
+            let _ = pending.reply.send(Err(READ_SUPERSEDED.to_string()));
+        }
+    }
+
+    /// Закрывает чтение всех открытых партиций. БЛОКИРУЮЩАЯ операция: каждый
+    /// `consume_stop` ждёт подтверждения от брокерского потока, а тот под
+    /// квотой может сидеть в придержанном фетче секундами. Поэтому зовётся
+    /// ровно один раз — на завершении чтения, а не между окнами.
+    fn stop_all(pending: &PendingRead) {
+        for &p in &pending.open_partitions {
+            pending.topic.consume_stop(p);
+        }
+    }
+
+    // --- Шаги чтения --------------------------------------------------------
+
+    /// Один шаг идущего чтения. Возвращает управление циклу `run()` после
+    /// каждого шага, чтобы между ними обслуживались остальные команды.
+    fn continue_read(&mut self) {
+        let Some(pending) = self.pending_read.take() else {
+            return;
         };
-        let queue = match RawQueue::new(client_ptr) {
-            Ok(q) => q,
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
-        };
 
-        let mut cursors = HashMap::new();
-        let mut started: Vec<i32> = Vec::new();
-        for (&p, prev) in &self.partition_cursors {
-            // По-настоящему кончилась (реальный EOF) — грузить нечего.
-            if prev.eof {
-                continue;
-            }
-
-            let (start_offset, boundary_offset) = if self.newest_first {
-                (
-                    raw_consumer::offset_tail(prev.absorbed.max(0) + additional),
-                    prev.oldest_offset_seen,
-                )
-            } else {
-                let resume = prev
-                    .newest_offset_seen
-                    .map(|o| o + 1)
-                    .unwrap_or(raw_consumer::OFFSET_BEGINNING);
-                (resume, None)
-            };
-
-            match topic.consume_start_queue(p, start_offset, &queue) {
-                Ok(()) => {
-                    started.push(p);
-                    cursors.insert(
-                        p,
-                        PartitionCursor {
-                            per_partition_limit: additional,
-                            absorbed: 0,
-                            oldest_offset_seen: prev.oldest_offset_seen,
-                            newest_offset_seen: prev.newest_offset_seen,
-                            boundary_offset,
-                            done: false,
-                            eof: false,
-                        },
-                    );
-                }
-                Err(e) => {
+        match pending.phase {
+            ReadPhase::Watermarks(_) => {
+                if pending.started.elapsed() >= READ_DEADLINE {
                     eprintln!(
-                        "[load_more] consume_start_queue p{p} offset={start_offset} FAILED: {e}"
+                        "[continue_read] {} deadline while fetching offsets",
+                        pending.topic_name
                     );
-                    for started_p in started {
-                        topic.consume_stop(started_p);
-                    }
-                    let _ = reply.send(Err(format!("can't resume partition {p}: {e}")));
+                    self.finish_read(pending, true);
+                    return;
+                }
+                self.step_watermarks(pending)
+            }
+            ReadPhase::Reading(_) => {
+                // Общий дедлайн чтения здесь НЕ проверяется — он смотрится на
+                // границе раунда (`begin_round`), где остановка ничего не
+                // стоит. Здесь только страховка от зависшего раунда.
+                if pending.round_started.elapsed() >= ROUND_DEADLINE {
+                    eprintln!(
+                        "[continue_read] {} round stalled after {:?}, dropping it",
+                        pending.topic_name,
+                        pending.round_started.elapsed()
+                    );
+                    self.abort_round(pending);
+                    return;
+                }
+                self.step_reading(pending)
+            }
+        }
+    }
+
+    /// Снимает границы очередной пачки партиций. Без них нельзя нарезать окна:
+    /// `RD_KAFKA_OFFSET_TAIL` дал бы только «последние N», но не сказал бы, где
+    /// начинается партиция и когда читать назад больше нечего.
+    fn step_watermarks(&mut self, mut pending: PendingRead) {
+        let ReadPhase::Watermarks(todo) = &mut pending.phase else {
+            return;
+        };
+        let take = WATERMARK_BATCH.min(todo.len());
+        let batch: Vec<i32> = todo.drain(..take).collect();
+        let remaining = todo.len();
+
+        let Some(consumer) = self.consumer.as_ref() else {
+            let _ = pending.reply.send(Err("not connected to a cluster".into()));
+            return;
+        };
+
+        // Сначала собираем ответы, и только потом трогаем `self.cursors`:
+        // `consumer` держит `&self`.
+        let mut fetched = Vec::with_capacity(batch.len());
+        for p in batch {
+            match consumer.fetch_watermarks(&pending.topic_name, p, WATERMARK_TIMEOUT) {
+                Ok((low, high)) => fetched.push((p, low, high)),
+                Err(e) => {
+                    let _ = pending
+                        .reply
+                        .send(Err(format!("can't read offsets of partition {p}: {e}")));
                     return;
                 }
             }
         }
 
-        if cursors.is_empty() {
-            // Все партиции уже вычитаны до конца — отвечаем текущим срезом.
-            let _ = reply.send(Ok(OpenTopicResult {
-                total: self.view.len(),
-                loaded: self.store.len(),
-                buffer_bytes: self.store.byte_size(),
-                truncated: false,
-            }));
+        let budget = pending.budget;
+        let newest_first = self.newest_first;
+        for (p, low, high) in fetched {
+            self.cursors.insert(
+                p,
+                PartitionCursor {
+                    low,
+                    high,
+                    next: if newest_first { high } else { low },
+                    absorbed: 0,
+                    budget,
+                    // Чтение ещё не открыто: где стоит читатель — не вопрос.
+                    read_position: None,
+                    exhausted: low >= high,
+                    frontier_ts: None,
+                    barren_rounds: 0,
+                },
+            );
+        }
+
+        if remaining > 0 {
+            self.pending_read = Some(pending);
+            let _ = self.tx.send(Command::ContinueRead);
             return;
         }
 
-        eprintln!("[load_more] {topic_name} resuming partitions={started:?} additional={additional}");
-
-        self.pending_read = Some(PendingRead {
-            topic,
-            queue,
-            cursors,
-            started: Instant::now(),
-            reply,
-            topic_name,
-        });
-
-        self.continue_read();
+        let total: i64 = self.cursors.values().map(|c| c.high - c.low).sum();
+        eprintln!(
+            "[watermarks] {} ready in {:?}, {total} messages in the topic",
+            pending.topic_name,
+            pending.started.elapsed()
+        );
+        pending.phase = ReadPhase::Reading(HashMap::new());
+        pending.round_mark = self.store.len();
+        pending.round_mark_bytes = self.store.byte_size();
+        self.begin_round(pending);
     }
 
-    /// Один шаг уже идущего чтения: один `consume_batch`, обновление курсоров,
-    /// пересборка `store`/`view` до консистентного состояния. Если не всё
-    /// готово — шлёт себе `Command::ContinueRead` и возвращает управление
-    /// циклу `run()`, чтобы между шагами обслуживались остальные команды.
-    fn continue_read(&mut self) {
-        let Some(mut pending) = self.pending_read.take() else {
+    /// Нарезает окна очередного раунда и запускает по ним чтение.
+    ///
+    /// Здесь же — единственная точка штатной остановки чтения. Обрывать раунд
+    /// на середине нельзя без потерь (см. `abort_round`), поэтому и дедлайн, и
+    /// байтовый бюджет проверяются именно тут, на границе.
+    fn begin_round(&mut self, mut pending: PendingRead) {
+        let newest_first = self.newest_first;
+
+        if pending.started.elapsed() >= READ_DEADLINE {
+            eprintln!(
+                "[begin_round] {} stopping at round boundary: deadline after {:?}",
+                pending.topic_name,
+                pending.started.elapsed()
+            );
+            self.finish_read(pending, true);
+            return;
+        }
+        let read_bytes = self
+            .store
+            .byte_size()
+            .saturating_sub(pending.bytes_at_start);
+        if read_bytes >= READ_BYTE_BUDGET {
+            eprintln!(
+                "[begin_round] {} stopping at round boundary: {read_bytes} bytes read",
+                pending.topic_name
+            );
+            self.finish_read(pending, true);
+            return;
+        }
+
+        let active = self
+            .cursors
+            .values()
+            .filter(|c| !c.exhausted && c.absorbed < c.budget)
+            .count();
+        let chunk = next_window(self.window, self.quota.estimate(), active, self.last_round);
+        self.window = chunk;
+
+        let mut round: HashMap<i32, RoundPartition> = HashMap::new();
+        for (&p, c) in &self.cursors {
+            if let Some((start, end)) = c.next_window(newest_first, chunk) {
+                round.insert(
+                    p,
+                    RoundPartition {
+                        start,
+                        end,
+                        absorbed: 0,
+                        done: false,
+                    },
+                );
+            }
+        }
+
+        if round.is_empty() {
+            self.finish_read(pending, false);
+            return;
+        }
+
+        // Партиция открывается один раз за чтение, дальше только
+        // переставляется. Ни `consume_stop`, ни новой очереди здесь нет
+        // намеренно: и то, и другое стоило многосекундных пауз под квотой.
+        for (&p, rp) in &round {
+            let position = self.cursors.get(&p).and_then(|c| c.read_position);
+
+            let outcome = if !pending.open_partitions.contains(&p) {
+                let opened = pending
+                    .topic
+                    .consume_start_queue(p, rp.start, &pending.queue);
+                if opened.is_ok() {
+                    pending.open_partitions.insert(p);
+                }
+                opened
+            } else if position == Some(rp.start) {
+                // Окна идут встык (режим `oldest`) — читатель уже там.
+                Ok(())
+            } else {
+                pending.topic.seek(p, rp.start)
+            };
+
+            match outcome {
+                Ok(()) => {
+                    if let Some(c) = self.cursors.get_mut(&p) {
+                        c.read_position = Some(rp.start);
+                    }
+                }
+                Err(e) => {
+                    Self::stop_all(&pending);
+                    let _ = pending
+                        .reply
+                        .send(Err(format!("can't position partition {p}: {e}")));
+                    return;
+                }
+            }
+        }
+
+        pending.round_mark = self.store.len();
+        pending.round_mark_bytes = self.store.byte_size();
+        pending.round_started = Instant::now();
+        pending.phase = ReadPhase::Reading(round);
+        self.pending_read = Some(pending);
+        let _ = self.tx.send(Command::ContinueRead);
+    }
+
+    /// Один `consume_batch` в рамках текущего раунда.
+    fn step_reading(&mut self, mut pending: PendingRead) {
+        let batch = raw_consumer::consume_batch(&pending.queue, POLL_TICK_MS, BATCH_SIZE);
+
+        let ReadPhase::Reading(round) = &mut pending.phase else {
             return;
         };
-
-        let batch = raw_consumer::consume_batch(&pending.queue, POLL_TICK_MS, BATCH_SIZE);
-        let mut budget_hit = false;
+        let newest_first = self.newest_first;
+        let mut buffer_full = false;
+        // Ошибка не обрабатывается на месте: пока жив `round`, `pending`
+        // заимствован и его нельзя ни отдать, ни разобрать на части.
+        let mut failure: Option<String> = None;
 
         for msg in batch {
             let p = msg.partition();
             match msg.err() {
                 RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR => {
-                    let already_done = pending.cursors.get(&p).is_none_or(|c| c.done);
-                    if already_done {
-                        // Партиция уже закрыта, но librdkafka успела доставить
-                        // ещё пару "в полёте" сообщений после consume_stop.
+                    let Some(rp) = round.get_mut(&p) else {
+                        continue;
+                    };
+                    if rp.done {
+                        // Партиция своё окно добрала и просто ждёт остальных.
+                        // Останавливать её здесь нельзя — `consume_stop`
+                        // блокирующий (см. `RawTopic::seek`); то, что она
+                        // успеет натаскать сверх окна, отбросит барьер версии
+                        // при переходе к следующему окну.
                         continue;
                     }
-                    if let Some(boundary) =
-                        pending.cursors.get(&p).and_then(|c| c.boundary_offset)
-                    {
-                        if msg.offset() >= boundary {
-                            if let Some(c) = pending.cursors.get_mut(&p) {
-                                c.done = true;
-                            }
-                            pending.topic.consume_stop(p);
-                            eprintln!(
-                                "[continue_read] {} p{p} reached load-more boundary offset={boundary}",
-                                pending.topic_name
-                            );
-                            continue;
-                        }
+                    if msg.offset() >= rp.end {
+                        // Окно вычитано целиком — остальное принадлежит уже
+                        // показанному (newest) либо следующему раунду (oldest).
+                        rp.done = true;
+                        continue;
+                    }
+                    if msg.offset() < rp.start {
+                        // Хвост со старой позиции, который барьер версии
+                        // почему-то не отбросил. Не должно случаться; молча
+                        // проглотить такое значило бы испортить порядок.
+                        eprintln!(
+                            "[step_reading] {} p{p} stale offset {} outside window [{}..{})",
+                            pending.topic_name,
+                            msg.offset(),
+                            rp.start,
+                            rp.end
+                        );
+                        continue;
                     }
                     if !absorb(&mut self.store, &msg) {
                         eprintln!(
-                            "[continue_read] {} buffer budget hit, absorbed so far in store={}",
+                            "[step_reading] {} buffer budget hit at {} messages",
                             pending.topic_name,
                             self.store.len()
                         );
-                        budget_hit = true;
+                        buffer_full = true;
                         break;
                     }
-                    if let Some(c) = pending.cursors.get_mut(&p) {
-                        c.absorbed += 1;
-                        let offset = msg.offset();
-                        c.oldest_offset_seen =
-                            Some(c.oldest_offset_seen.map_or(offset, |o| o.min(offset)));
-                        c.newest_offset_seen =
-                            Some(c.newest_offset_seen.map_or(offset, |o| o.max(offset)));
-                        if c.absorbed >= c.per_partition_limit {
-                            c.done = true;
-                            pending.topic.consume_stop(p);
-                        }
+                    rp.absorbed += 1;
+
+                    let ts = msg.timestamp_millis();
+                    if ts > 0 {
+                        self.has_timestamps = true;
+                    }
+                    if let Some(c) = self.cursors.get_mut(&p) {
+                        c.observe(newest_first, ts);
                     }
                 }
                 RDKafkaRespErr::RD_KAFKA_RESP_ERR__PARTITION_EOF => {
-                    if let Some(c) = pending.cursors.get_mut(&p) {
-                        if !c.done {
-                            c.done = true;
-                            c.eof = true;
-                            eprintln!(
-                                "[continue_read] {} p{p} EOF, absorbed={}",
-                                pending.topic_name, c.absorbed
-                            );
+                    // Конец лога. В `oldest` это настоящее дно партиции;
+                    // в `newest` — просто верхняя граница первого окна.
+                    if let Some(rp) = round.get_mut(&p) {
+                        rp.done = true;
+                    }
+                    if !newest_first {
+                        if let Some(c) = self.cursors.get_mut(&p) {
+                            c.exhausted = true;
                         }
                     }
                 }
                 other => {
                     let e = raw_consumer::err_str(other);
-                    eprintln!("[continue_read] {} READ ERROR: {e}", pending.topic_name);
-                    for (&pp, c) in &pending.cursors {
-                        if !c.done {
-                            pending.topic.consume_stop(pp);
-                        }
-                    }
-                    let _ = pending.reply.send(Err(format!("read failed: {e}")));
-                    return;
+                    eprintln!("[step_reading] {} READ ERROR: {e}", pending.topic_name);
+                    failure = Some(format!("read failed: {e}"));
+                    break;
                 }
             }
         }
 
-        let deadline_hit = pending.started.elapsed() >= READ_DEADLINE;
-        if deadline_hit {
-            eprintln!(
-                "[continue_read] {} DEADLINE after {:?}",
-                pending.topic_name,
-                pending.started.elapsed()
-            );
-            for (&p, c) in pending.cursors.iter_mut() {
-                if !c.done {
-                    c.done = true;
-                    pending.topic.consume_stop(p);
-                }
-            }
+        if let Some(e) = failure {
+            Self::stop_all(&pending);
+            self.store.truncate(pending.round_mark);
+            let _ = pending.reply.send(Err(e));
+            return;
+        }
+        if buffer_full {
+            // Дочитать раунд уже не выйдет: следующий `push` тоже не влезет.
+            // Отматываем дырявое окно и закрываемся тем, что опубликовано.
+            self.abort_round(pending);
+            return;
         }
 
-        // Пересобираем ВСЕГДА, даже на промежуточном шаге: конкурентные
-        // GetWindow/GetOpenTopicProgress должны видеть консистентный,
-        // отсортированный и отфильтрованный срез того, что уже вычитано.
-        self.store.sort_by_time(self.newest_first);
-        self.rebuild_view();
-
-        let all_done = pending.cursors.values().all(|c| c.done);
-        if all_done || budget_hit {
-            for (&p, c) in &pending.cursors {
-                if !c.done {
-                    pending.topic.consume_stop(p);
-                }
-            }
-            let truncated = budget_hit || pending.cursors.values().any(|c| !c.eof);
-            eprintln!(
-                "[continue_read] {} finished: loaded={} view={} bytes={} truncated={truncated}",
-                pending.topic_name,
-                self.store.len(),
-                self.view.len(),
-                self.store.byte_size()
-            );
-            for (p, c) in pending.cursors {
-                self.partition_cursors.insert(p, c);
-            }
-            let _ = pending.reply.send(Ok(OpenTopicResult {
-                total: self.view.len(),
-                loaded: self.store.len(),
-                buffer_bytes: self.store.byte_size(),
-                truncated,
-            }));
-        } else {
+        let round_complete = match &pending.phase {
+            ReadPhase::Reading(round) => round.values().all(|rp| rp.done),
+            _ => false,
+        };
+        if !round_complete {
             self.pending_read = Some(pending);
             let _ = self.tx.send(Command::ContinueRead);
+            return;
+        }
+
+        self.close_round(&mut pending);
+        self.publish();
+        self.begin_round(pending);
+    }
+
+    /// Раунд дочитан целиком: двигаем курсоры на следующее окно.
+    fn close_round(&mut self, pending: &mut PendingRead) {
+        let newest_first = self.newest_first;
+        let elapsed = pending.round_started.elapsed();
+        let bytes = self.store.byte_size() - pending.round_mark_bytes;
+        let window = self.window;
+        let quota = self.quota.estimate();
+        let ReadPhase::Reading(round) = &mut pending.phase else {
+            return;
+        };
+
+        let absorbed: i64 = round.values().map(|rp| rp.absorbed).sum();
+        let offsets: i64 = round.values().map(|rp| rp.end - rp.start).sum();
+        // Офсеты за раунд — вторая половина измерения: она превращает «байт в
+        // секунду» в «офсетов в секунду», уже с учётом и размера сообщений, и
+        // плотности, и предвыборки, которую пришлось выбросить.
+        self.quota.record_offsets(offsets);
+        eprintln!(
+            "[round] {} {} partitions, window {window}, +{absorbed} messages of {offsets} \
+             offsets, +{bytes} bytes in {elapsed:?}{}",
+            pending.topic_name,
+            round.len(),
+            match quota {
+                Some(q) => format!(
+                    ", cluster gives {:.0} KB/s at {:.0} B/offset, throttle up to {:?}",
+                    q.bytes_per_sec / 1024.0,
+                    q.bytes_per_offset,
+                    q.peak_throttle
+                ),
+                // Печатается явно: молчащий измеритель — это не «пока мало
+                // данных», а вполне возможная поломка, и один раз она уже
+                // стоила разогнавшегося вслепую окна.
+                None => ", quota not measured yet".to_string(),
+            }
+        );
+        // Окно, отдавшее заметно меньше сообщений, чем в нём офсетов, — это
+        // либо compacted-топик, либо ошибка в нарезке. Отличить одно от
+        // другого можно только по конкретным диапазонам, поэтому печатаем их.
+        if absorbed * 2 < offsets {
+            let detail: Vec<String> = round
+                .iter()
+                .map(|(p, rp)| format!("p{p} [{}..{}) -> {}", rp.start, rp.end, rp.absorbed))
+                .collect();
+            eprintln!("[round] {} thin: {}", pending.topic_name, detail.join(", "));
+        }
+
+        for (&p, rp) in round.iter() {
+            if let Some(c) = self.cursors.get_mut(&p) {
+                c.advance(newest_first, rp);
+            }
+        }
+        round.clear();
+        self.last_round = Some(elapsed);
+    }
+
+    /// Раунд оборвался на середине (дедлайн, переполнение буфера, ошибка).
+    /// Его окно вычитано частично, а частичное окно — это дырка в порядке:
+    /// в `newest` непрочитанным остался как раз САМЫЙ СВЕЖИЙ его край, который
+    /// обязан стоять выше. Выбрасываем добычу раунда и закрываем чтение —
+    /// курсоры остались на границе окна, `load_more` перечитает его целиком.
+    fn abort_round(&mut self, pending: PendingRead) {
+        Self::stop_all(&pending);
+        self.store.truncate(pending.round_mark);
+        self.finish_read(pending, true);
+    }
+
+    /// Отдаёт итог чтения. `interrupted` — чтение оборвалось, а не упёрлось в
+    /// естественный конец: значит в топике заведомо есть ещё.
+    fn finish_read(&mut self, pending: PendingRead, interrupted: bool) {
+        self.publish();
+        let all_done = self.cursors.values().all(|c| c.exhausted);
+        let truncated = interrupted || !all_done;
+
+        eprintln!(
+            "[finish_read] {} in {:?}: published={} staged={} bytes={} truncated={truncated}",
+            pending.topic_name,
+            pending.started.elapsed(),
+            self.store.committed_len(),
+            self.store.staged_len(),
+            self.store.byte_size()
+        );
+
+        let _ = pending.reply.send(Ok(OpenTopicResult {
+            total: self.view.len(),
+            loaded: self.store.committed_len(),
+            buffer_bytes: self.store.byte_size(),
+            truncated,
+            quota: self.quota_info(),
+        }));
+    }
+
+    // --- Публикация ---------------------------------------------------------
+
+    /// Насколько глубоко можно публиковать прямо сейчас.
+    ///
+    /// Партиция, вычитанная до `frontier_ts`, дальше выдаст только более старое
+    /// (в `newest`) — значит всё, что СТРОГО новее самой отстающей из живых
+    /// партиций, своё место в порядке уже заняло и никем не будет подвинуто.
+    fn safe_frontier(&self) -> Frontier {
+        let mut frontier: Option<i64> = None;
+        for c in self.cursors.values() {
+            if c.exhausted {
+                continue;
+            }
+            let Some(ts) = c.frontier_ts else {
+                // Из партиции ещё ни одного сообщения: она может принести что
+                // угодно, включая самое свежее. Придерживаем весь отстойник.
+                // Бывает на дырявых (compacted) партициях, чьё окно оказалось
+                // пустым; разрешается само, как только оттуда что-то приедет.
+                return Frontier::Nothing;
+            };
+            frontier = Some(match frontier {
+                None => ts,
+                Some(f) if self.newest_first => f.max(ts),
+                Some(f) => f.min(ts),
+            });
+        }
+        match frontier {
+            // Ни одной живой партиции — придерживать не от кого.
+            None => Frontier::Everything,
+            Some(ts) => Frontier::Beyond(ts),
+        }
+    }
+
+    /// Досортировывает отстойник и публикует всё, что уже не может быть
+    /// подвинуто. Опубликованное больше не двигается никогда — на этом и
+    /// держится стабильность таблицы на фронте.
+    fn publish(&mut self) {
+        if self.store.staged_len() == 0 {
+            return;
+        }
+        self.store.sort_staged(self.newest_first);
+
+        let published = if !self.has_timestamps {
+            // Брокер не отдал времени ни по одному сообщению: ни сортировать,
+            // ни придерживать не по чему — показываем в порядке приезда,
+            // иначе таблица так и осталась бы пустой.
+            self.store.commit_all()
+        } else {
+            match self.safe_frontier() {
+                Frontier::Nothing => 0,
+                Frontier::Everything => self.store.commit_all(),
+                Frontier::Beyond(f) if self.newest_first => {
+                    self.store.commit_staged_while(|m| m.timestamp > f)
+                }
+                Frontier::Beyond(f) => self.store.commit_staged_while(|m| m.timestamp < f),
+            }
+        };
+
+        if published > 0 {
+            self.rebuild_view();
         }
     }
 
     /// Снимок хода ещё не завершённого чтения — для опроса с фронта, пока
     /// `open_topic`/`load_more` не ответили финальным результатом.
+    /// Измеренная скорость кластера для показа в шапке.
+    fn quota_info(&self) -> QuotaInfo {
+        match self.quota.estimate() {
+            Some(est) => QuotaInfo {
+                read_bytes_per_sec: Some(est.bytes_per_sec as u64),
+                peak_throttle_ms: est.peak_throttle.as_millis() as u64,
+            },
+            None => QuotaInfo::default(),
+        }
+    }
+
     fn progress(&self) -> OpenTopicProgress {
         OpenTopicProgress {
-            loaded: self.store.len(),
+            topic: self.open_topic.clone(),
+            quota: self.quota_info(),
+            buffer_bytes: self.store.byte_size(),
+            loaded: self.store.committed_len(),
             total: self.view.len(),
             truncated: self.pending_read.is_some(),
             done: self.pending_read.is_none(),
         }
-    }
-
-    #[allow(dead_code)]
-    fn currently_open(&self) -> Option<&str> {
-        self.open_topic.as_deref()
     }
 
     fn close_topic(&mut self) {
@@ -707,21 +1333,27 @@ impl Worker {
         self.open_topic = None;
         self.filter = MessageFilter::default();
         self.view.clear();
-        self.partition_cursors.clear();
+        self.cursors.clear();
+        self.has_timestamps = false;
         // Освобождаем буфер целиком: держать сотни мегабайт, пока пользователь
         // ничего не смотрит, незачем.
         self.store.release();
     }
 
-    /// Пересобирает отфильтрованное представление. Работает по буферу в памяти,
-    /// без единого сетевого запроса — поэтому смена фильтра мгновенна.
+    /// Пересобирает отфильтрованное представление по ОПУБЛИКОВАННОЙ части
+    /// буфера. Работает в памяти, без единого сетевого запроса — поэтому смена
+    /// фильтра мгновенна.
+    ///
+    /// Публикация только дописывает записи в хвост, поэтому и `view` только
+    /// растёт: индексы уже показанных строк не меняются, и кэш окон на фронте
+    /// остаётся валидным.
     fn rebuild_view(&mut self) {
         // Забираем вектор себе: иначе `self.view.push` конфликтует с
         // одновременным заимствованием `self.filter` и `self.store`.
         // Ёмкость при этом сохраняется, повторных аллокаций нет.
         let mut view = std::mem::take(&mut self.view);
         view.clear();
-        let total = self.store.len();
+        let total = self.store.committed_len();
 
         if self.filter.is_empty() {
             view.extend(0..total as u32);
@@ -756,7 +1388,10 @@ impl Worker {
             .enumerate()
             .map(|(offset_in_window, &store_index)| {
                 let i = store_index as usize;
-                let meta = self.store.get(i).expect("view index out of sync with store");
+                let meta = self
+                    .store
+                    .get(i)
+                    .expect("view index out of sync with store");
                 let value = self.store.value(i);
                 RowPreview {
                     index: start + offset_in_window,
@@ -802,5 +1437,300 @@ impl Worker {
                 })
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NEWEST: bool = true;
+    const OLDEST: bool = false;
+
+    fn cursor(low: i64, high: i64, newest_first: bool, budget: i64) -> PartitionCursor {
+        PartitionCursor {
+            low,
+            high,
+            next: if newest_first { high } else { low },
+            absorbed: 0,
+            budget,
+            read_position: None,
+            exhausted: low >= high,
+            frontier_ts: None,
+            barren_rounds: 0,
+        }
+    }
+
+    /// Прокручивает раунды до упора и отдаёт список окон в порядке чтения.
+    /// Каждое окно считается вычитанным целиком (по офсету на сообщение).
+    fn walk(mut c: PartitionCursor, newest_first: bool, chunk: i64) -> Vec<(i64, i64)> {
+        let mut windows = Vec::new();
+        while let Some((start, end)) = c.next_window(newest_first, chunk) {
+            windows.push((start, end));
+            c.advance(
+                newest_first,
+                &RoundPartition {
+                    start,
+                    end,
+                    absorbed: end - start,
+                    done: true,
+                },
+            );
+            assert!(windows.len() < 1000, "раунды не сходятся");
+        }
+        windows
+    }
+
+    #[test]
+    fn newest_walks_windows_backwards_from_the_end() {
+        let windows = walk(cursor(0, 1000, NEWEST, 1000), NEWEST, 250);
+        assert_eq!(windows, vec![(750, 1000), (500, 750), (250, 500), (0, 250)]);
+    }
+
+    #[test]
+    fn oldest_walks_windows_forward_from_the_start() {
+        let windows = walk(cursor(0, 1000, OLDEST, 1000), OLDEST, 250);
+        assert_eq!(windows, vec![(0, 250), (250, 500), (500, 750), (750, 1000)]);
+    }
+
+    /// Партиция, обрезанная retention: офсеты начинаются не с нуля, и окна не
+    /// должны заезжать ниже реального начала лога.
+    #[test]
+    fn windows_never_cross_the_partition_bounds() {
+        assert_eq!(
+            walk(cursor(400, 1000, NEWEST, 10_000), NEWEST, 250),
+            vec![(750, 1000), (500, 750), (400, 500)],
+        );
+        assert_eq!(
+            walk(cursor(400, 1000, OLDEST, 10_000), OLDEST, 250),
+            vec![(400, 650), (650, 900), (900, 1000)],
+        );
+    }
+
+    #[test]
+    fn budget_caps_the_last_window_and_stops_the_walk() {
+        // Бюджет 300 при шаге 250: второе окно урезано до остатка, третьего нет.
+        assert_eq!(
+            walk(cursor(0, 1000, NEWEST, 300), NEWEST, 250),
+            vec![(750, 1000), (700, 750)],
+        );
+        assert_eq!(
+            walk(cursor(0, 1000, OLDEST, 300), OLDEST, 250),
+            vec![(0, 250), (250, 300)],
+        );
+    }
+
+    #[test]
+    fn empty_partition_yields_no_windows() {
+        assert!(walk(cursor(0, 0, NEWEST, 1000), NEWEST, 250).is_empty());
+        assert!(walk(cursor(500, 500, OLDEST, 1000), OLDEST, 250).is_empty());
+    }
+
+    /// Пустое (полностью compacted) окно не должно вешать чтение: курсор
+    /// обязан двигаться даже когда сообщений в окне не оказалось.
+    #[test]
+    fn a_window_that_yielded_nothing_still_advances_the_cursor() {
+        let mut c = cursor(0, 500, NEWEST, 1000);
+        let (start, end) = c.next_window(NEWEST, 250).unwrap();
+        c.advance(
+            NEWEST,
+            &RoundPartition {
+                start,
+                end,
+                absorbed: 0,
+                done: true,
+            },
+        );
+        assert_eq!(c.absorbed, 0);
+        assert_eq!(c.next_window(NEWEST, 250), Some((0, 250)));
+    }
+
+    /// `load_more` поднимает бюджет — и чтение продолжается ровно с того окна,
+    /// на котором остановилось, без нахлёста на уже прочитанное.
+    #[test]
+    fn raising_the_budget_resumes_without_overlap() {
+        let mut c = cursor(0, 1000, NEWEST, 250);
+        let (start, end) = c.next_window(NEWEST, 250).unwrap();
+        assert_eq!((start, end), (750, 1000));
+        c.advance(
+            NEWEST,
+            &RoundPartition {
+                start,
+                end,
+                absorbed: 250,
+                done: true,
+            },
+        );
+        assert_eq!(c.next_window(NEWEST, 250), None, "бюджет выбран");
+
+        c.budget = c.absorbed + 250;
+        assert_eq!(c.next_window(NEWEST, 250), Some((500, 750)));
+    }
+
+    fn estimate(bytes_per_sec: f64, bytes_per_offset: f64) -> Option<QuotaEstimate> {
+        Some(QuotaEstimate {
+            bytes_per_sec,
+            bytes_per_offset,
+            peak_throttle: Duration::ZERO,
+        })
+    }
+
+    /// Быстрый раунд, не мешающий росту.
+    const QUICK: Option<Duration> = Some(Duration::from_millis(500));
+
+    /// Ровно тот сценарий, который вылез на кластере: измеритель молчит
+    /// (колбэк статистики висел на неопрошенной очереди), и единственная
+    /// обратная связь — длительность раунда. Окно обязано перестать расти.
+    #[test]
+    fn a_slow_round_stops_the_window_from_growing_even_without_measurements() {
+        // Наблюдавшаяся последовательность: 20 -> 40 -> 80, и раунд на 10.4 с.
+        assert_eq!(next_window(20, None, 8, QUICK), 40);
+        assert_eq!(next_window(40, None, 8, QUICK), 80);
+
+        // Здесь прошлая версия выдавала 160 и разгонялась дальше до 640.
+        let after_slow = next_window(80, None, 8, Some(Duration::from_secs_f64(10.4)));
+        assert!(
+            after_slow < 20,
+            "окно должно было рухнуть, а не расти: {after_slow}"
+        );
+    }
+
+    /// Ужимание пропорционально переработке, а не фиксированным шагом: за
+    /// пятикратный перебор нельзя расплачиваться пятью медленными раундами.
+    #[test]
+    fn overrun_shrinks_the_window_in_proportion() {
+        let previous = 600;
+        let w = next_window(
+            previous,
+            None,
+            8,
+            Some(Duration::from_secs_f64(TARGET_ROUND_SECS * 4.0)),
+        );
+        assert_eq!(w, previous / 4);
+    }
+
+    /// Окно считается прямо из измеренной скорости, а не подбирается вслепую.
+    #[test]
+    fn window_is_computed_from_the_measured_quota() {
+        // 200 КБ/с, 12 КБ на офсет, 4 партиции, цель — 2 секунды:
+        // 400 КБ на раунд, это ~33 офсета, по 8 на партицию.
+        let previous = 100;
+        let w = next_window(previous, estimate(200_000.0, 12_000.0), 4, QUICK);
+        assert_eq!(
+            w,
+            (200_000.0 * TARGET_ROUND_SECS / 12_000.0 / 4.0).round() as i64
+        );
+
+        // Тот же кластер, но мелкие сообщения — окно кратно больше.
+        let small = next_window(previous, estimate(200_000.0, 400.0), 4, QUICK);
+        assert!(small > w * 10, "{small} vs {w}");
+
+        // Ровно наблюдавшийся случай: 8 партиций по 12 КБ на офсет при 200 КБ/с
+        // упираются в нижнюю границу — 5 офсетов на партицию, то есть около
+        // 480 КБ и 2.4 секунды на раунд. Это и есть предел дробления.
+        assert_eq!(
+            next_window(previous, estimate(200_000.0, 12_000.0), 8, QUICK),
+            MIN_ROUND_CHUNK
+        );
+    }
+
+    /// Чем больше партиций читается разом, тем меньше достаётся каждой:
+    /// бюджет раунда общий на всех.
+    #[test]
+    fn window_splits_the_quota_across_partitions() {
+        let est = estimate(2_000_000.0, 1_000.0);
+        assert!(next_window(10_000, est, 16, QUICK) < next_window(10_000, est, 4, QUICK));
+    }
+
+    /// Именно это и сломалось на кластере с квотой: пока измеритель не набрал
+    /// окно шире квотного, он видит burst-кредит и завышает оценку. Расти
+    /// быстрее чем вдвое за раунд нельзя, иначе одна такая оценка превращается
+    /// в раунд с многосекундной паузой.
+    #[test]
+    fn window_growth_is_capped_even_on_a_wildly_optimistic_estimate() {
+        let burst = estimate(50_000_000.0, 100.0);
+        assert_eq!(next_window(10, burst, 8, QUICK), 20);
+        assert_eq!(next_window(20, burst, 8, QUICK), 40);
+        // Без измерений — то же удвоение от достигнутого.
+        assert_eq!(next_window(40, None, 8, QUICK), 80);
+    }
+
+    /// А вниз — сразу: расплата за перебор квоты приходит одной длинной
+    /// паузой, и растягивать ужимание на несколько раундов значит платить
+    /// этой паузой несколько раз.
+    #[test]
+    fn window_shrinks_in_a_single_step() {
+        let slow = estimate(200_000.0, 12_000.0);
+        assert!(
+            next_window(2_000, slow, 8, QUICK) < 10,
+            "должно было рухнуть сразу"
+        );
+    }
+
+    #[test]
+    fn window_stays_within_bounds() {
+        // Кластер почти не отдаёт — но мельче минимума не дробим.
+        assert_eq!(
+            next_window(1_000, estimate(1.0, 1_000_000.0), 64, QUICK),
+            MIN_ROUND_CHUNK
+        );
+        // И никакая скорость не разгоняет окно выше потолка.
+        let mut w = 10;
+        for _ in 0..50 {
+            w = next_window(w, estimate(f64::MAX, 1.0), 1, QUICK);
+        }
+        assert_eq!(w, MAX_ROUND_CHUNK);
+    }
+
+    /// Окно без единого сообщения (compacted-топик) должно расширяться, а не
+    /// сужаться: за фетч мы платим в любом случае, и мельчить — значит платить
+    /// за ту же пустоту много раз.
+    #[test]
+    fn barren_windows_widen_the_next_one() {
+        let mut c = cursor(0, 100_000, NEWEST, 10_000);
+        let (start, end) = c.next_window(NEWEST, 100).unwrap();
+        assert_eq!(end - start, 100);
+
+        c.advance(
+            NEWEST,
+            &RoundPartition {
+                start,
+                end,
+                absorbed: 0,
+                done: true,
+            },
+        );
+        let (start, end) = c.next_window(NEWEST, 100).unwrap();
+        assert_eq!(end - start, 200, "пустое окно должно было расшириться");
+
+        // Пришли данные — разгон сбрасывается.
+        c.advance(
+            NEWEST,
+            &RoundPartition {
+                start,
+                end,
+                absorbed: 7,
+                done: true,
+            },
+        );
+        assert_eq!(c.barren_rounds, 0);
+        let (start, end) = c.next_window(NEWEST, 100).unwrap();
+        assert_eq!(end - start, 100);
+    }
+
+    #[test]
+    fn frontier_tracks_the_deepest_point_reached_in_each_direction() {
+        let mut c = cursor(0, 1000, NEWEST, 1000);
+        for ts in [300, 100, 200] {
+            c.observe(NEWEST, ts);
+        }
+        // Назад по времени: интересует самое старое из увиденного.
+        assert_eq!(c.frontier_ts, Some(100));
+
+        let mut c = cursor(0, 1000, OLDEST, 1000);
+        for ts in [100, 300, 200] {
+            c.observe(OLDEST, ts);
+        }
+        assert_eq!(c.frontier_ts, Some(300));
     }
 }

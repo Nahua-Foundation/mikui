@@ -9,6 +9,21 @@
 //! (`index`) со смещениями в него. Байты копируются ровно один раз — из буфера
 //! rdkafka в арену. Сортировка и фильтрация работают по `index`, который на
 //! 50k сообщений занимает около 2 МБ и отлично ложится в кэш.
+//!
+//! `index` разрезан границей `committed` на две части:
+//!
+//! * `[0, committed)` — **опубликованное**. Это и только это видит UI. Порядок
+//!   здесь заморожен навсегда: строка, однажды показанная под номером 42, под
+//!   этим номером и останется.
+//! * `[committed, len)` — **отстойник**. Сюда падает всё, что вычитано, но ещё
+//!   не заняло окончательного места в глобальном порядке: пока хоть одна
+//!   партиция может выдать сообщение новее (или, в режиме oldest, старее),
+//!   публиковать нельзя — иначе следующая порция вклинилась бы ВЫШЕ уже
+//!   показанных строк, и таблица поехала бы под курсором.
+//!
+//! Раньше границы не было, и `sort_by_time` перетряхивал весь буфер на каждом
+//! шаге чтения. Строки прыгали, а фронту приходилось сбрасывать кэш окон —
+//! отсюда и бесконечно мерцающие плейсхолдеры.
 
 /// Кусок байтов в `blob`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +56,8 @@ pub struct MessageStore {
     blob: Vec<u8>,
     index: Vec<MessageMeta>,
     max_bytes: usize,
+    /// Граница опубликованного префикса — см. модульный комментарий.
+    committed: usize,
 }
 
 /// Потолок буфера. Упёрлись — считаем выдачу усечённой и прекращаем чтение,
@@ -59,11 +76,24 @@ impl MessageStore {
             blob: Vec::new(),
             index: Vec::new(),
             max_bytes,
+            committed: 0,
         }
     }
 
+    /// Сколько всего вычитано, включая ещё не опубликованный отстойник.
     pub fn len(&self) -> usize {
         self.index.len()
+    }
+
+    /// Сколько строк видит UI. Именно это число фигурирует в статистике —
+    /// показывать «загружено 5000», когда в таблице 4200 строк, значило бы
+    /// врать пользователю.
+    pub fn committed_len(&self) -> usize {
+        self.committed
+    }
+
+    pub fn staged_len(&self) -> usize {
+        self.index.len() - self.committed
     }
 
     pub fn byte_size(&self) -> usize {
@@ -79,6 +109,7 @@ impl MessageStore {
         // вместо новой крупной аллокации.
         self.blob.clear();
         self.index.clear();
+        self.committed = 0;
     }
 
     /// Освобождает память под буфером. Вызывается при закрытии топика —
@@ -86,6 +117,29 @@ impl MessageStore {
     pub fn release(&mut self) {
         self.blob = Vec::new();
         self.index = Vec::new();
+        self.committed = 0;
+    }
+
+    /// Отрезает хвост индекса вместе с его байтами. Нужна ровно для одного
+    /// случая: раунд чтения оборвался на середине (дедлайн, переполнение
+    /// буфера), и его добыча — дырявое окно, которое нельзя ни опубликовать,
+    /// ни докатить. Дешевле выбросить и перечитать окно целиком.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.index.len() {
+            return;
+        }
+        // Сообщения кладутся в blob последовательно, а заголовки — последними
+        // в записи, поэтому конец записи `len - 1` и есть новая длина blob.
+        let blob_len = match len.checked_sub(1) {
+            Some(last) => {
+                let meta = &self.index[last];
+                meta.headers.start as usize + meta.headers.len as usize
+            }
+            None => 0,
+        };
+        self.index.truncate(len);
+        self.blob.truncate(blob_len);
+        self.committed = self.committed.min(len);
     }
 
     pub fn get(&self, i: usize) -> Option<&MessageMeta> {
@@ -160,16 +214,38 @@ impl MessageStore {
         true
     }
 
-    /// Новые сверху / старые сверху. Сортируется только `index` — байты в blob
-    /// не двигаются, поэтому перестановка стоит копейки даже на 50k записей.
-    pub fn sort_by_time(&mut self, newest_first: bool) {
+    /// Новые сверху / старые сверху — но **только внутри отстойника**.
+    /// Опубликованный префикс не трогается: он уже занял своё место.
+    /// Сортируется только `index`, байты в blob не двигаются, поэтому
+    /// перестановка стоит копейки.
+    pub fn sort_staged(&mut self, newest_first: bool) {
+        let staged = &mut self.index[self.committed..];
         if newest_first {
-            self.index
+            staged
                 .sort_unstable_by_key(|m| (std::cmp::Reverse(m.timestamp), m.partition, m.offset));
         } else {
-            self.index
-                .sort_unstable_by_key(|m| (m.timestamp, m.partition, m.offset));
+            staged.sort_unstable_by_key(|m| (m.timestamp, m.partition, m.offset));
         }
+    }
+
+    /// Публикует префикс отсортированного отстойника, пока `keep` возвращает
+    /// true, и отдаёт число опубликованных записей.
+    ///
+    /// Предполагает, что `keep` монотонен по уже применённому порядку (у нас
+    /// это всегда сравнение timestamp с порогом) — отсюда `partition_point`
+    /// вместо линейного прохода.
+    pub fn commit_staged_while(&mut self, keep: impl Fn(&MessageMeta) -> bool) -> usize {
+        let n = self.index[self.committed..].partition_point(keep);
+        self.committed += n;
+        n
+    }
+
+    /// Публикует отстойник целиком. Законно только когда читать больше нечего:
+    /// иначе следующая порция могла бы встать выше только что показанного.
+    pub fn commit_all(&mut self) -> usize {
+        let n = self.staged_len();
+        self.committed = self.index.len();
+        n
     }
 
     fn append(&mut self, bytes: &[u8]) -> Span {
@@ -270,13 +346,79 @@ mod tests {
         push_simple(&mut store, 0, 2, 300);
         push_simple(&mut store, 0, 3, 200);
 
-        store.sort_by_time(true);
+        store.sort_staged(true);
 
         // Порядок по времени убывающий, и payload по-прежнему тот, что нужно.
         assert_eq!(store.get(0).unwrap().timestamp, 300);
         assert_eq!(store.value(0), b"value-2");
         assert_eq!(store.get(2).unwrap().timestamp, 100);
         assert_eq!(store.value(2), b"value-1");
+    }
+
+    #[test]
+    fn published_prefix_never_moves_when_older_data_arrives() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        // Первый раунд: две свежие записи, публикуем обе.
+        push_simple(&mut store, 0, 1, 300);
+        push_simple(&mut store, 0, 2, 200);
+        store.sort_staged(true);
+        store.commit_all();
+
+        // Второй раунд приносит запись, которая ПО ВРЕМЕНИ должна была бы
+        // встать между ними. Права на это у неё уже нет.
+        push_simple(&mut store, 0, 3, 250);
+        store.sort_staged(true);
+        store.commit_all();
+
+        assert_eq!(store.get(0).unwrap().timestamp, 300);
+        assert_eq!(store.get(1).unwrap().timestamp, 200);
+        assert_eq!(store.get(2).unwrap().timestamp, 250);
+    }
+
+    #[test]
+    fn commit_staged_while_holds_back_the_unsafe_tail() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        for ts in [500, 400, 300, 200] {
+            push_simple(&mut store, 0, ts, ts);
+        }
+        store.sort_staged(true);
+
+        // Отстающая партиция вычитана только до 300 — всё, что не новее,
+        // придерживаем: она ещё может выдать что-то между 300 и 200.
+        let published = store.commit_staged_while(|m| m.timestamp > 300);
+        assert_eq!(published, 2);
+        assert_eq!(store.committed_len(), 2);
+        assert_eq!(store.staged_len(), 2);
+
+        // Партиция догналась — остаток встал следом, префикс не шелохнулся.
+        store.sort_staged(true);
+        assert_eq!(store.commit_all(), 2);
+        assert_eq!(store.get(0).unwrap().timestamp, 500);
+        assert_eq!(store.get(3).unwrap().timestamp, 200);
+    }
+
+    #[test]
+    fn truncate_reclaims_blob_and_pulls_committed_back() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        for i in 0..10 {
+            push_simple(&mut store, 0, i, i);
+        }
+        store.commit_all();
+        let bytes_before = store.byte_size();
+
+        store.truncate(4);
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.committed_len(), 4);
+        assert!(
+            store.byte_size() < bytes_before,
+            "байты хвоста должны освободиться"
+        );
+        // Уцелевшие записи по-прежнему читаются корректно.
+        assert_eq!(store.value(3), b"value-3");
+        // И буфер снова растёт с правильного места.
+        assert!(push_simple(&mut store, 0, 99, 99));
+        assert_eq!(store.value(4), b"value-99");
+        assert_eq!(store.value(0), b"value-0");
     }
 
     #[test]
@@ -319,5 +461,21 @@ mod tests {
         store.truncate(3);
         assert_eq!(store.len(), 3);
         assert_eq!(store.value(2), b"value-2");
+    }
+
+    #[test]
+    fn clear_and_release_reset_the_published_boundary() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        push_simple(&mut store, 0, 1, 100);
+        store.commit_all();
+        assert_eq!(store.committed_len(), 1);
+
+        store.clear();
+        assert_eq!(store.committed_len(), 0);
+
+        push_simple(&mut store, 0, 1, 100);
+        store.commit_all();
+        store.release();
+        assert_eq!(store.committed_len(), 0);
     }
 }

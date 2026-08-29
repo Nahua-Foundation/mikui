@@ -22,22 +22,16 @@ use rdkafka::bindings::{
     rd_kafka_consume_batch_queue, rd_kafka_consume_start_queue, rd_kafka_consume_stop,
     rd_kafka_err2str, rd_kafka_header_get_all, rd_kafka_last_error, rd_kafka_message_destroy,
     rd_kafka_message_headers, rd_kafka_message_timestamp, rd_kafka_queue_destroy,
-    rd_kafka_queue_new, rd_kafka_timestamp_type_t, rd_kafka_topic_destroy, rd_kafka_topic_new,
+    rd_kafka_queue_new, rd_kafka_seek, rd_kafka_timestamp_type_t, rd_kafka_topic_destroy,
+    rd_kafka_topic_new,
 };
 use rdkafka::types::{RDKafka, RDKafkaMessage, RDKafkaQueue, RDKafkaRespErr, RDKafkaTopic};
 
-/// `RD_KAFKA_OFFSET_BEGINNING` — читать с начала партиции.
-pub const OFFSET_BEGINNING: i64 = -2;
-/// Базовое значение для макроса `RD_KAFKA_OFFSET_TAIL(CNT)` из `rdkafka.h`:
-/// `TAIL(CNT) = TAIL_BASE - CNT`. Готовой константы в безопасном крейте нет,
-/// т.к. `Offset::OffsetTail` там реализован как обёртка над этим же макросом.
-const OFFSET_TAIL_BASE: i64 = -2000;
-
-/// Офсет «последние `count` сообщений», как `Offset::OffsetTail(count)` в
-/// высокоуровневом API — только не требует group.id.
-pub fn offset_tail(count: i64) -> i64 {
-    OFFSET_TAIL_BASE - count
-}
+// Логических офсетов (`RD_KAFKA_OFFSET_BEGINNING`, `RD_KAFKA_OFFSET_TAIL`)
+// здесь нет намеренно: воркер снимает watermarks и нарезает окна абсолютными
+// офсетами. `TAIL(N)` дал бы «последние N», но не сказал бы, где партиция
+// начинается — а без этого нельзя ни идти назад окнами, ни понять, что назад
+// идти уже некуда.
 
 fn last_error_str() -> String {
     unsafe {
@@ -104,8 +98,7 @@ impl RawTopic {
     /// наследует конфиг клиента (NULL topic conf), как и раньше через
     /// `assign()`.
     pub fn new(client: *mut RDKafka, topic: &str) -> Result<Self, String> {
-        let name =
-            CString::new(topic).map_err(|_| "topic name contains a NUL byte".to_string())?;
+        let name = CString::new(topic).map_err(|_| "topic name contains a NUL byte".to_string())?;
         let ptr = unsafe { rd_kafka_topic_new(client, name.as_ptr(), std::ptr::null_mut()) };
         if ptr.is_null() {
             return Err(format!(
@@ -130,8 +123,36 @@ impl RawTopic {
         Ok(())
     }
 
-    /// Останавливает чтение партиции. Best-effort: ошибку логируем, не
-    /// падаем — зеркалит прежнее `let _ = consumer.unassign()`.
+    /// Переставляет уже читающуюся партицию на другой офсет, НЕ дожидаясь
+    /// брокерского потока.
+    ///
+    /// Это единственный способ сменить окно, не заплатив многосекундной
+    /// паузой. Пара `consume_stop` + `consume_start_queue` делает то же самое,
+    /// но `rd_kafka_consume_stop0` заканчивается на
+    /// `rd_kafka_q_wait_result(tmpq, RD_POLL_INFINITE)` — ждёт, пока
+    /// брокерский поток подтвердит остановку. А тот в этот момент вполне может
+    /// сидеть в фетче, придержанном квотой: на кластере с квотой на чтение
+    /// восемь таких остановок за раунд и давали пол в 8–12 секунд,
+    /// не зависевший от размера окна вообще.
+    ///
+    /// `timeout_ms = 0` — `rd_kafka_seek` в этом случае не заводит очередь
+    /// ответа и возвращается сразу. Сообщения, уже летящие со старой позиции,
+    /// отбрасывает сама librdkafka: seek поднимает барьер версии
+    /// (`rd_kafka_toppar_op_seek`), а путь выдачи, которым мы пользуемся
+    /// (`consume_batch_queue` → `rd_kafka_q_serve_rkmessages`), на
+    /// `RD_KAFKA_OP_BARRIER` вычищает устаревшее через
+    /// `rd_kafka_purge_outdated_messages`.
+    pub fn seek(&self, partition: i32, offset: i64) -> Result<(), String> {
+        let err = unsafe { rd_kafka_seek(self.ptr, partition, offset, 0) };
+        if err != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR {
+            return Err(err_str(err));
+        }
+        Ok(())
+    }
+
+    /// Останавливает чтение партиции. БЛОКИРУЮЩАЯ операция — см. `seek`.
+    /// Зовётся только один раз на чтение, при его завершении.
+    /// Best-effort: ошибку логируем, не падаем.
     pub fn consume_stop(&self, partition: i32) {
         let rc = unsafe { rd_kafka_consume_stop(self.ptr, partition) };
         if rc == -1 {
@@ -148,6 +169,11 @@ impl Drop for RawTopic {
         unsafe { rd_kafka_topic_destroy(self.ptr) };
     }
 }
+
+// `rd_kafka_poll` здесь намеренно нет. События клиента (статистику, ошибки)
+// забирает `Worker::drain_events` через `BaseConsumer::poll`: rdkafka-rust
+// включает event API и C-колбэков не ставит, поэтому прямой `rd_kafka_poll`
+// статистику до нас не доносит — см. комментарий там.
 
 /// Сообщение из общей очереди. Может нести ошибку вместо данных (например,
 /// `PARTITION_EOF`) — см. `err()`, тот же паттерн, что и у высокоуровневого

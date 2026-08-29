@@ -89,6 +89,21 @@ pub struct OpenTopicResult {
     pub buffer_bytes: usize,
     /// true — упёрлись в лимит или таймаут, в топике есть ещё.
     pub truncated: bool,
+    #[serde(flatten)]
+    pub quota: QuotaInfo,
+}
+
+/// Что кластер реально даёт по скорости. Измеряется косвенно — см.
+/// `kafka::quota`. В UI нужна потому, что без неё медленное чтение неотличимо
+/// от зависшего приложения: пользователь видит замерший экран и винит mikui,
+/// хотя это брокер придерживает ответы по квоте.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct QuotaInfo {
+    /// None — измерений пока недостаточно.
+    pub read_bytes_per_sec: Option<u64>,
+    /// Самая длинная задержка, наложенная брокером, мс. 0 — не придерживал.
+    pub peak_throttle_ms: u64,
 }
 
 /// Снимок хода ещё не завершённого чтения — опрашивается фронтом по таймеру,
@@ -96,11 +111,20 @@ pub struct OpenTopicResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OpenTopicProgress {
+    /// Топик, к которому относится снимок. Опрос идёт по таймеру и его ответ
+    /// вполне может разминуться со сменой топика — без этого поля счётчики
+    /// ушедшего топика на мгновение подменяли бы счётчики нового.
+    pub topic: Option<String>,
     pub loaded: usize,
     pub total: usize,
+    /// Размер арены. Раньше его тут не было, и шапка во время загрузки честно
+    /// показывала «0 B» — единственное поле, которого не хватало.
+    pub buffer_bytes: usize,
     pub truncated: bool,
     /// true — чтения в фоне уже нет, снимок финальный.
     pub done: bool,
+    #[serde(flatten)]
+    pub quota: QuotaInfo,
 }
 
 /// Строка таблицы. Тело обрезано: таблица всё равно показывает его в одну
@@ -139,4 +163,52 @@ pub struct FullMessage {
     pub value_size: usize,
     pub binary: bool,
     pub headers: Vec<MessageHeader>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `#[serde(flatten)]` легко даёт вложенный объект вместо плоских полей, а
+    /// заметно это только по пустому месту в шапке приложения. Проверяем, что
+    /// измеренная квота доезжает до фронта именно там, где её ждут.
+    #[test]
+    fn quota_fields_are_flattened_to_the_top_level() {
+        let json = serde_json::to_value(OpenTopicResult {
+            total: 10,
+            loaded: 10,
+            buffer_bytes: 4096,
+            truncated: true,
+            quota: QuotaInfo {
+                read_bytes_per_sec: Some(204_800),
+                peak_throttle_ms: 9_000,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(json["read_bytes_per_sec"], 204_800);
+        assert_eq!(json["peak_throttle_ms"], 9_000);
+        assert_eq!(json["buffer_bytes"], 4096);
+        assert!(json.get("quota").is_none(), "поля должны быть плоскими");
+    }
+
+    #[test]
+    fn progress_carries_the_same_fields_the_header_reads() {
+        let json = serde_json::to_value(OpenTopicProgress {
+            topic: Some("t".into()),
+            loaded: 5,
+            total: 5,
+            buffer_bytes: 128,
+            truncated: false,
+            done: false,
+            quota: QuotaInfo::default(),
+        })
+        .unwrap();
+
+        // Ни одного измерения — поле обязано быть null, а не отсутствовать:
+        // иначе на фронте `p.read_bytes_per_sec` был бы undefined.
+        assert!(json["read_bytes_per_sec"].is_null());
+        assert_eq!(json["peak_throttle_ms"], 0);
+        assert_eq!(json["buffer_bytes"], 128);
+    }
 }
