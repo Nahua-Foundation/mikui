@@ -1,51 +1,14 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Edit } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Search } from 'lucide-react';
 import { Input } from '../ui/input';
 import { Topic } from './types';
 import { Virtuoso } from 'react-virtuoso';
+import { TopicRow } from './components/TopicRow';
+import { TopicPeek, PeekAnchor } from './components/TopicPeek';
 
 const DEFAULT_WIDTH = 220;
 const MIN_WIDTH = 160;
 const MAX_WIDTH = 480;
-
-interface TopicItemProps {
-  topic: Topic; 
-  isSelected: boolean; 
-  onClick: () => void;
-  onConfigClick: (topic: Topic) => void;
-}
-
-const TopicItem = memo(function TopicItem({
-  topic,
-  isSelected,
-  onClick,
-  onConfigClick,
-}: TopicItemProps) {
-  const handleEditClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    onConfigClick(topic);
-  };
-
-  return (
-    <div className="relative shrink-0 w-full cursor-pointer" data-name="folder" onClick={onClick}>
-      <div className="flex flex-row items-center relative size-full">
-        <div className="box-border content-stretch flex flex-row gap-1.5 items-center justify-start px-2 py-1 relative w-full">
-          <button
-            onClick={handleEditClick}
-            className="size-4 text-dim hover:text-brand transition-colors cursor-pointer p-0 border-none bg-transparent"
-          >
-            <Edit className="size-4" />
-          </button>
-          <div className={`basis-0 font-mono font-[450] grow leading-[0] min-h-px min-w-px relative shrink-0 text-[14px] text-left ${
-            isSelected ? 'text-slate-50' : 'text-soft hover:text-slate-50'
-          }`}>
-            <p className="block leading-[20px]" style={{whiteSpace: "nowrap"}}>{topic.name}</p>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-});
 
 interface TopicsPanelProps {
   topics: Topic[];
@@ -64,6 +27,7 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
   const rootRef = useRef<HTMLDivElement>(null);
   const dragging = useRef<{ startX: number; startW: number } | null>(null);
   const pendingWidth = useRef<number | null>(null);
+  const [peek, setPeek] = useState<PeekAnchor | null>(null);
 
   // Как и в MessagesPanel: во время перетаскивания React не участвует,
   // ширина применяется напрямую к DOM, в state попадает один раз на mouseup.
@@ -126,6 +90,44 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
       .sort((a, b) => a.name.length - b.name.length || COLLATOR.compare(a.name, b.name));
   }, [topics, topicFilter]);
 
+  const closePeek = useCallback(() => setPeek(null), []);
+
+  /** Курсор зашёл на строку списка. Дорисовываем имя, только если оно реально
+   *  не поместилось: над короткими именами вынос был бы мельтешением без
+   *  пользы — там и так всё видно.
+   *
+   *  Левый край берётся от самого текста, а не от строки: вынос продолжает
+   *  имя ровно оттуда, где оно начинается в списке, и не накрывает кнопку
+   *  слева, так что та остаётся настоящей и подсвечивается под курсором. */
+  const openPeek = useCallback((row: HTMLElement, name: string) => {
+    const label = row.querySelector<HTMLElement>('[data-topic-name]');
+    if (!label || label.scrollWidth <= label.clientWidth) {
+      setPeek(null);
+      return;
+    }
+    const rowRect = row.getBoundingClientRect();
+    const labelRect = label.getBoundingClientRect();
+    setPeek({ name, left: labelRect.left, top: rowRect.top, height: rowRect.height });
+  }, []);
+
+  // Прокрутка и изменение размера двигают список под уже снятой геометрией,
+  // а пересчитывать её на лету незачем: курсор в этот момент всё равно уходит
+  // со строки. Скролл слушаем в фазе capture — он всплывает не от window,
+  // а от внутреннего скроллера Virtuoso.
+  useEffect(() => {
+    if (!peek) return;
+    window.addEventListener('scroll', closePeek, true);
+    window.addEventListener('resize', closePeek);
+    return () => {
+      window.removeEventListener('scroll', closePeek, true);
+      window.removeEventListener('resize', closePeek);
+    };
+  }, [peek, closePeek]);
+
+  // Смена фильтра перетасовывает список под неподвижным курсором: строка на
+  // том же месте — уже другой топик, а mouseenter об этом не сообщит.
+  useEffect(() => setPeek(null), [topicFilter]);
+
   return (
     <div
       ref={rootRef}
@@ -160,18 +162,25 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
                 key={filteredTopics[index].name}
                 className="relative shrink-0 w-full p-2"
                 data-name="topic item"
+                onMouseEnter={(e) => openPeek(e.currentTarget, filteredTopics[index].name)}
+                // Закрывает вынос в том числе когда курсор уходит ВПРАВО за
+                // границу панели: справа строки уже нет, а хвост выноса
+                // сквозной и мышь не ловит.
+                onMouseLeave={closePeek}
               >
-                <TopicItem
+                <TopicRow
                   topic={filteredTopics[index]}
                   isSelected={selectedTopic?.name === filteredTopics[index].name}
-                  onClick={() => onTopicSelect(filteredTopics[index])}
-                  onConfigClick={onTopicConfig}
+                  onSelect={() => onTopicSelect(filteredTopics[index])}
+                  onConfig={onTopicConfig}
                 />
               </div>
             )}
           />
         )}
       </div>
+
+      {peek && <TopicPeek anchor={peek} />}
 
       <div
         onMouseDown={startDragging}
