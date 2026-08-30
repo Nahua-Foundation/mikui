@@ -118,7 +118,19 @@ const FIRST_ROUND_CHUNK: i64 = 10;
 /// Ниже этого окно не опускается даже на самом медленном канале: каждый раунд
 /// заново открывает чтение партиции, и дробить его до единиц сообщений — уже
 /// одни накладные расходы.
+///
+/// Это АБСОЛЮТНЫЙ пол, страховка от деления на мусор. Настоящий пол считает
+/// `window_floor` — он заметно выше и зависит от размера сообщений.
 const MIN_ROUND_CHUNK: i64 = 5;
+/// Копия `fetch.message.max.bytes` из `helpers::get_cluster_config`. Держать её
+/// здесь приходится потому, что от неё зависит минимальный ОСМЫСЛЕННЫЙ размер
+/// окна: столько байт брокер пришлёт по партиции в одном фетче в любом случае,
+/// сколько бы офсетов мы ни попросили. Менять только вместе с оригиналом.
+const FETCH_MESSAGE_MAX_BYTES: f64 = 262_144.0;
+/// Потолок вычисленного пола: на топике с крошечными сообщениями один фетч
+/// покрывает тысячи офсетов, и делать это МИНИМАЛЬНЫМ окном значило бы тянуть
+/// мегабайты там, где хватило бы экрана строк.
+const MAX_WINDOW_FLOOR: i64 = 500;
 const MAX_ROUND_CHUNK: i64 = 5000;
 /// Во сколько раз окно может вырасти за один раунд.
 ///
@@ -379,6 +391,7 @@ fn next_window(
     estimate: Option<QuotaEstimate>,
     active: usize,
     last_round: Option<Duration>,
+    floor: i64,
 ) -> i64 {
     let ceiling = match last_round {
         Some(elapsed) if elapsed.as_secs_f64() > TARGET_ROUND_SECS => {
@@ -396,8 +409,57 @@ fn next_window(
         }
         None => ceiling,
     };
-    target.min(ceiling).clamp(MIN_ROUND_CHUNK, MAX_ROUND_CHUNK)
+    target
+        .min(ceiling)
+        .clamp(floor.clamp(MIN_ROUND_CHUNK, MAX_WINDOW_FLOOR), MAX_ROUND_CHUNK)
 }
+
+/// Ниже какого окна ужиматься не просто бесполезно, а ВРЕДНО.
+///
+/// Брокер отдаёт до `fetch.message.max.bytes` НА ПАРТИЦИЮ в каждом фетче
+/// независимо от того, сколько офсетов мы попросили, и квота списывается за
+/// всё присланное. Значит окно мельче одного фетча не экономит ни байта
+/// квоты — оно только уменьшает то, что мы из этого фетча оставляем себе.
+///
+/// Ровно на этом чтение и разваливалось. Замер с боевого кластера
+/// (`fireg.securities`, 8 партиций, ~8 КБ полезных на офсет): окно ужалось до
+/// 5 офсетов, а брокер продолжал слать свои 256 КБ на партицию — и
+/// «цена офсета» в измерителе поехала с 37 КБ до 101 КБ, хотя полезных байт
+/// на офсет всё это время было те же 8 КБ. Измеритель видел дорожающий офсет,
+/// ужимал окно ещё сильнее, и цена росла дальше. Раунд, отдававший 386
+/// сообщений в секунду, к седьмому кругу отдавал 6.
+///
+/// `kept_per_offset` — ПОЛЕЗНЫЕ байты на офсет (то, что осело в арене), а не
+/// сетевые: именно они говорят, сколько офсетов покрывает один фетч.
+fn window_floor(kept_per_offset: Option<f64>) -> i64 {
+    let Some(kept) = kept_per_offset.filter(|k| *k > 0.0) else {
+        return MIN_ROUND_CHUNK;
+    };
+    let offsets_per_fetch = (FETCH_MESSAGE_MAX_BYTES / kept).round() as i64;
+    offsets_per_fetch.clamp(MIN_ROUND_CHUNK, MAX_WINDOW_FLOOR)
+}
+
+// Активного pacing (намеренной паузы между раундами, чтобы не «занимать» из
+// брокерского токен-бакета) здесь больше нет — его пробовали и убрали.
+//
+// Идея была в том, что раунд, закончившийся быстрее измеренной устойчивой
+// скорости, взял в долг, и расплата за это придёт одной длинной паузой. На
+// боевом кластере это не подтвердилось дважды. В первой редакции цена раунда
+// считалась в байтах арены, а скорость — по `rxbytes`, и пауза не назначилась
+// ни разу. Во второй, уже в одних единицах, вышло хуже: пауза упиралась в свой
+// потолок после КАЖДОГО раунда и съела 18 секунд из 34.
+//
+// Причина в том, что оценка, на которую опиралась пауза, во время самой паузы
+// и застревала: часы измерителя на ней останавливаются, накопленные офсеты
+// сбрасываются, а раунды короче интервала статистики (1 с) не дают ни одной
+// засчитанной выборки. В логе это видно прямо — `1385 KB/s` и `39302 B/offset`
+// побайтово повторялись во всех раундах после первой же паузы. Пауза кормилась
+// одним замером с раунда, поймавшего throttle, и по нему укладывала спать
+// раунды, только что отработавшие за 0.4 секунды.
+//
+// Держать темп ниже квоты, если это когда-нибудь понадобится, нужно из
+// измерения, которое во время удержания продолжает обновляться, — иначе
+// регулятор управляет по собственному следу.
 
 /// Что публикация может себе позволить, см. `Worker::safe_frontier`.
 enum Frontier {
@@ -475,6 +537,11 @@ struct Worker {
     /// нечего по чему — публикуем в порядке приезда, иначе таблица осталась бы
     /// пустой навсегда.
     has_timestamps: bool,
+    /// ПОЛЕЗНЫХ байт на офсет по последнему раунду — то, что осело в арене,
+    /// без выброшенной предвыборки. Не путать с `bytes_per_offset` измерителя:
+    /// та считает сетевую цену офсета и потому зависит от размера окна, а эта
+    /// — свойство самих данных. Отсюда берётся пол окна (`window_floor`).
+    kept_per_offset: Option<f64>,
 }
 
 impl Worker {
@@ -495,6 +562,7 @@ impl Worker {
             window: FIRST_ROUND_CHUNK,
             last_round: None,
             has_timestamps: false,
+            kept_per_offset: None,
         }
     }
 
@@ -678,6 +746,7 @@ impl Worker {
         // чем вдвое за раунд, пока в измерение не войдут данные нового топика.
         self.window = FIRST_ROUND_CHUNK;
         self.last_round = None;
+        self.kept_per_offset = None;
         self.has_timestamps = false;
         self.rebuild_view();
 
@@ -966,7 +1035,14 @@ impl Worker {
             .values()
             .filter(|c| !c.exhausted && c.absorbed < c.budget)
             .count();
-        let chunk = next_window(self.window, self.quota.estimate(), active, self.last_round);
+        let floor = window_floor(self.kept_per_offset);
+        let chunk = next_window(
+            self.window,
+            self.quota.estimate(),
+            active,
+            self.last_round,
+            floor,
+        );
         self.window = chunk;
 
         let mut round: HashMap<i32, RoundPartition> = HashMap::new();
@@ -1172,10 +1248,22 @@ impl Worker {
             pending.topic_name,
             round.len(),
             match quota {
+                // «kept» против «paid» — главный индикатор впустую потраченной
+                // квоты: брокер шлёт по `fetch.message.max.bytes` на партицию
+                // независимо от размера окна, и всё, что не влезло в окно,
+                // оплачено и выброшено. Растущий разрыв означает, что окно
+                // мельче одного фетча — см. `window_floor`.
                 Some(q) => format!(
-                    ", cluster gives {:.0} KB/s at {:.0} B/offset, throttle up to {:?}",
+                    ", cluster gives {:.0} KB/s, {:.0} B/offset paid vs {:.0} kept ({:.1}x waste), \
+                     throttle up to {:?}",
                     q.bytes_per_sec / 1024.0,
                     q.bytes_per_offset,
+                    if offsets > 0 { bytes as f64 / offsets as f64 } else { 0.0 },
+                    if offsets > 0 && bytes > 0 {
+                        q.bytes_per_offset * offsets as f64 / bytes as f64
+                    } else {
+                        0.0
+                    },
                     q.peak_throttle
                 ),
                 // Печатается явно: молчащий измеритель — это не «пока мало
@@ -1202,6 +1290,9 @@ impl Worker {
         }
         round.clear();
         self.last_round = Some(elapsed);
+        if offsets > 0 {
+            self.kept_per_offset = Some(bytes as f64 / offsets as f64);
+        }
     }
 
     /// Раунд оборвался на середине (дедлайн, переполнение буфера, ошибка).
@@ -1577,6 +1668,9 @@ mod tests {
 
     /// Быстрый раунд, не мешающий росту.
     const QUICK: Option<Duration> = Some(Duration::from_millis(500));
+    /// Пол окна, ничего не ограничивающий: тесты ниже проверяют саму формулу
+    /// подбора, а пол от размера сообщений — отдельно, в тестах `window_floor`.
+    const NO_FLOOR: i64 = MIN_ROUND_CHUNK;
 
     /// Ровно тот сценарий, который вылез на кластере: измеритель молчит
     /// (колбэк статистики висел на неопрошенной очереди), и единственная
@@ -1584,11 +1678,11 @@ mod tests {
     #[test]
     fn a_slow_round_stops_the_window_from_growing_even_without_measurements() {
         // Наблюдавшаяся последовательность: 20 -> 40 -> 80, и раунд на 10.4 с.
-        assert_eq!(next_window(20, None, 8, QUICK), 40);
-        assert_eq!(next_window(40, None, 8, QUICK), 80);
+        assert_eq!(next_window(20, None, 8, QUICK, NO_FLOOR), 40);
+        assert_eq!(next_window(40, None, 8, QUICK, NO_FLOOR), 80);
 
         // Здесь прошлая версия выдавала 160 и разгонялась дальше до 640.
-        let after_slow = next_window(80, None, 8, Some(Duration::from_secs_f64(10.4)));
+        let after_slow = next_window(80, None, 8, Some(Duration::from_secs_f64(10.4)), NO_FLOOR);
         assert!(
             after_slow < 20,
             "окно должно было рухнуть, а не расти: {after_slow}"
@@ -1605,6 +1699,7 @@ mod tests {
             None,
             8,
             Some(Duration::from_secs_f64(TARGET_ROUND_SECS * 4.0)),
+            NO_FLOOR,
         );
         assert_eq!(w, previous / 4);
     }
@@ -1615,21 +1710,22 @@ mod tests {
         // 200 КБ/с, 12 КБ на офсет, 4 партиции, цель — 2 секунды:
         // 400 КБ на раунд, это ~33 офсета, по 8 на партицию.
         let previous = 100;
-        let w = next_window(previous, estimate(200_000.0, 12_000.0), 4, QUICK);
+        let w = next_window(previous, estimate(200_000.0, 12_000.0), 4, QUICK, NO_FLOOR);
         assert_eq!(
             w,
             (200_000.0 * TARGET_ROUND_SECS / 12_000.0 / 4.0).round() as i64
         );
 
         // Тот же кластер, но мелкие сообщения — окно кратно больше.
-        let small = next_window(previous, estimate(200_000.0, 400.0), 4, QUICK);
+        let small = next_window(previous, estimate(200_000.0, 400.0), 4, QUICK, NO_FLOOR);
         assert!(small > w * 10, "{small} vs {w}");
 
         // Ровно наблюдавшийся случай: 8 партиций по 12 КБ на офсет при 200 КБ/с
-        // упираются в нижнюю границу — 5 офсетов на партицию, то есть около
-        // 480 КБ и 2.4 секунды на раунд. Это и есть предел дробления.
+        // схлопывают саму формулу в абсолютный минимум. В боевом коде до такого
+        // окна дело не доходит — его перебивает `window_floor`, см.
+        // `the_floor_stops_the_shrinking_death_spiral`.
         assert_eq!(
-            next_window(previous, estimate(200_000.0, 12_000.0), 8, QUICK),
+            next_window(previous, estimate(200_000.0, 12_000.0), 8, QUICK, NO_FLOOR),
             MIN_ROUND_CHUNK
         );
     }
@@ -1639,7 +1735,7 @@ mod tests {
     #[test]
     fn window_splits_the_quota_across_partitions() {
         let est = estimate(2_000_000.0, 1_000.0);
-        assert!(next_window(10_000, est, 16, QUICK) < next_window(10_000, est, 4, QUICK));
+        assert!(next_window(10_000, est, 16, QUICK, NO_FLOOR) < next_window(10_000, est, 4, QUICK, NO_FLOOR));
     }
 
     /// Именно это и сломалось на кластере с квотой: пока измеритель не набрал
@@ -1649,10 +1745,10 @@ mod tests {
     #[test]
     fn window_growth_is_capped_even_on_a_wildly_optimistic_estimate() {
         let burst = estimate(50_000_000.0, 100.0);
-        assert_eq!(next_window(10, burst, 8, QUICK), 20);
-        assert_eq!(next_window(20, burst, 8, QUICK), 40);
+        assert_eq!(next_window(10, burst, 8, QUICK, NO_FLOOR), 20);
+        assert_eq!(next_window(20, burst, 8, QUICK, NO_FLOOR), 40);
         // Без измерений — то же удвоение от достигнутого.
-        assert_eq!(next_window(40, None, 8, QUICK), 80);
+        assert_eq!(next_window(40, None, 8, QUICK, NO_FLOOR), 80);
     }
 
     /// А вниз — сразу: расплата за перебор квоты приходит одной длинной
@@ -1662,7 +1758,7 @@ mod tests {
     fn window_shrinks_in_a_single_step() {
         let slow = estimate(200_000.0, 12_000.0);
         assert!(
-            next_window(2_000, slow, 8, QUICK) < 10,
+            next_window(2_000, slow, 8, QUICK, NO_FLOOR) < 10,
             "должно было рухнуть сразу"
         );
     }
@@ -1671,15 +1767,63 @@ mod tests {
     fn window_stays_within_bounds() {
         // Кластер почти не отдаёт — но мельче минимума не дробим.
         assert_eq!(
-            next_window(1_000, estimate(1.0, 1_000_000.0), 64, QUICK),
+            next_window(1_000, estimate(1.0, 1_000_000.0), 64, QUICK, NO_FLOOR),
             MIN_ROUND_CHUNK
         );
         // И никакая скорость не разгоняет окно выше потолка.
         let mut w = 10;
         for _ in 0..50 {
-            w = next_window(w, estimate(f64::MAX, 1.0), 1, QUICK);
+            w = next_window(w, estimate(f64::MAX, 1.0), 1, QUICK, NO_FLOOR);
         }
         assert_eq!(w, MAX_ROUND_CHUNK);
+    }
+
+    /// Главный вывод из боевого лога: окно мельче одного фетча не экономит
+    /// квоту, а только уменьшает добычу — брокер всё равно шлёт свои 256 КБ на
+    /// партицию. Пол окна обязан следовать за размером сообщений.
+    #[test]
+    fn window_floor_covers_one_fetch_worth_of_offsets() {
+        // Замер с `fireg.securities`: ~8 КБ полезных на офсет.
+        // 262144 / 8000 = 33 офсета — а прежний пол был 5.
+        let floor = window_floor(Some(8_000.0));
+        assert_eq!(floor, (FETCH_MESSAGE_MAX_BYTES / 8_000.0).round() as i64);
+        assert!(
+            floor > MIN_ROUND_CHUNK * 6,
+            "пол должен быть кратно выше прежних пяти офсетов: {floor}"
+        );
+    }
+
+    #[test]
+    fn window_floor_falls_back_to_the_absolute_minimum_without_a_measurement() {
+        assert_eq!(window_floor(None), MIN_ROUND_CHUNK);
+        assert_eq!(window_floor(Some(0.0)), MIN_ROUND_CHUNK);
+        // Гигантские сообщения: один фетч не покрывает даже офсета.
+        assert_eq!(window_floor(Some(10_000_000.0)), MIN_ROUND_CHUNK);
+    }
+
+    #[test]
+    fn window_floor_is_capped_on_tiny_messages() {
+        // 40 байт на офсет — один фетч покрыл бы 6500 офсетов; столько тянуть
+        // МИНИМАЛЬНЫМ окном незачем.
+        assert_eq!(window_floor(Some(40.0)), MAX_WINDOW_FLOOR);
+    }
+
+    /// Регрессия на сам обвал: при измеренной цене офсета, какую выдал
+    /// боевой кластер после нескольких мелких окон, формула просит 5 офсетов —
+    /// и пол обязан это перебить.
+    #[test]
+    fn the_floor_stops_the_shrinking_death_spiral() {
+        // Оценка кластера в момент обвала: ~1 МБ/с, 101 КБ за офсет (из
+        // которых полезных — восемь).
+        let collapsed = estimate(1_000_000.0, 101_746.0);
+        let floor = window_floor(Some(8_000.0));
+
+        let unbounded = next_window(10, collapsed, 8, QUICK, NO_FLOOR);
+        assert_eq!(unbounded, MIN_ROUND_CHUNK, "формула сама по себе схлопывается");
+
+        let bounded = next_window(10, collapsed, 8, QUICK, floor);
+        assert_eq!(bounded, floor);
+        assert!(bounded > unbounded * 6, "{bounded} vs {unbounded}");
     }
 
     /// Окно без единого сообщения (compacted-топик) должно расширяться, а не
