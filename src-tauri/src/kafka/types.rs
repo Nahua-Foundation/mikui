@@ -11,9 +11,13 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub struct ClusterConnectPayload {
     /// Идентификатор сохранённого кластера, если подключаемся к такому.
-    /// Нужен, чтобы достать пароль из keychain, не гоняя его через IPC.
     #[serde(default)]
     pub id: Option<String>,
+    /// Идентификатор Kafka-пользователя, под которым подключаемся. Нужен, чтобы
+    /// достать пароль из keychain, не гоняя его через IPC: у сохранённой учётки
+    /// пароль вообще не покидает бэкенд.
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub brokers: String,
     pub security_protocol: String,
     pub sasl_mechanism: Option<String>,
@@ -63,8 +67,13 @@ pub struct OpenTopicParams {
     /// топик — при большом числе партиций итоговый объём в буфере кратно
     /// больше). Не путать с размером окна выдачи.
     pub limit: usize,
-    /// None — все партиции топика.
-    pub partition: Option<i32>,
+    /// Из каких партиций читать. `None` (как и пустой список) — из всех.
+    ///
+    /// Список, а не одна партиция: выбрать «партиции 3 и 7» — обычная задача
+    /// при разборе инцидента, а читать ради неё весь топик значит платить за
+    /// это квотой на чтение.
+    #[serde(default)]
+    pub partitions: Option<Vec<i32>>,
     #[serde(default)]
     pub filter: MessageFilter,
 }

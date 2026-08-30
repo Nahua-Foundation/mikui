@@ -3,6 +3,7 @@ import { toast } from 'sonner';
 import {
   Topic,
   ClusterConnectPayload,
+  ClusterUser,
   FavoriteMessage,
   FullMessage,
   MessageFilter,
@@ -19,6 +20,7 @@ import { MessageDetailsModal } from './kafka';
 import { TopicConfigModal } from './kafka';
 import { ClusterConfigModal } from './kafka';
 import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
+import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
 import { FavoritesModal } from './kafka';
 import { useMessageWindow } from './kafka/useMessageWindow';
 import { invoke } from '@tauri-apps/api/core';
@@ -47,7 +49,8 @@ function describeError(e: unknown): string {
 
 export function KafkaExplorerPortfolio() {
   const [selectedTopic, setSelectedTopic] = useState<Topic | null>(null);
-  const [selectedPartition, setSelectedPartition] = useState<number | null>(null);
+  /** Из каких партиций читаем. null — из всех. */
+  const [selectedPartitions, setSelectedPartitions] = useState<number[] | null>(null);
   /** С какого конца топика читать. Определяет и порядок строк в таблице, и
    *  направление, в котором догружаются следующие порции. */
   const [startFrom, setStartFrom] = useState<StartFrom>('newest');
@@ -57,6 +60,7 @@ export function KafkaExplorerPortfolio() {
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
   const [isClusterConfigModalOpen, setIsClusterConfigModalOpen] = useState(false);
   const [isClusterArchiveModalOpen, setIsClusterArchiveModalOpen] = useState(false);
+  const [isClusterUsersModalOpen, setIsClusterUsersModalOpen] = useState(false);
   const [isFavoritesModalOpen, setIsFavoritesModalOpen] = useState(false);
   const [filters, setFilters] = useState<MessageFilter>(EMPTY_FILTER);
   const [favorites, setFavorites] = useState<FavoriteMessage[]>([]);
@@ -81,9 +85,33 @@ export function KafkaExplorerPortfolio() {
   topicRef.current = selectedTopic?.name ?? null;
 
   const [clusters, setClusters] = useState<KafkaCluster[]>([]);
-  const [selectedCluster, setSelectedCluster] = useState<KafkaCluster | null>(null);
+  const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
   const [connectedClusterId, setConnectedClusterId] = useState<string | null>(null);
+  /** Учётка, под которой держится текущее подключение. */
+  const [connectedUserId, setConnectedUserId] = useState<string | null>(null);
+  /**
+   * Как называется то, к чему подключены. Отдельно от `connectedClusterId`
+   * потому, что подключиться можно и из формы, не сохраняя кластер, — а шапка
+   * обязана показывать имя и в этом случае.
+   */
+  const [connectedName, setConnectedName] = useState<string | null>(null);
+  /** Идёт рукопожатие с кластером. Без этого признака переключение учётки
+   *  выглядит как «ничего не произошло»: старая шапка и старый список топиков
+   *  стоят на месте, пока бэкенд ходит в сеть. */
+  const [isConnecting, setIsConnecting] = useState(false);
   const [clusterConfigMode, setClusterConfigMode] = useState<ClusterConfigMode>('create');
+  const [usersModalClusterId, setUsersModalClusterId] = useState<string | null>(null);
+  const [usersModalFromConfig, setUsersModalFromConfig] = useState(false);
+
+  // Единственный источник правды по кластерам — список `clusters`: и шапка, и
+  // модалка пользователей смотрят в него по id. Держать рядом ещё и копию
+  // объекта означало бы, что добавленный пользователь виден в одном месте и
+  // не виден в другом.
+  const connectedCluster = clusters.find((c) => c.id === connectedClusterId) ?? null;
+  const usersModalCluster = clusters.find((c) => c.id === usersModalClusterId) ?? null;
+  // Тоже по id, а не снимком: из настроек кластера можно уйти в Manage users,
+  // завести там пользователя и вернуться — снимок этого бы не показал.
+  const selectedCluster = clusters.find((c) => c.id === selectedClusterId) ?? null;
 
   // Сохранённые подключения читаются с диска при старте. Раньше список жил
   // только в React state, поэтому добавленный кластер исчезал при перезапуске.
@@ -96,6 +124,8 @@ export function KafkaExplorerPortfolio() {
         toast.error(`Failed to load saved clusters: ${e}`);
       });
   }, []);
+
+  const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
 
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
@@ -119,7 +149,7 @@ export function KafkaExplorerPortfolio() {
         topic: selectedTopic.name,
         start_from: startFrom,
         limit: DEFAULT_PARTITION_LIMIT,
-        partition: selectedPartition,
+        partitions: selectedPartitions,
         filter: filters,
       },
     })
@@ -150,8 +180,11 @@ export function KafkaExplorerPortfolio() {
     // filters здесь намеренно не в зависимостях: их применяет set_filter,
     // без повторного чтения из Kafka. А вот startFrom — в зависимостях:
     // сменить направление можно только перечитав топик с другого конца.
+    //
+    // Партиции — строкой, а не массивом: у массива каждый рендер новая
+    // идентичность, и топик перечитывался бы на ровном месте.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTopic, selectedPartition, startFrom]);
+  }, [selectedTopic, partitionsKey, startFrom]);
 
   // Опрос хода чтения — общий для открытия топика и для "Load more".
   //
@@ -251,45 +284,165 @@ export function KafkaExplorerPortfolio() {
   const handleClusterClick = useCallback(() => setIsClusterArchiveModalOpen(true), []);
 
   const handleCreateNewCluster = useCallback(() => {
-    setSelectedCluster(null);
+    setSelectedClusterId(null);
     setClusterConfigMode('create');
     setIsClusterConfigModalOpen(true);
   }, []);
 
   const handleEditCluster = useCallback((cluster: KafkaCluster) => {
-    setSelectedCluster(cluster);
+    setSelectedClusterId(cluster.id);
     setClusterConfigMode('edit');
     setIsClusterConfigModalOpen(true);
   }, []);
 
   /**
    * Единственный путь подключения — им пользуются и кнопка Connect в форме,
-   * и клик по строке в архиве. Раньше клик по архиву только красил строку и
-   * показывал «Connected», ничего не подключая.
+   * и клик по строке в архиве, и смена Kafka-пользователя. Раньше клик по
+   * архиву только красил строку и показывал «Connected», ничего не подключая.
+   *
+   * `keepTopic` — для смены учётки: читать ту же тему под другими ACL и есть
+   * то, ради чего учётки переключают, и выбрасывать пользователя обратно к
+   * списку топиков на каждое переключение незачем.
+   *
+   * `replace` — прежнее подключение заведомо устарело (у текущей учётки
+   * поменяли креды), и откатываться на него нельзя ни при какой неудаче.
    */
-  const connect = useCallback(async (payload: ClusterConnectPayload, label: string) => {
-    try {
-      await api.clusterConnect(payload);
-      const loaded = await api.getTopics();
-      setTopics(loaded);
-      setSelectedTopic(null);
+  const connect = useCallback(
+    async (
+      payload: ClusterConnectPayload,
+      label: string,
+      options?: { keepTopic?: boolean; replace?: boolean },
+    ) => {
+      setIsConnecting(true);
+      // Соединение держится на СТАРОМ пароле: librdkafka аутентифицируется
+      // один раз при подключении и после этого читает, ничего не переспрашивая.
+      // Не разорвав его, мы бы оставили работающим сеанс по кредам, которых
+      // больше нет, — и вся смена пароля выглядела бы фикцией.
+      if (options?.replace) {
+        await api.clusterDisconnect().catch(() => {});
+      }
+      try {
+        // Бэкенд проверяет связь внутри `cluster_connect` и на неудаче
+        // оставляет прежнее подключение нетронутым — поэтому здесь ничего не
+        // трогаем до успеха.
+        await api.clusterConnect(payload);
+      } catch (e) {
+        console.error('Connect failed', e);
+        // Откатываться некуда: прежнее соединение мы разорвали сами.
+        if (options?.replace) {
+          setConnectedClusterId(null);
+          setConnectedUserId(null);
+          setConnectedName(null);
+          setTopics([]);
+          setSelectedTopic(null);
+        }
+        toast.error(`Failed to connect: ${describeError(e)}`);
+        setIsConnecting(false);
+        throw e;
+      }
+
+      // Соединение на бэкенде уже переставлено. Состояние UI обязано это
+      // отразить даже если следующий шаг упадёт: иначе шапка показывала бы
+      // одну учётку, пока воркер держит другую.
       setConnectedClusterId(payload.id ?? null);
-      // last_used обновил бэкенд — перечитываем список, чтобы порядок совпадал.
+      setConnectedUserId(payload.user_id ?? null);
+      setConnectedName(label);
+      // last_used и active_user_id обновил бэкенд — перечитываем список.
       api.listClusters().then(setClusters).catch(() => {});
-      toast.success(`Connected to ${label} · ${loaded.length} topics`);
-    } catch (e) {
-      console.error('Connect failed', e);
-      toast.error(`Failed to connect: ${e}`);
-      throw e;
-    }
-  }, []);
+
+      try {
+        const loaded = await api.getTopics();
+        setTopics(loaded);
+
+        const previous = options?.keepTopic ? topicRef.current : null;
+        const retained = previous ? loaded.find((t) => t.name === previous) : undefined;
+        if (previous && !retained) {
+          // Учётка сменилась на менее полномочную — топик просто исчез из
+          // списка. Молча оставить его открытым значило бы показывать строки,
+          // которых новому пользователю видеть не положено.
+          toast.warning(`Topic ${previous} is not available to this user`);
+        }
+        // Новый объект, а не тот же самый: перечитать топик под новыми правами
+        // можно только подняв поколение.
+        setSelectedTopic(retained ? { ...retained } : null);
+        setSelectedPartitions((prev) =>
+          prev && retained && prev.some((p) => p >= retained.partitions) ? null : prev,
+        );
+
+        toast.success(`Connected to ${label} · ${loaded.length} topics`);
+      } catch (e) {
+        console.error('Failed to list topics', e);
+        setTopics([]);
+        setSelectedTopic(null);
+        toast.error(`Connected, but the topic list is unavailable: ${describeError(e)}`);
+        throw e;
+      } finally {
+        setIsConnecting(false);
+      }
+    },
+    [],
+  );
 
   const handleConnectToCluster = useCallback(
     (cluster: KafkaCluster) => {
-      connect(api.clusterToPayload(cluster), cluster.name).catch(() => {});
+      const user = api.activeUser(cluster);
+      connect(api.clusterToPayload(cluster, user), cluster.name).catch(() => {});
     },
     [connect],
   );
+
+  /**
+   * Переподключение к тому же кластеру под указанной учёткой.
+   *
+   * `replace` — креды этой учётки только что изменились: прежнее соединение
+   * держится на старом пароле, и сохранять его как запасной вариант нельзя.
+   */
+  const connectAsUser = useCallback(
+    (user: ClusterUser, options?: { replace?: boolean }) => {
+      if (!connectedCluster) return;
+      connect(api.clusterToPayload(connectedCluster, user), connectedCluster.name, {
+        keepTopic: true,
+        replace: options?.replace,
+      }).catch(() => {});
+    },
+    [connect, connectedCluster],
+  );
+
+  const handleSelectUser = useCallback(
+    (user: ClusterUser) => {
+      if (user.id === connectedUserId) return;
+      connectAsUser(user);
+    },
+    [connectAsUser, connectedUserId],
+  );
+
+  /**
+   * Применить только что сохранённые настройки подключения.
+   *
+   * Настройки СОСЕДНЕГО кластера правят, не бросая текущую сессию: увести с
+   * неё по нажатию Save было бы самоуправством. Во всех остальных случаях —
+   * подключаемся, ради этого настройки и правили.
+   */
+  const handleApplyClusterSettings = useCallback(
+    async (cluster: KafkaCluster) => {
+      if (connectedClusterId && connectedClusterId !== cluster.id) return;
+      await connect(api.clusterToPayload(cluster, api.activeUser(cluster)), cluster.name, {
+        keepTopic: true,
+        // Параметры подключения изменились — прежний сеанс держится на
+        // прежних и достоверным больше не является.
+        replace: true,
+      });
+    },
+    [connect, connectedClusterId],
+  );
+
+  /** `fromConfig` — пришли из настроек кластера, значит есть куда вернуться. */
+  const handleManageUsers = useCallback((cluster: KafkaCluster, fromConfig = false) => {
+    setUsersModalClusterId(cluster.id);
+    setUsersModalFromConfig(fromConfig);
+    setIsClusterConfigModalOpen(false);
+    setIsClusterUsersModalOpen(true);
+  }, []);
 
   const handleBackToArchive = useCallback(() => {
     setIsClusterConfigModalOpen(false);
@@ -309,7 +462,11 @@ export function KafkaExplorerPortfolio() {
       try {
         await api.deleteCluster(id);
         setClusters((prev) => prev.filter((c) => c.id !== id));
-        if (connectedClusterId === id) setConnectedClusterId(null);
+        if (connectedClusterId === id) {
+          setConnectedClusterId(null);
+          setConnectedUserId(null);
+          setConnectedName(null);
+        }
         toast.success('Cluster deleted');
       } catch (e) {
         console.error('Failed to delete cluster', e);
@@ -318,6 +475,13 @@ export function KafkaExplorerPortfolio() {
     },
     [connectedClusterId],
   );
+
+  /** Выбор партиций осмыслен только для того топика, на котором сделан: у
+   *  соседнего их может быть меньше, и чтение упёрлось бы в «out of range». */
+  const handleSelectTopic = useCallback((topic: Topic | null) => {
+    if (topicRef.current !== (topic?.name ?? null)) setSelectedPartitions(null);
+    setSelectedTopic(topic);
+  }, []);
 
   const handleRefresh = useCallback(() => {
     // Перечитываем топик с нуля, поднимая поколение.
@@ -350,11 +514,17 @@ export function KafkaExplorerPortfolio() {
       data-name="kafka-explorer-portfolio"
     >
       <HeaderDesktop
-        selectedPartition={selectedPartition}
-        onSelectPartition={setSelectedPartition}
+        selectedPartitions={selectedPartitions}
+        onSelectPartitions={setSelectedPartitions}
         startFrom={startFrom}
         onStartFromChange={setStartFrom}
         topic={selectedTopic}
+        clusterName={connectedName}
+        cluster={connectedCluster}
+        activeUserId={connectedUserId}
+        isConnecting={isConnecting}
+        onSelectUser={handleSelectUser}
+        onManageUsers={() => connectedCluster && handleManageUsers(connectedCluster)}
         onClusterClick={handleClusterClick}
         filters={filters}
         onFiltersChange={setFilters}
@@ -367,7 +537,7 @@ export function KafkaExplorerPortfolio() {
         <TopicsPanel
           topics={topics}
           selectedTopic={selectedTopic}
-          onTopicSelect={setSelectedTopic}
+          onTopicSelect={handleSelectTopic}
           onTopicConfig={handleConfigClick}
         />
 
@@ -422,6 +592,32 @@ export function KafkaExplorerPortfolio() {
         onBack={handleBackToArchive}
         onSaved={handleClusterSaved}
         onConnect={connect}
+        onManageUsers={(cluster) => handleManageUsers(cluster, true)}
+        isConnected={!!selectedCluster && selectedCluster.id === connectedClusterId}
+        onApply={handleApplyClusterSettings}
+      />
+
+      <ClusterUsersModal
+        open={isClusterUsersModalOpen}
+        onOpenChange={setIsClusterUsersModalOpen}
+        cluster={usersModalCluster}
+        activeUserId={usersModalClusterId === connectedClusterId ? connectedUserId : null}
+        onChanged={handleClusterSaved}
+        // Правка учётки, под которой мы сейчас подключены, — это смена
+        // действующих кредов. Прежнее соединение при этом рвётся безусловно,
+        // даже если новый пароль неверен: иначе чтение продолжало бы работать
+        // по паролю, которого больше нет, и смена пароля выглядела бы фикцией.
+        onReconnect={(user) => connectAsUser(user, { replace: true })}
+        // Из настроек кластера сюда приходят через кнопку — значит есть куда
+        // вернуться. Из шапки списком заведуют напрямую, и кнопки нет.
+        onBack={
+          usersModalFromConfig
+            ? () => {
+                setIsClusterUsersModalOpen(false);
+                setIsClusterConfigModalOpen(true);
+              }
+            : undefined
+        }
       />
 
       <FavoritesModal

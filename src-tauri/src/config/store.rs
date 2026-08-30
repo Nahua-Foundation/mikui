@@ -60,7 +60,14 @@ fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T,
 }
 
 pub fn load_clusters(app: &AppHandle) -> Result<Vec<ClusterConfig>, String> {
-    read_json(&config_dir(app)?.join(CLUSTERS_FILE))
+    let mut clusters: Vec<ClusterConfig> = read_json(&config_dir(app)?.join(CLUSTERS_FILE))?;
+    // Единственная точка входа для записей с диска — значит и единственное
+    // место, где стоит приводить их к текущему формату. Остальной код имеет
+    // дело только с мигрированными.
+    for cluster in &mut clusters {
+        cluster.migrate();
+    }
+    Ok(clusters)
 }
 
 pub fn save_clusters(app: &AppHandle, clusters: &[ClusterConfig]) -> Result<(), String> {

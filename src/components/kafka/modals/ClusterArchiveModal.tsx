@@ -1,9 +1,9 @@
 import { Button } from '../../ui/button';
-import { Plus, Edit, Trash2 } from 'lucide-react';
+import { Plus, Settings, Trash2 } from 'lucide-react';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { KafkaCluster } from '../types';
-import { Table, TableBody, TableCell, TableRow } from '../../ui/table';
+import * as api from '../api';
 
 interface ClusterArchiveModalProps {
   open: boolean;
@@ -55,60 +55,77 @@ export function ClusterArchiveModal({
         </DialogHeader>
 
         <div className="flex-1 overflow-auto pt-4">
-          <div className="bg-surface border border-edge rounded-lg overflow-hidden">
-            <Table>
-              <TableBody>
-                {clusters.map((cluster) => (
-                  <TableRow
-                    key={cluster.id}
-                    className="border-edge hover:bg-edge/20 cursor-pointer transition-colors"
-                    onClick={() => handleConnectAndClose(cluster)}
-                  >
-                    <TableCell className="py-4">
-                      <div className="flex items-center gap-2">
-                        {cluster.id === connectedClusterId && (
-                          <span
-                            className="size-2 rounded-full bg-green-500 shrink-0"
-                            title="Connected"
-                          />
-                        )}
-                        <span className="font-mono text-slate-50">{cluster.name}</span>
-                      </div>
-                      <div className="font-mono text-xs text-dim mt-1">
-                        {cluster.brokers}
-                        {' · '}
-                        {cluster.security_protocol}
-                        {cluster.has_password && ' · password saved'}
-                      </div>
-                    </TableCell>
-                    <TableCell className="py-4 text-right">
-                      <div className="flex items-center justify-end gap-2">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onEditCluster(cluster);
-                          }}
-                          className="p-1 text-dim hover:text-brand transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
-                          title="Edit cluster"
-                        >
-                          <Edit className="size-4" />
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onDeleteCluster(cluster.id);
-                          }}
-                          className="p-1 text-dim hover:text-red-400 transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
-                          title="Delete cluster"
-                        >
-                          <Trash2 className="size-4" />
-                        </button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+          {/* Не таблица: строка адресов брокеров бывает длиннее модалки, а
+              `<table>` в таком случае растягивается по самой длинной ячейке и
+              уезжает под горизонтальный скролл — вместе с кнопками, которые
+              обязаны оставаться на виду. Flex с `min-w-0` держит их справа, а
+              длинному тексту даёт усечься; полное значение — в подсказке. */}
+          {/* Пустая рамка вместо списка выглядела бы как сломанная вёрстка. */}
+          <div
+            className={`bg-surface border border-edge rounded-lg overflow-hidden ${
+              clusters.length === 0 ? 'hidden' : ''
+            }`}
+          >
+            {clusters.map((cluster) => {
+              // Под кем откроется этот кластер по клику — то же, что решит
+              // и сам обработчик подключения.
+              const user = api.activeUser(cluster);
+              const details = [
+                cluster.brokers,
+                cluster.security_protocol,
+                user && `${user.username}${cluster.users.length > 1 ? ` +${cluster.users.length - 1}` : ''}`,
+              ]
+                .filter(Boolean)
+                .join(' · ');
+
+              return (
+                <div
+                  key={cluster.id}
+                  className="flex items-center gap-3 px-4 py-4 border-b border-edge last:border-b-0 hover:bg-edge/20 cursor-pointer transition-colors"
+                  onClick={() => handleConnectAndClose(cluster)}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      {cluster.id === connectedClusterId && (
+                        <span
+                          className="size-2 rounded-full bg-green-500 shrink-0"
+                          title="Connected"
+                        />
+                      )}
+                      <span className="font-mono text-slate-50 truncate" title={cluster.name}>
+                        {cluster.name}
+                      </span>
+                    </div>
+                    <div className="font-mono text-xs text-dim mt-1 truncate" title={details}>
+                      {details}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onEditCluster(cluster);
+                      }}
+                      className="p-1 text-dim hover:text-brand transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+                      title="Connection settings"
+                    >
+                      <Settings className="size-4" />
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeleteCluster(cluster.id);
+                      }}
+                      className="p-1 text-dim hover:text-red-400 transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+                      title="Delete cluster"
+                    >
+                      <Trash2 className="size-4" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
 
           {clusters.length === 0 && (

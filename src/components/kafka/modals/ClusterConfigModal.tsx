@@ -1,23 +1,19 @@
 import { useState, useEffect } from 'react';
 import { Button } from '../../ui/button';
-import { ArrowLeft, Loader2 } from 'lucide-react';
+import { ArrowLeft, Loader2, Users } from 'lucide-react';
 import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
-import { ClusterConnectPayload, KafkaCluster } from '../types';
+import { ClusterConnectPayload, KafkaCluster, newId } from '../types';
 import * as api from '../api';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 /** Запасной список на случай, если бэкенд не ответил. GSSAPI сюда не входит:
  *  он есть не в каждой сборке (Cyrus SASL линкуется только фичей `gssapi`). */
 const FALLBACK_MECHANISMS = ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512', 'OAUTHBEARER'];
-
-/** Плейсхолдер вместо сохранённого пароля: показывать сам пароль в поле незачем,
- *  а вот сообщить, что он есть, полезно. */
-const KEPT_PASSWORD = '';
 
 interface ClusterConfigModalProps {
   open: boolean;
@@ -27,6 +23,12 @@ interface ClusterConfigModalProps {
   onBack?: () => void;
   onSaved?: (cluster: KafkaCluster) => void;
   onConnect?: (payload: ClusterConnectPayload, name: string) => Promise<void>;
+  /** Открыть список Kafka-пользователей этого кластера. */
+  onManageUsers?: (cluster: KafkaCluster) => void;
+  /** Подключены ли мы прямо сейчас именно к этому кластеру. */
+  isConnected?: boolean;
+  /** Применить сохранённые настройки — переподключиться с ними. */
+  onApply?: (cluster: KafkaCluster) => Promise<void>;
 }
 
 export function ClusterConfigModal({
@@ -37,10 +39,15 @@ export function ClusterConfigModal({
   onBack,
   onSaved,
   onConnect,
+  onManageUsers,
+  isConnected = false,
+  onApply,
 }: ClusterConfigModalProps) {
   const [name, setName] = useState<string>('');
   const [brokers, setBrokers] = useState<string>('localhost:9092');
   const [securityProtocol, setSecurityProtocol] = useState<string>('PLAINTEXT');
+  /** Какую учётку правит форма. null — новую, ещё не заведённую. */
+  const [userId, setUserId] = useState<string | null>(null);
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [sslCaBundlePath, setSslCaBundlePath] = useState<string>('');
@@ -48,6 +55,7 @@ export function ClusterConfigModal({
 
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
   const [mechanisms, setMechanisms] = useState<string[]>(FALLBACK_MECHANISMS);
 
   // Какие механизмы доступны, знает только бэкенд: GSSAPI требует Cyrus SASL,
@@ -59,23 +67,40 @@ export function ClusterConfigModal({
       .catch((e) => console.error('Failed to load SASL mechanisms', e));
   }, []);
 
+  /**
+   * Правит ли форма логин и пароль.
+   *
+   * Пока к кластеру не подключены — правит: сохранённая учётка с неверным
+   * паролем иначе запирает вход намертво. Подключиться нельзя, а выбрать
+   * другую учётку можно только уже подключившись — селектор пользователя
+   * живёт в шапке и до подключения его нет.
+   *
+   * Когда подключены — не правит: там учётками заведует Manage users, и
+   * держать вторую точку редактирования тех же кредов значило бы менять их
+   * из двух мест с разным результатом.
+   */
+  const editsCredentials = mode === 'create' || !isConnected;
+
   // Load cluster data when editing
   useEffect(() => {
     if (cluster && mode === 'edit') {
       setName(cluster.name);
       setBrokers(cluster.brokers);
       setSecurityProtocol(cluster.security_protocol);
-      setUsername(cluster.username || '');
-      // Пароль из keychain сюда не тянем: он не нужен форме и незачем гонять
-      // его через IPC. Пустое поле означает «оставить как есть».
-      setPassword(KEPT_PASSWORD);
       setSslCaBundlePath(cluster.ssl_ca_bundle_path || '');
       setSaslMechanism(cluster.sasl_mechanism || 'PLAIN');
+      const user = api.activeUser(cluster);
+      setUserId(user?.id ?? null);
+      setUsername(user?.username ?? '');
+      // Пароль из keychain сюда не тянем: форме он не нужен и незачем гонять
+      // его через IPC. Пустое поле означает «оставить как есть».
+      setPassword('');
     } else {
       // Reset form for create mode
       setName('');
       setBrokers('localhost:9092');
       setSecurityProtocol('PLAINTEXT');
+      setUserId(null);
       setUsername('');
       setPassword('');
       setSslCaBundlePath('');
@@ -83,28 +108,45 @@ export function ClusterConfigModal({
     }
   }, [cluster, mode, open]);
 
+  const users = cluster?.users ?? [];
+  /** Учётка, которую правит форма, — в том виде, в каком она сохранена. */
+  const savedUser = users.find((u) => u.id === userId) ?? null;
+
+  /** Переключение на другую сохранённую учётку в форме. */
+  const selectUser = (id: string) => {
+    const user = users.find((u) => u.id === id);
+    if (!user) return;
+    setUserId(user.id);
+    setUsername(user.username);
+    setPassword('');
+  };
+
   const buildPayload = (): ClusterConnectPayload => ({
     id: cluster?.id,
+    // Пароль сохранённой учётки не покидает бэкенд — уезжает только её id.
+    // Но только если пользователь не ввёл в форме новый: введённый главнее.
+    user_id: password ? undefined : savedUser?.id,
     brokers,
     security_protocol: securityProtocol,
     sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
-    username: isSASLRequired ? username : undefined,
-    // Пустой пароль у сохранённого кластера — сигнал «возьми из keychain».
+    username: isSASLRequired ? (editsCredentials ? username : savedUser?.username) : undefined,
     password: isSASLRequired && password ? password : undefined,
     ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
   });
 
   const buildConfig = (): KafkaCluster => ({
-    id: cluster?.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: cluster?.id ?? newId(),
     name: name.trim() || 'Untitled Cluster',
     brokers,
     security_protocol: securityProtocol,
     sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
-    username: isSASLRequired ? username : undefined,
     ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
     created_at: cluster?.created_at || new Date().toISOString(),
     last_used: cluster?.last_used,
-    has_password: cluster?.has_password ?? false,
+    // Список учёток бэкенд всё равно возьмёт из своей записи — здесь он только
+    // чтобы тип был честным.
+    users: cluster?.users ?? [],
+    active_user_id: cluster?.active_user_id,
   });
 
   const handleConnect = async () => {
@@ -133,14 +175,40 @@ export function ClusterConfigModal({
 
   const handleSave = async () => {
     try {
-      // undefined — не трогать сохранённый пароль; иначе записать введённый.
-      const saved = await api.saveCluster(buildConfig(), password ? password : undefined);
+      setIsSaving(true);
+      let saved = await api.saveCluster(buildConfig());
+
+      // Логин из формы — это учётка кластера, а не отдельная настройка
+      // подключения: при создании она заводится первой, при правке обновляет
+      // выбранную. Без этого шага новый SASL-кластер оставался бы без единого
+      // логина, и подключаться к нему было бы не под кем.
+      const login = username.trim();
+      if (isSASLRequired && editsCredentials && login) {
+        saved = await api.saveClusterUser(
+          saved.id,
+          { id: userId ?? newId(), username: login, has_password: false },
+          // Пустое поле означает «оставить сохранённый пароль», а не «стереть».
+          password ? password : undefined,
+          // Выбранная в форме учётка становится текущей — и переживает
+          // неудачную попытку подключиться, иначе выбор пришлось бы делать
+          // заново после каждой опечатки в пароле.
+          true,
+        );
+      }
+
       onSaved?.(saved);
       toast.success(mode === 'create' ? 'Cluster created' : 'Cluster updated');
       onOpenChange(false);
+
+      // Настройки сохранены — применяем их. Ошибку подключения показывает сам
+      // `connect`, и превращать её здесь во второй тост про неудачное
+      // сохранение нельзя: сохранение как раз удалось.
+      onApply?.(saved).catch(() => {});
     } catch (e) {
       console.error(e);
       toast.error(`Failed to save cluster: ${e}`);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -246,33 +314,96 @@ export function ClusterConfigModal({
                   </Select>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
+                {/* Пока подключены — логинами заведует Manage users: они там
+                    списком, и переключаться между ними надо на лету. Пока не
+                    подключены — правим прямо здесь, иначе учётка с неверным
+                    паролем запирает вход: подключиться нельзя, а селектор
+                    пользователя до подключения не существует. */}
+                {cluster && mode === 'edit' && !editsCredentials ? (
                   <div className="space-y-2">
-                    <Label className="font-mono text-sm text-soft">
-                      Username
-                    </Label>
-                    <Input
-                      value={username}
-                      onChange={(e) => setUsername(e.target.value)}
-                      placeholder="Enter username"
-                      className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-                    />
+                    <Label className="font-mono text-sm text-soft">Users</Label>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="font-mono text-sm text-slate-50 truncate">
+                        {cluster.users.length > 0 ? (
+                          cluster.users.map((u) => u.username).join(', ')
+                        ) : (
+                          <span className="text-dim">No users yet</span>
+                        )}
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => onManageUsers?.(cluster)}
+                        className="shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                      >
+                        <Users className="size-4 mr-2" />
+                        Manage users
+                      </Button>
+                    </div>
                   </div>
-                  <div className="space-y-2">
-                    <Label className="font-mono text-sm text-soft">
-                      Password
-                    </Label>
-                    <Input
-                      type="password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder={
-                        cluster?.has_password ? 'Saved in keychain — leave blank to keep' : 'Enter password'
-                      }
-                      className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-                    />
-                  </div>
-                </div>
+                ) : (
+                  <>
+                    {/* Переключение между уже заведёнными учётками. Без него
+                        форма умела бы только ПЕРЕИМЕНОВАТЬ текущую: набрать в
+                        поле имя соседнего пользователя значило бы затереть им
+                        запись того, кто выбран, а не выбрать соседа. */}
+                    {users.length > 1 && (
+                      <div className="space-y-2">
+                        <Label className="font-mono text-sm text-soft">User</Label>
+                        <Select value={userId ?? ''} onValueChange={selectUser}>
+                          <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent className="bg-surface border-edge">
+                            {users.map((user) => (
+                              <SelectItem
+                                key={user.id}
+                                value={user.id}
+                                className="text-slate-50 font-mono focus:bg-edge"
+                              >
+                                {user.username}
+                                {!user.has_password && ' · no password'}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label className="font-mono text-sm text-soft">Username</Label>
+                        <Input
+                          value={username}
+                          onChange={(e) => setUsername(e.target.value)}
+                          placeholder="Enter username"
+                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="font-mono text-sm text-soft">Password</Label>
+                        <Input
+                          type="password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder={
+                            savedUser?.has_password
+                              ? 'Saved in keychain — leave blank to keep'
+                              : 'Enter password'
+                          }
+                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+                <p className="font-mono text-xs text-dim">
+                  {mode === 'create'
+                    ? "Saved as the cluster's first user — add more from the header once connected."
+                    : editsCredentials
+                      ? 'Add or remove users from the header once connected.'
+                      : 'Connected right now — credentials are managed from Manage users.'}
+                </p>
               </div>
             )}
 
@@ -321,41 +452,61 @@ export function ClusterConfigModal({
         </div>
 
         {/* Action Buttons */}
+        {/* Ничего не записывается до нажатия Save, поэтому «отменить» — это
+            просто закрыть форму. Кнопка называется Cancel, а не Back: она
+            отвечает на вопрос «что будет с моими правками», а не «куда я
+            попаду». Вернуться к списку кластеров можно и стрелкой в шапке. */}
         <div className="flex gap-3 pt-4 border-t border-edge flex-shrink-0">
           {onBack && (
             <Button
               onClick={handleBack}
               variant="outline"
+              disabled={isSaving}
               className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
             >
-              Back
+              Cancel
             </Button>
           )}
           <Button
             onClick={handleTestConnection}
             variant="outline"
-            disabled={isTesting || isConnecting}
+            disabled={isTesting || isConnecting || isSaving}
             className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {isTesting && <Loader2 className="size-4 animate-spin" />}
             {isTesting ? 'Testing…' : 'Test'}
           </Button>
-          <Button
-            onClick={handleSave}
-            variant="outline"
-            disabled={isConnecting}
-            className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Save
-          </Button>
-          <Button
-            onClick={handleConnect}
-            disabled={isConnecting || isTesting}
-            className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
-          >
-            {isConnecting && <Loader2 className="size-4 animate-spin" />}
-            {isConnecting ? 'Connecting…' : 'Connect'}
-          </Button>
+          {/* В режиме правки Save сам применяет настройки, и отдельный Connect
+              рядом с ним делал бы почти то же самое — только не сохраняя. */}
+          {mode === 'create' && (
+            <Button
+              onClick={handleSave}
+              variant="outline"
+              disabled={isConnecting || isSaving}
+              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Save
+            </Button>
+          )}
+          {mode === 'create' ? (
+            <Button
+              onClick={handleConnect}
+              disabled={isConnecting || isTesting || isSaving}
+              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
+            >
+              {isConnecting && <Loader2 className="size-4 animate-spin" />}
+              {isConnecting ? 'Connecting…' : 'Connect'}
+            </Button>
+          ) : (
+            <Button
+              onClick={handleSave}
+              disabled={isSaving || isTesting}
+              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
+            >
+              {isSaving && <Loader2 className="size-4 animate-spin" />}
+              {isSaving ? 'Saving…' : 'Save & connect'}
+            </Button>
+          )}
         </div>
       </DialogContentNoClose>
     </Dialog>

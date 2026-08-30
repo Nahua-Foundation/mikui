@@ -59,14 +59,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rdkafka::admin::AdminClient;
 use rdkafka::client::ClientContext;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
-use rdkafka::error::KafkaError;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::statistics::Statistics;
 use rdkafka::types::RDKafkaRespErr;
 use tokio::sync::oneshot;
@@ -159,15 +159,93 @@ const WATERMARK_BATCH: usize = 2;
 const WATERMARK_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Сколько ждать первого ответа от кластера при подключении.
+///
+/// Меньше `METADATA_TIMEOUT` намеренно: на подключении человек СМОТРИТ на
+/// приложение и ждёт реакции, а на живом кластере рукопожатие укладывается в
+/// доли секунды (в замере с боевого стенда — 137 мс до `AUTH_REQ`). Десять
+/// секунд тишины здесь неотличимы от зависшего приложения.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Шаг проверки связи. Он же — задержка, с которой замечается ошибка
+/// аутентификации: она приезжает колбэком между попытками.
+const CONNECT_PROBE_STEP: Duration = Duration::from_millis(300);
+
 /// Как часто librdkafka отдаёт статистику. Из неё измеритель квоты берёт
 /// принятые байты и наложенные брокером задержки — см. `kafka::quota`.
 const STATS_INTERVAL_MS: &str = "1000";
 
-/// Контекст клиента, единственная задача которого — сливать статистику
-/// librdkafka в измеритель квоты.
+/// Ошибка, после которой ждать ответа от кластера бессмысленно.
+///
+/// Нужна потому, что `fetch_metadata` о таком не сообщает. Неверный пароль
+/// librdkafka распознаёт за ~150 мс и кричит об этом в колбэк ошибок, но для
+/// самого запроса метаданных это обычный неответивший брокер: она молча
+/// ретраится до конца таймаута. Без этой отметки неверный пароль неотличим от
+/// медленного кластера — и стоит секунд ожидания там, где ответ уже известен.
+#[derive(Default)]
+struct FatalError(Mutex<Option<String>>);
+
+impl FatalError {
+    fn record(&self, reason: &str) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Первая ошибка информативнее: дальше пойдут её следствия вроде
+        // «1/1 brokers are down».
+        slot.get_or_insert_with(|| reason.to_string());
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Ошибки, которые повтором не лечатся. Всё остальное (брокер не ответил,
+/// разорвалось соединение) librdkafka чинит сама, и вмешиваться незачем.
+fn is_fatal(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::Global(RDKafkaErrorCode::Authentication)
+            | KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed)
+    )
+}
+
+/// Ждёт, пока кластер либо ответит метаданными, либо откажет так, что ждать
+/// дальше бессмысленно.
+///
+/// Опрос здесь обязателен: колбэк ошибок висит на главной очереди клиента, и
+/// сам по себе `fetch_metadata` её не выгребает — без `poll` отказ в
+/// аутентификации так и остался бы незамеченным до конца таймаута.
+fn wait_until_ready(
+    consumer: &BaseConsumer<MeteredContext>,
+    fatal: &FatalError,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let _ = consumer.poll(Duration::ZERO);
+        if let Some(reason) = fatal.take() {
+            return Err(reason.to_string());
+        }
+        match consumer.fetch_metadata(None, CONNECT_PROBE_STEP) {
+            Ok(_) => return Ok(()),
+            Err(e) if started.elapsed() >= CONNECT_TIMEOUT => {
+                // Ошибка могла приехать колбэком ровно на этом шаге — тогда
+                // она точнее, чем «истекло время ожидания».
+                let _ = consumer.poll(Duration::ZERO);
+                return Err(match fatal.take() {
+                    Some(reason) => reason,
+                    None => format!("can't reach cluster: {e}"),
+                });
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Контекст клиента: сливает статистику librdkafka в измеритель квоты и
+/// перехватывает ошибки, после которых подключение можно не ждать.
 #[derive(Clone)]
 struct MeteredContext {
     meter: Arc<QuotaMeter>,
+    fatal: Arc<FatalError>,
 }
 
 impl ClientContext for MeteredContext {
@@ -190,6 +268,9 @@ impl ClientContext for MeteredContext {
 
     fn error(&self, error: KafkaError, reason: &str) {
         eprintln!("[rdkafka] {error}: {reason}");
+        if is_fatal(&error) {
+            self.fatal.record(reason);
+        }
     }
 }
 
@@ -439,6 +520,37 @@ fn window_floor(kept_per_offset: Option<f64>) -> i64 {
     offsets_per_fetch.clamp(MIN_ROUND_CHUNK, MAX_WINDOW_FLOOR)
 }
 
+/// Какие партиции читать по выбору из UI.
+///
+/// `None` и пустой список означают одно и то же — «все». Пустой список сюда
+/// приезжать не должен (селектор в шапке возвращается к «all», когда снят
+/// последний чек), но трактовать его как ошибку значило бы завести состояние,
+/// из которого таблица не может выйти сама.
+///
+/// Дубликаты убираются: одна и та же партиция, прицепленная к очереди дважды,
+/// — это `consume_start` поверх уже открытой, то есть ошибка librdkafka на
+/// ровном месте.
+fn selected_partitions(selected: Option<&[i32]>, partition_count: usize) -> Result<Vec<i32>, String> {
+    let all = || (0..partition_count as i32).collect::<Vec<i32>>();
+    let Some(selected) = selected.filter(|s| !s.is_empty()) else {
+        return Ok(all());
+    };
+
+    if let Some(&p) = selected
+        .iter()
+        .find(|&&p| p < 0 || p as usize >= partition_count)
+    {
+        return Err(format!(
+            "partition {p} is out of range; the topic has {partition_count}"
+        ));
+    }
+
+    let mut partitions = selected.to_vec();
+    partitions.sort_unstable();
+    partitions.dedup();
+    Ok(partitions)
+}
+
 // Активного pacing (намеренной паузы между раундами, чтобы не «занимать» из
 // брокерского токен-бакета) здесь больше нет — его пробовали и убрали.
 //
@@ -629,10 +741,10 @@ impl Worker {
         // одну проверку связи, и собирать для него JSON раз в секунду незачем.
         conf.set("statistics.interval.ms", STATS_INTERVAL_MS);
 
-        // Другой кластер — другая квота.
-        self.quota.reset();
+        let fatal = Arc::new(FatalError::default());
         let context = MeteredContext {
             meter: Arc::clone(&self.quota),
+            fatal: Arc::clone(&fatal),
         };
 
         let consumer: BaseConsumer<MeteredContext> = conf
@@ -642,24 +754,56 @@ impl Worker {
             .create_with_context(context)
             .map_err(|e| format!("can't create admin client: {e}"))?;
 
+        // Связь проверяется ДО того, как расстаться с прежним подключением.
+        //
+        // `create_with_context` не доказывает ровно ничего: librdkafka
+        // соединяется лениво, и клиент с заведомо неверным паролем создаётся
+        // так же успешно, как рабочий. Раньше на этом всё и заканчивалось —
+        // пользователь, переключившийся на учётку с опечаткой в пароле, терял
+        // рабочее подключение и открытый топик, а узнавал об этом секунд через
+        // десять, когда истекал таймаут следующего же запроса метаданных.
+        wait_until_ready(&consumer, &fatal)?;
+
+        // Другой кластер (или другая учётка) — другая квота. Сбрасываем только
+        // здесь: провалившееся подключение не должно стирать измерение
+        // работающего, которое после ошибки остаётся в силе.
+        self.quota.reset();
+
+        // Идущее чтение сворачивается ДО подмены клиента, а не после.
+        //
+        // `RawTopic`/`RawQueue` внутри `pending_read` — сырые указатели,
+        // выданные `rd_kafka_t*` ПРЕЖНЕГО консьюмера. Присваивание
+        // `self.consumer = Some(...)` уничтожает старого (`rd_kafka_destroy`),
+        // и всё, что после этого делает `close_topic` — `consume_stop`,
+        // `rd_kafka_topic_destroy`, `rd_kafka_queue_destroy` — уходит в уже
+        // освобождённую память.
+        //
+        // Раньше порядок был обратным. Подставлялось это редко (переподключение
+        // прямо во время чтения), но смена Kafka-пользователя — именно оно и
+        // есть, и делается на ходу, не дожидаясь конца загрузки.
+        self.close_topic();
+
         self.consumer = Some(consumer);
         self.admin = Some(admin);
         self.partition_counts.clear();
-        self.close_topic();
         Ok(())
     }
 
     fn test(payload: ClusterConnectPayload) -> Result<(), String> {
         let conf = get_cluster_config(&payload);
-        let consumer: BaseConsumer = conf
-            .create()
+        let fatal = Arc::new(FatalError::default());
+        // Свой измеритель, в общий не пишем: проверка связи — не чтение, и
+        // засчитывать её в измеренную скорость кластера нечего.
+        let context = MeteredContext {
+            meter: Arc::new(QuotaMeter::new()),
+            fatal: Arc::clone(&fatal),
+        };
+        let consumer: BaseConsumer<MeteredContext> = conf
+            .create_with_context(context)
             .map_err(|e| format!("can't create consumer: {e}"))?;
         // Создание клиента ещё ничего не доказывает — librdkafka соединяется
-        // лениво. Дёргаем метаданные, чтобы реально сходить в кластер.
-        consumer
-            .fetch_metadata(None, METADATA_TIMEOUT)
-            .map_err(|e| format!("can't reach cluster: {e}"))?;
-        Ok(())
+        // лениво. Ходим в кластер по-настоящему.
+        wait_until_ready(&consumer, &fatal)
     }
 
     fn disconnect(&mut self) {
@@ -711,13 +855,12 @@ impl Worker {
             return;
         }
 
-        let partitions: Vec<i32> = match params.partition {
-            Some(p) if p >= 0 && (p as usize) < partition_count => vec![p],
-            Some(p) => {
-                let _ = reply.send(Err(format!("partition {p} is out of range")));
+        let partitions = match selected_partitions(params.partitions.as_deref(), partition_count) {
+            Ok(partitions) => partitions,
+            Err(e) => {
+                let _ = reply.send(Err(e));
                 return;
             }
-            None => (0..partition_count as i32).collect(),
         };
 
         let (topic, queue) = match self.open_handles(&params.topic) {
@@ -729,7 +872,7 @@ impl Worker {
         };
 
         eprintln!(
-            "[open_topic] {} partitions={} start_from={:?} per_partition_limit={limit}",
+            "[open_topic] {} partitions={}/{partition_count} start_from={:?} per_partition_limit={limit}",
             params.topic,
             partitions.len(),
             params.start_from
@@ -1609,6 +1752,31 @@ mod tests {
             walk(cursor(0, 1000, OLDEST, 300), OLDEST, 250),
             vec![(0, 250), (250, 300)],
         );
+    }
+
+    #[test]
+    fn all_partitions_when_nothing_is_selected() {
+        assert_eq!(selected_partitions(None, 4).unwrap(), vec![0, 1, 2, 3]);
+        // Пустой список — то же самое: состояния «читать неоткуда» быть не должно.
+        assert_eq!(selected_partitions(Some(&[]), 3).unwrap(), vec![0, 1, 2]);
+    }
+
+    /// Дубликат означал бы `consume_start` по уже открытой партиции — ошибку
+    /// librdkafka на ровном месте.
+    #[test]
+    fn selection_is_sorted_and_deduplicated() {
+        assert_eq!(
+            selected_partitions(Some(&[5, 1, 5, 1, 3]), 8).unwrap(),
+            vec![1, 3, 5],
+        );
+    }
+
+    /// Топик сменился, а выбор партиций остался от прежнего — читать «партицию
+    /// 7» из двухпартиционного топика нельзя, и молчать об этом тоже.
+    #[test]
+    fn selection_outside_the_topic_is_rejected() {
+        assert!(selected_partitions(Some(&[0, 7]), 2).is_err());
+        assert!(selected_partitions(Some(&[-1]), 2).is_err());
     }
 
     #[test]

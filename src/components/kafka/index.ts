@@ -18,6 +18,8 @@ export { MessagesPanel } from './MessagesPanel';
 export { MessageDetailsModal } from './modals/MessageDetailsModal';
 export { TopicConfigModal } from './modals/TopicConfigModal';
 export { ClusterConfigModal } from './modals/ClusterConfigModal';
+export { ClusterArchiveModal } from './modals/ClusterArchiveModal';
+export { ClusterUsersModal } from './modals/ClusterUsersModal';
 export { FavoritesModal } from './modals/FavoritesModal';
 
 // Small Components

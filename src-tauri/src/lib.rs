@@ -4,20 +4,23 @@ mod config;
 mod helpers;
 mod kafka;
 
-use config::{ClusterConfig, Settings};
+use config::{ClusterConfig, ClusterUser, Settings};
 use kafka::*;
 
 /// Подставляет пароль из keychain, если фронт его не прислал.
 ///
-/// Для сохранённого кластера пароль вообще не пересекает границу IPC: фронт
-/// шлёт только идентификатор, а значение подтягивается здесь.
+/// Для сохранённой учётки пароль вообще не пересекает границу IPC: фронт шлёт
+/// только идентификатор пользователя, а значение подтягивается здесь.
 fn resolve_password(payload: &mut ClusterConnectPayload) -> Result<(), String> {
     let already_provided = payload.password.as_deref().is_some_and(|p| !p.is_empty());
     if already_provided {
         return Ok(());
     }
-    if let Some(id) = payload.id.clone() {
-        payload.password = config::secrets::read_password(&id)?;
+    // `id` как запасной ключ — ради записей, которые ещё не пережили миграцию
+    // на список пользователей: там ключом в keychain был идентификатор кластера.
+    let key = payload.user_id.clone().or_else(|| payload.id.clone());
+    if let Some(key) = key {
+        payload.password = config::secrets::read_password(&key)?;
     }
     Ok(())
 }
@@ -33,26 +36,38 @@ async fn cluster_connect(
 ) -> Result<(), String> {
     resolve_password(&mut payload)?;
     let id = payload.id.clone();
+    let user_id = payload.user_id.clone();
     worker
         .call(|reply| Command::Connect(payload, reply))
         .await??;
 
-    // Подключение удалось — отмечаем кластер как недавно использованный.
-    // Не критично, поэтому ошибку записи не поднимаем наверх.
+    // Подключение удалось — отмечаем кластер как недавно использованный и
+    // запоминаем учётку. Не критично, поэтому ошибку записи не поднимаем наверх.
     if let Some(id) = id {
-        if let Err(e) = touch_cluster(&app, &id) {
+        if let Err(e) = touch_cluster(&app, &id, user_id.as_deref()) {
             eprintln!("can't update last_used for cluster {id}: {e}");
         }
     }
     Ok(())
 }
 
-fn touch_cluster(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+/// Отмечает кластер использованным и запоминает, под кем подключились: иначе
+/// выбор пользователя не пережил бы перезапуск приложения.
+fn touch_cluster(
+    app: &tauri::AppHandle,
+    id: &str,
+    user_id: Option<&str>,
+) -> Result<(), String> {
     let mut clusters = config::load_clusters(app)?;
     let Some(cluster) = clusters.iter_mut().find(|c| c.id == id) else {
         return Ok(());
     };
     cluster.last_used = Some(chrono::Utc::now().to_rfc3339());
+    // Подключиться могли и из формы, руками введя логин, которого в списке нет
+    // — такой выбор запоминать нечем и незачем.
+    if let Some(user_id) = user_id.filter(|id| cluster.user(id).is_some()) {
+        cluster.active_user_id = Some(user_id.to_string());
+    }
     config::save_clusters(app, &clusters)
 }
 
@@ -70,37 +85,24 @@ async fn list_clusters(app: tauri::AppHandle) -> Result<Vec<ClusterConfig>, Stri
     config::load_clusters(&app)
 }
 
-/// Сохраняет подключение. Пароль трактуется трояко:
-///   `Some(непустой)` — записать в keychain;
-///   `Some("")`       — удалить из keychain;
-///   `None`           — не трогать то, что там уже лежит.
+/// Сохраняет параметры подключения.
+///
+/// Список учёток берётся из уже сохранённой записи, а не из присланной формы:
+/// пользователями заведуют `save_cluster_user`/`delete_cluster_user`, и
+/// разъехавшийся во вкладке список не должен молча затирать keychain.
 #[tauri::command]
 async fn save_cluster(
     app: tauri::AppHandle,
     cluster: ClusterConfig,
-    password: Option<String>,
 ) -> Result<ClusterConfig, String> {
     let mut cluster = cluster;
     let mut clusters = config::load_clusters(&app)?;
 
-    match password.as_deref() {
-        Some("") => {
-            config::secrets::delete_password(&cluster.id)?;
-            cluster.has_password = false;
-        }
-        Some(secret) => {
-            config::secrets::store_password(&cluster.id, secret)?;
-            cluster.has_password = true;
-        }
-        None => {
-            // Сохраняем прежний флаг: форма могла прийти без пароля просто
-            // потому, что пользователь его не менял.
-            cluster.has_password = clusters
-                .iter()
-                .find(|c| c.id == cluster.id)
-                .is_some_and(|c| c.has_password);
-        }
+    if let Some(existing) = clusters.iter().find(|c| c.id == cluster.id) {
+        cluster.users = existing.users.clone();
+        cluster.active_user_id = existing.active_user_id.clone();
     }
+    cluster.migrate();
 
     match clusters.iter_mut().find(|c| c.id == cluster.id) {
         Some(existing) => *existing = cluster.clone(),
@@ -114,10 +116,96 @@ async fn save_cluster(
 #[tauri::command]
 async fn delete_cluster(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let mut clusters = config::load_clusters(&app)?;
-    clusters.retain(|c| c.id != id);
+    let Some(position) = clusters.iter().position(|c| c.id == id) else {
+        return Ok(());
+    };
+    let removed = clusters.remove(position);
     config::save_clusters(&app, &clusters)?;
-    // Осиротевший пароль в keychain никому не нужен.
-    config::secrets::delete_password(&id)
+
+    // Осиротевшие пароли в keychain никому не нужны. Ошибку одной учётки не
+    // поднимаем наверх: кластер уже удалён, и падать после этого значило бы
+    // показать пользователю сбой на успешной операции.
+    for user in &removed.users {
+        if let Err(e) = config::secrets::delete_password(&user.id) {
+            eprintln!("can't delete password of user {}: {e}", user.id);
+        }
+    }
+    Ok(())
+}
+
+/// Заводит или обновляет Kafka-пользователя кластера. Пароль трактуется трояко:
+///   `Some(непустой)` — записать в keychain;
+///   `Some("")`       — удалить из keychain;
+///   `None`           — не трогать то, что там уже лежит.
+///
+/// `activate` — сделать эту учётку текущей для кластера. Заведение ещё одного
+/// логина само по себе текущего не меняет (иначе список пользователей уводил бы
+/// подключение из-под ног), а вот выбор учётки в настройках подключения — как
+/// раз меняет, и должен пережить неудачную попытку подключиться.
+#[tauri::command]
+async fn save_cluster_user(
+    app: tauri::AppHandle,
+    cluster_id: String,
+    user: ClusterUser,
+    password: Option<String>,
+    activate: Option<bool>,
+) -> Result<ClusterConfig, String> {
+    let mut user = user;
+    let mut clusters = config::load_clusters(&app)?;
+    let cluster = clusters
+        .iter_mut()
+        .find(|c| c.id == cluster_id)
+        .ok_or_else(|| format!("unknown cluster {cluster_id}"))?;
+
+    match password.as_deref() {
+        Some("") => {
+            config::secrets::delete_password(&user.id)?;
+            user.has_password = false;
+        }
+        Some(secret) => {
+            config::secrets::store_password(&user.id, secret)?;
+            user.has_password = true;
+        }
+        // Форма могла прийти без пароля просто потому, что его не меняли.
+        None => user.has_password = cluster.user(&user.id).is_some_and(|u| u.has_password),
+    }
+
+    match cluster.users.iter_mut().find(|u| u.id == user.id) {
+        Some(existing) => *existing = user.clone(),
+        None => cluster.users.push(user.clone()),
+    }
+    // Первая заведённая учётка становится текущей — иначе подключаться было бы
+    // не под кем, пока пользователь не выберет её руками.
+    if activate.unwrap_or(false) || cluster.active_user_id.is_none() {
+        cluster.active_user_id = Some(user.id);
+    }
+
+    let updated = cluster.clone();
+    config::save_clusters(&app, &clusters)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn delete_cluster_user(
+    app: tauri::AppHandle,
+    cluster_id: String,
+    user_id: String,
+) -> Result<ClusterConfig, String> {
+    let mut clusters = config::load_clusters(&app)?;
+    let cluster = clusters
+        .iter_mut()
+        .find(|c| c.id == cluster_id)
+        .ok_or_else(|| format!("unknown cluster {cluster_id}"))?;
+
+    cluster.users.retain(|u| u.id != user_id);
+    if cluster.active_user_id.as_deref() == Some(user_id.as_str()) {
+        cluster.active_user_id = cluster.users.first().map(|u| u.id.clone());
+    }
+
+    let updated = cluster.clone();
+    config::save_clusters(&app, &clusters)?;
+    config::secrets::delete_password(&user_id)?;
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -236,6 +324,8 @@ pub fn run() {
             list_clusters,
             save_cluster,
             delete_cluster,
+            save_cluster_user,
+            delete_cluster_user,
             get_settings,
             save_settings,
             get_topics,

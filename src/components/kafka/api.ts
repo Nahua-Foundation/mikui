@@ -8,6 +8,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import {
   ClusterConnectPayload,
+  ClusterUser,
   FullMessage,
   KafkaCluster,
   LoadMoreParams,
@@ -22,16 +23,32 @@ import {
 
 // --- Подключение ------------------------------------------------------------
 
-/** Payload для сохранённого кластера: пароль не передаём, Rust возьмёт его из keychain. */
-export function clusterToPayload(cluster: KafkaCluster): ClusterConnectPayload {
+/**
+ * Payload для сохранённого кластера: пароль не передаём, Rust возьмёт его из
+ * keychain по `user_id`.
+ */
+export function clusterToPayload(
+  cluster: KafkaCluster,
+  user?: ClusterUser | null,
+): ClusterConnectPayload {
   return {
     id: cluster.id,
+    user_id: user?.id,
     brokers: cluster.brokers,
     security_protocol: cluster.security_protocol,
     sasl_mechanism: cluster.sasl_mechanism,
-    username: cluster.username,
+    username: user?.username,
     ssl_ca_bundle_path: cluster.ssl_ca_bundle_path,
   };
+}
+
+/**
+ * Под кем подключаться к кластеру: та учётка, что использовалась в прошлый раз,
+ * иначе первая известная. `null` — логинов нет вовсе (PLAINTEXT-кластер).
+ */
+export function activeUser(cluster: KafkaCluster): ClusterUser | null {
+  const users = cluster.users ?? [];
+  return users.find((u) => u.id === cluster.active_user_id) ?? users[0] ?? null;
 }
 
 export const clusterConnect = (payload: ClusterConnectPayload) =>
@@ -49,13 +66,32 @@ export const saslMechanisms = () => invoke<string[]>('sasl_mechanisms');
 export const listClusters = () => invoke<KafkaCluster[]>('list_clusters');
 
 /**
- * `password`: непустая строка — записать в keychain; пустая — удалить оттуда;
- * `undefined` — не трогать сохранённый.
+ * Сохраняет параметры подключения. Список пользователей бэкенд берёт из уже
+ * сохранённой записи, а не отсюда: им заведуют `saveClusterUser`/`deleteClusterUser`.
  */
-export const saveCluster = (cluster: KafkaCluster, password?: string) =>
-  invoke<KafkaCluster>('save_cluster', { cluster, password });
+export const saveCluster = (cluster: KafkaCluster) =>
+  invoke<KafkaCluster>('save_cluster', { cluster });
 
 export const deleteCluster = (id: string) => invoke<void>('delete_cluster', { id });
+
+// --- Kafka-пользователи кластера --------------------------------------------
+
+/**
+ * `password`: непустая строка — записать в keychain; пустая — удалить оттуда;
+ * `undefined` — не трогать сохранённый. Возвращает кластер целиком.
+ *
+ * `activate` — сделать учётку текущей для кластера. Нужно там, где логин
+ * ВЫБИРАЮТ (настройки подключения), и не нужно там, где его просто заводят.
+ */
+export const saveClusterUser = (
+  clusterId: string,
+  user: ClusterUser,
+  password?: string,
+  activate?: boolean,
+) => invoke<KafkaCluster>('save_cluster_user', { clusterId, user, password, activate });
+
+export const deleteClusterUser = (clusterId: string, userId: string) =>
+  invoke<KafkaCluster>('delete_cluster_user', { clusterId, userId });
 
 // --- Настройки --------------------------------------------------------------
 
@@ -70,7 +106,8 @@ export const openTopic = (params: {
   topic: string;
   start_from: StartFrom;
   limit: number;
-  partition: number | null;
+  /** null — все партиции топика. */
+  partitions: number[] | null;
   filter: MessageFilter;
 }) => invoke<OpenTopicResult>('open_topic', { params });
 

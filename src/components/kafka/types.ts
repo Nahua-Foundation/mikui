@@ -105,11 +105,26 @@ export interface OpenTopicProgress extends QuotaInfo {
 }
 
 /**
+ * Kafka-пользователь кластера.
+ *
+ * Один кластер обычно смотрят из-под нескольких учёток с разными ACL, поэтому
+ * логины живут списком, а переключение между ними — обычная операция в шапке,
+ * а не перенастройка подключения.
+ *
+ * Пароля здесь нет намеренно: он живёт в системном keychain под ключом `id`.
+ * `has_password` — признак того, что пароль там есть, а не сам пароль.
+ */
+export interface ClusterUser {
+  id: string;
+  username: string;
+  has_password: boolean;
+}
+
+/**
  * Сохранённое подключение — ровно то, что лежит в clusters.json.
  *
- * Поля пароля здесь нет намеренно: он живёт в системном keychain, и при
- * подключении к сохранённому кластеру фронт передаёт только `id`.
- * `has_password` — признак того, что пароль там есть, а не сам пароль.
+ * Ни пароля, ни логина в самом кластере нет: логины — в `users`, пароли —
+ * в keychain. При подключении фронт передаёт только идентификаторы.
  */
 export interface KafkaCluster {
   id: string;
@@ -117,22 +132,43 @@ export interface KafkaCluster {
   brokers: string;
   security_protocol: string;
   sasl_mechanism?: string;
-  username?: string;
   ssl_ca_bundle_path?: string;
   created_at: string;
   last_used?: string;
-  has_password: boolean;
+  users: ClusterUser[];
+  /** Под кем подключались в прошлый раз — с него и начинаем следующий раз. */
+  active_user_id?: string;
 }
 
-/** Параметры подключения. `password` заполняется только для несохранённой формы. */
+/**
+ * Параметры подключения.
+ *
+ * `user_id` — сохранённая учётка: пароль подтянет Rust из keychain, через IPC
+ * он не поедет. `password` заполняется только для несохранённой формы.
+ */
 export interface ClusterConnectPayload {
   id?: string;
+  user_id?: string;
   brokers: string;
   security_protocol: string;
   sasl_mechanism?: string;
   username?: string;
   password?: string;
   ssl_ca_bundle_path?: string;
+}
+
+/** Требуют ли выбранные настройки безопасности SASL-логина. */
+export function needsSasl(securityProtocol: string): boolean {
+  return securityProtocol === 'SASL_PLAINTEXT' || securityProtocol === 'SASL_SSL';
+}
+
+/**
+ * Идентификатор кластера или учётки. У учётки он же служит ключом пароля в
+ * keychain, поэтому уникален и неизменен: переименование пользователя не
+ * должно осиротить его пароль.
+ */
+export function newId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /** Файл настроек. Своих полей пока нет — see config/types.rs. */
