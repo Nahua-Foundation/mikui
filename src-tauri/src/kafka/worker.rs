@@ -66,6 +66,8 @@ use rdkafka::admin::AdminClient;
 use rdkafka::client::ClientContext;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use rdkafka::topic_partition_list::TopicPartitionList;
+use rdkafka::Offset;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::statistics::Statistics;
 use rdkafka::types::RDKafkaRespErr;
@@ -206,6 +208,72 @@ fn is_fatal(error: &KafkaError) -> bool {
         KafkaError::Global(RDKafkaErrorCode::Authentication)
             | KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed)
     )
+}
+
+/// Пересечение границ партиции `[low, high)` с запрошенным диапазоном.
+/// `to` — exclusive, как и `high`.
+///
+/// Пустой результат сам по себе не ошибка: в соседней партиции такие офсеты
+/// вполне могут быть, и решает это вызывающий, посмотрев сразу на все.
+fn intersect(low: i64, high: i64, from: Option<i64>, to: Option<i64>) -> (i64, i64) {
+    let start = from.map_or(low, |f| f.max(low));
+    let end = to.map_or(high, |t| t.min(high)).max(start);
+    (start, end)
+}
+
+/// Верхняя граница, названная человеком, — inclusive; внутри всё считается
+/// полуинтервалами. `saturating_add` здесь не педантизм: `to` приходит из поля
+/// ввода и вполне может оказаться `i64::MAX`, а переполнение превратило бы
+/// границу в отрицательную и молча отдало бы пустоту вместо хвоста партиции.
+fn exclusive(inclusive: Option<i64>) -> Option<i64> {
+    inclusive.map(|v| v.saturating_add(1))
+}
+
+/// Офсет, найденный по времени, либо `fallback`, если такого момента в
+/// партиции нет.
+fn resolved(found: &HashMap<i32, i64>, partition: i32, fallback: i64) -> i64 {
+    found.get(&partition).copied().unwrap_or(fallback)
+}
+
+/// Границы, названные человеком, должны быть согласованы между собой — иначе
+/// чтение молча вернёт пустоту вместо внятного «начало позже конца».
+fn validate_range(range: &ReadRange) -> Result<(), String> {
+    if let (Some(from), Some(to)) = (range.from_offset, range.to_offset) {
+        if from > to {
+            return Err(format!("offset {from} is after {to}"));
+        }
+    }
+    if let (Some(from), Some(to)) = (range.from_timestamp, range.to_timestamp) {
+        if from > to {
+            return Err("the start of the time range is after its end".into());
+        }
+    }
+    if range.from_offset.is_some_and(|o| o < 0) || range.to_offset.is_some_and(|o| o < 0) {
+        return Err("offsets cannot be negative".into());
+    }
+    Ok(())
+}
+
+/// Человекочитаемые границы партиций — для сообщения о том, что запрошенный
+/// диапазон в топик не попал.
+fn describe_bounds(cursors: &HashMap<i32, PartitionCursor>) -> String {
+    let mut parts: Vec<(i32, String)> = cursors
+        .iter()
+        .map(|(&p, c)| {
+            let what = if c.low >= c.high {
+                "is empty".to_string()
+            } else {
+                format!("holds {}..{}", c.low, c.high - 1)
+            };
+            (p, format!("partition {p} {what}"))
+        })
+        .collect();
+    parts.sort_by_key(|(p, _)| *p);
+    parts
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Ждёт, пока кластер либо ответит метаданными, либо откажет так, что ждать
@@ -611,6 +679,10 @@ struct PendingRead {
     /// Стартовый бюджет партиции. Нужен только в фазе `Watermarks`: курсоров,
     /// которым его можно проставить, до неё ещё не существует.
     budget: i64,
+    /// Запрошенные границы. Живут в чтении, а не в воркере: применяются они
+    /// ровно один раз, сразу после watermarks, и дальше уже вшиты в курсоры —
+    /// поэтому `load_more` за диапазон не выходит, ничего о нём не зная.
+    range: ReadRange,
 }
 
 struct Worker {
@@ -863,6 +935,11 @@ impl Worker {
             }
         };
 
+        if let Err(e) = validate_range(&params.range) {
+            let _ = reply.send(Err(e));
+            return;
+        }
+
         let (topic, queue) = match self.open_handles(&params.topic) {
             Ok(pair) => pair,
             Err(e) => {
@@ -872,15 +949,16 @@ impl Worker {
         };
 
         eprintln!(
-            "[open_topic] {} partitions={}/{partition_count} start_from={:?} per_partition_limit={limit}",
+            "[open_topic] {} partitions={}/{partition_count} start_from={:?} range={:?} per_partition_limit={limit}",
             params.topic,
             partitions.len(),
-            params.start_from
+            params.start_from,
+            params.range,
         );
 
         self.store.clear();
         self.filter = params.filter;
-        self.newest_first = params.start_from == StartFrom::Newest;
+        self.newest_first = params.range.newest_first(params.start_from);
         self.open_topic = Some(params.topic.clone());
         self.cursors.clear();
         // Скорость кластера измерителю переносить между топиками можно, а вот
@@ -906,6 +984,7 @@ impl Worker {
             round_mark: 0,
             round_mark_bytes: 0,
             budget: limit,
+            range: params.range,
         });
 
         let _ = self.tx.send(Command::ContinueRead);
@@ -962,6 +1041,9 @@ impl Worker {
             round_mark: self.store.len(),
             round_mark_bytes: self.store.byte_size(),
             budget: additional,
+            // Диапазон уже вшит в границы курсоров — здесь его применять
+            // повторно нечему и незачем.
+            range: ReadRange::default(),
         };
         self.begin_round(pending);
     }
@@ -1137,10 +1219,122 @@ impl Worker {
             pending.topic_name,
             pending.started.elapsed()
         );
+
+        // Границы сняты — теперь их можно сузить до запрошенного диапазона.
+        // Отдельным шагом, а не по ходу снятия: границы по времени известны
+        // только целиком, `offsets_for_times` спрашивается одним запросом на
+        // все партиции сразу, и до его ответа резать нечего.
+        if let Err(e) = self.apply_range(&pending) {
+            Self::stop_all(&pending);
+            let _ = pending.reply.send(Err(e));
+            return;
+        }
+
         pending.phase = ReadPhase::Reading(HashMap::new());
         pending.round_mark = self.store.len();
         pending.round_mark_bytes = self.store.byte_size();
         self.begin_round(pending);
+    }
+
+    /// Сужает уже снятые границы партиций до запрошенного диапазона.
+    ///
+    /// После этого о диапазоне не знает больше никто: окна, бюджеты, признак
+    /// «дочитано», `load_more` — всё работает с `[low, high)` курсора и потому
+    /// за диапазон не выходит по построению, а не по проверке в каждой ветке.
+    fn apply_range(&mut self, pending: &PendingRead) -> Result<(), String> {
+        let range = pending.range;
+        if range.is_empty() {
+            return Ok(());
+        }
+
+        // Время → офсеты. Ищет брокер: `ListOffsets` по времени возвращает
+        // первый офсет со временем не раньше запрошенного, так что городить
+        // поверх этого бинарный поиск по офсетам незачем.
+        let by_time = range.by_timestamp();
+        let from_at = self.offsets_at(&pending.topic_name, range.from_timestamp)?;
+        // Верхняя граница inclusive, а exclusive конец диапазона — это первое
+        // сообщение ПОСЛЕ неё: спрашиваем на миллисекунду позже.
+        let to_at = self.offsets_at(&pending.topic_name, exclusive(range.to_timestamp))?;
+
+        // Считаем всё до единой записи в курсоры: если диапазон окажется
+        // пустым, сообщение об этом должно опираться на настоящие границы
+        // партиций, а не на уже урезанные.
+        let computed: Vec<(i32, i64, i64)> = self
+            .cursors
+            .iter()
+            .map(|(&p, c)| {
+                let (from, to) = if by_time {
+                    (
+                        // Момента нет в партиции — значит всё, что в ней есть,
+                        // старше запрошенного начала, и брать нечего.
+                        range.from_timestamp.map(|_| resolved(&from_at, p, c.high)),
+                        // А вот отсутствие ВЕРХНЕЙ границы значит обратное:
+                        // после неё сообщений нет, и читать надо до конца.
+                        range.to_timestamp.map(|_| resolved(&to_at, p, c.high)),
+                    )
+                } else {
+                    (range.from_offset, exclusive(range.to_offset))
+                };
+                let (low, high) = intersect(c.low, c.high, from, to);
+                (p, low, high)
+            })
+            .collect();
+
+        if computed.iter().all(|&(_, low, high)| low >= high) {
+            return Err(if by_time {
+                format!(
+                    "no messages in the selected time range ({})",
+                    describe_bounds(&self.cursors)
+                )
+            } else {
+                format!(
+                    "the selected offset range is outside the topic ({})",
+                    describe_bounds(&self.cursors)
+                )
+            });
+        }
+
+        let newest_first = self.newest_first;
+        for (p, low, high) in computed {
+            let Some(cursor) = self.cursors.get_mut(&p) else {
+                continue;
+            };
+            cursor.low = low;
+            cursor.high = high;
+            cursor.next = if newest_first { high } else { low };
+            cursor.exhausted = low >= high;
+        }
+        Ok(())
+    }
+
+    /// С какого офсета начинается указанный момент времени, по партициям.
+    /// Пустая карта — момент не задан.
+    fn offsets_at(&self, topic: &str, at: Option<i64>) -> Result<HashMap<i32, i64>, String> {
+        let Some(at) = at else {
+            return Ok(HashMap::new());
+        };
+        let consumer = self.consumer.as_ref().ok_or("not connected to a cluster")?;
+
+        let mut request = TopicPartitionList::new();
+        for &p in self.cursors.keys() {
+            request
+                .add_partition_offset(topic, p, Offset::Offset(at))
+                .map_err(|e| format!("can't build a timestamp lookup: {e}"))?;
+        }
+
+        let resolved = consumer
+            .offsets_for_times(request, WATERMARK_TIMEOUT)
+            .map_err(|e| format!("can't look up offsets by time: {e}"))?;
+
+        Ok(resolved
+            .elements()
+            .iter()
+            // Отрицательный офсет — это `RD_KAFKA_OFFSET_END`: сообщений не
+            // раньше запрошенного момента в партиции нет. Значение отбрасываем,
+            // а что оно означает, решает вызывающий: для нижней границы это
+            // «брать нечего», для верхней — «читать до конца».
+            .filter_map(|e| e.offset().to_raw().filter(|o| *o >= 0).map(|o| (e.partition(), o)))
+            .collect())
     }
 
     /// Нарезает окна очередного раунда и запускает по ним чтение.
@@ -1469,6 +1663,7 @@ impl Worker {
             total: self.view.len(),
             loaded: self.store.committed_len(),
             buffer_bytes: self.store.byte_size(),
+            memory: self.memory_usage(),
             truncated,
             quota: self.quota_info(),
         }));
@@ -1545,8 +1740,16 @@ impl Worker {
             Some(est) => QuotaInfo {
                 read_bytes_per_sec: Some(est.bytes_per_sec as u64),
                 peak_throttle_ms: est.peak_throttle.as_millis() as u64,
+                active_brokers: est.brokers,
             },
             None => QuotaInfo::default(),
+        }
+    }
+
+    fn memory_usage(&self) -> MemoryUsage {
+        MemoryUsage {
+            memory_bytes: self.store.memory_bytes(),
+            memory_limit: self.store.max_bytes(),
         }
     }
 
@@ -1555,6 +1758,7 @@ impl Worker {
             topic: self.open_topic.clone(),
             quota: self.quota_info(),
             buffer_bytes: self.store.byte_size(),
+            memory: self.memory_usage(),
             loaded: self.store.committed_len(),
             total: self.view.len(),
             truncated: self.pending_read.is_some(),
@@ -1779,6 +1983,87 @@ mod tests {
         assert!(selected_partitions(Some(&[-1]), 2).is_err());
     }
 
+    /// Границы вводит человек и вводит их inclusive; внутри всё считается
+    /// полуинтервалами. Съехать здесь на единицу — значит потерять ровно то
+    /// сообщение, ради которого диапазон и задавали.
+    #[test]
+    fn an_inclusive_upper_bound_keeps_the_message_it_names() {
+        // Партиция 100..1000, просим 200..300 включительно.
+        assert_eq!(
+            intersect(100, 1000, Some(200), exclusive(Some(300))),
+            (200, 301),
+        );
+    }
+
+    #[test]
+    fn range_is_clipped_to_what_the_partition_actually_holds() {
+        // Начало раньше retention — читаем с реального начала.
+        assert_eq!(intersect(100, 1000, Some(0), None), (100, 1000));
+        // Конец за горизонтом — читаем до реального конца.
+        assert_eq!(intersect(100, 1000, None, exclusive(Some(i64::MAX))), (100, 1000));
+        // Диапазон целиком мимо партиции — пусто, но без паники и переполнений.
+        assert_eq!(intersect(100, 1000, Some(5000), None), (5000, 5000));
+        assert_eq!(intersect(100, 1000, None, exclusive(Some(10))), (100, 100));
+    }
+
+    /// Названа только верхняя граница — пользователь указал точку, ОТ которой
+    /// смотрит назад, и порядок должен быть по убыванию.
+    #[test]
+    fn only_an_upper_bound_reads_backwards() {
+        let to_only = ReadRange {
+            to_offset: Some(500),
+            ..ReadRange::default()
+        };
+        assert!(to_only.newest_first(StartFrom::Oldest));
+
+        let from_only = ReadRange {
+            from_offset: Some(500),
+            ..ReadRange::default()
+        };
+        assert!(!from_only.newest_first(StartFrom::Newest));
+
+        let both = ReadRange {
+            from_offset: Some(1),
+            to_offset: Some(500),
+            ..ReadRange::default()
+        };
+        assert!(!both.newest_first(StartFrom::Newest));
+
+        // Границ нет — решает селектор.
+        let none = ReadRange::default();
+        assert!(none.newest_first(StartFrom::Newest));
+        assert!(!none.newest_first(StartFrom::Oldest));
+    }
+
+    /// Перевёрнутый диапазон вернул бы пустую таблицу без единого намёка на
+    /// причину — а причина здесь целиком во введённом.
+    #[test]
+    fn inverted_bounds_are_rejected_with_a_reason() {
+        assert!(validate_range(&ReadRange {
+            from_offset: Some(500),
+            to_offset: Some(100),
+            ..ReadRange::default()
+        })
+        .is_err());
+        assert!(validate_range(&ReadRange {
+            from_timestamp: Some(2),
+            to_timestamp: Some(1),
+            ..ReadRange::default()
+        })
+        .is_err());
+        assert!(validate_range(&ReadRange {
+            from_offset: Some(-1),
+            ..ReadRange::default()
+        })
+        .is_err());
+        assert!(validate_range(&ReadRange {
+            from_offset: Some(100),
+            to_offset: Some(100),
+            ..ReadRange::default()
+        })
+        .is_ok());
+    }
+
     #[test]
     fn empty_partition_yields_no_windows() {
         assert!(walk(cursor(0, 0, NEWEST, 1000), NEWEST, 250).is_empty());
@@ -1831,6 +2116,7 @@ mod tests {
             bytes_per_sec,
             bytes_per_offset,
             peak_throttle: Duration::ZERO,
+            brokers: 1,
         })
     }
 

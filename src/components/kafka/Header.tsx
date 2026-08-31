@@ -1,15 +1,4 @@
-import {
-  ArrowDown,
-  ArrowUp,
-  ChevronDown,
-  Filter,
-  RefreshCw,
-  Play,
-  Folder,
-  Search,
-  User,
-  Users,
-} from 'lucide-react';
+import { ChevronDown, Filter, RefreshCw, Play, Folder, Search, User, Users } from 'lucide-react';
 import { Button } from '../ui/button';
 import {
   DropdownMenu,
@@ -27,21 +16,14 @@ import {
   ClusterUser,
   KafkaCluster,
   MessageFilter,
-  OpenTopicResult,
-  StartFrom,
+  ReadMode,
+  ReadRange,
   EMPTY_FILTER,
   needsSasl,
 } from './types';
 import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
-
-/** Направление чтения — оно же порядок строк в таблице. Подпись объясняет
- *  не только «с какого конца», но и что будет догружаться дальше: именно это
- *  и определяет, куда поедет список во время фоновой подгрузки. */
-const START_FROM_OPTIONS: { value: StartFrom; label: string; hint: string }[] = [
-  { value: 'newest', label: 'newest first', hint: 'самые новые сверху, старые догружаются вниз' },
-  { value: 'oldest', label: 'oldest first', hint: 'самые старые сверху, новые догружаются вниз' },
-];
+import { ReadOrder } from './components/ReadOrder';
 
 /** Со скольки выбранных партиций перечисление перестаёт помещаться в шапку. */
 const PARTITIONS_SHOWN_INLINE = 3;
@@ -50,8 +32,9 @@ interface HeaderDesktopProps {
   /** null — читаем все партиции топика. */
   selectedPartitions: number[] | null;
   onSelectPartitions: (partitions: number[] | null) => void;
-  startFrom: StartFrom;
-  onStartFromChange: (startFrom: StartFrom) => void;
+  readMode: ReadMode;
+  range: ReadRange;
+  onReadChange: (mode: ReadMode, range: ReadRange) => void;
   topic: Topic | null;
   /**
    * Как называется то, к чему подключены. null — ни к чему. Отдельно от
@@ -72,13 +55,6 @@ interface HeaderDesktopProps {
   onFiltersChange: (filters: MessageFilter) => void;
   onRefresh: () => void;
   onOpenFavorites: () => void;
-  stats: OpenTopicResult | null;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**
@@ -106,11 +82,20 @@ function partitionsLabel(selected: number[] | null, total: number): string {
   return `${selected.length} of ${total}`;
 }
 
+/** Полный перечень — в подсказке, когда в подпись он не уложился. */
+function partitionsTitle(selected: number[] | null, total: number): string {
+  if (!selected || selected.length === 0 || selected.length === total) {
+    return `All ${total} partitions`;
+  }
+  return `Partitions ${selected.join(', ')}`;
+}
+
 export function HeaderDesktop({
   selectedPartitions,
   onSelectPartitions,
-  startFrom,
-  onStartFromChange,
+  readMode,
+  range,
+  onReadChange,
   topic,
   clusterName,
   cluster,
@@ -123,7 +108,6 @@ export function HeaderDesktop({
   onFiltersChange,
   onRefresh,
   onOpenFavorites,
-  stats,
 }: HeaderDesktopProps) {
   const partitions = topic ? Array.from({ length: topic.partitions }, (_, i) => i) : [];
   const hasActiveFilters = filters.key.trim() !== '' || filters.value.trim() !== '';
@@ -179,13 +163,15 @@ export function HeaderDesktop({
           {showUsers && cluster && (
             <MenuItem>
               <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
+                {/* Мельче названия кластера: кластер — это «где я», а учётка
+                    — уточнение к нему, и спорить с ним за внимание ей незачем. */}
                 <DropdownMenu>
-                  <DropdownMenuTrigger className="font-mono font-[450] text-[16px] text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-2 flex items-center border-none outline-none cursor-pointer">
-                    <User className="size-4" />
+                  <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-center border-none outline-none cursor-pointer">
+                    <User className="size-3.5" />
                     <span className={activeUser ? '' : 'text-dim'}>
                       {activeUser ? activeUser.username : 'no user'}
                     </span>
-                    <ChevronDown className="size-4" />
+                    <ChevronDown className="size-3.5" />
                   </DropdownMenuTrigger>
                   <DropdownMenuContent
                     className="bg-surface border-edge min-w-56 max-h-80 overflow-auto"
@@ -228,36 +214,18 @@ export function HeaderDesktop({
             </MenuItem>
           )}
 
-          {/* Сколько лежит в буфере Rust. Приложение обещает быть экономным —
-              пусть цифра будет на виду, а не на словах. */}
-          {stats && (
-            <div className="px-4 font-mono text-xs text-dim whitespace-nowrap">
-              {stats.loaded.toLocaleString()} msg · {formatBytes(stats.buffer_bytes)}
-              {stats.truncated && <span className="text-brand"> · truncated</span>}
-              {/* Скорость, которую даёт кластер. Без неё медленная загрузка
-                  неотличима от зависшего приложения — а на кластере с квотой
-                  на чтение она медленная всегда. */}
-              {stats.read_bytes_per_sec !== null && (
-                <span title="Read throughput the cluster actually allows">
-                  {' '}
-                  · {formatBytes(stats.read_bytes_per_sec)}/s
-                </span>
-              )}
-              {stats.peak_throttle_ms > 0 && (
-                <span
-                  className="text-brand"
-                  title={`The broker held responses back for up to ${stats.peak_throttle_ms} ms — a read quota is in effect`}
-                >
-                  {' '}
-                  · throttled
-                </span>
-              )}
-            </div>
-          )}
+          {/* Счётчиков буфера, скорости и throttled здесь больше нет — они
+              переехали в полоску под таблицей (`StatusBar`). Это фоновые
+              сведения: смотреть на них постоянно не нужно, а места крупным
+              шрифтом они занимали столько, что шапка перестала вмещать
+              собственные селекторы. */}
         </div>
       </div>
 
       <div className="box-border content-stretch flex flex-row items-center justify-start p-0 relative shrink-0">
+        {/* Фильтры живут кнопкой ВНУТРИ поля поиска, а не отдельным пунктом
+            рядом: поиск по телу сообщения — это уже фильтр, и разносить их по
+            двум местам значило бы занимать шапку дважды под одно и то же. */}
         {topic && (
           <MenuItem>
             <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
@@ -269,56 +237,105 @@ export function HeaderDesktop({
                   value={filters.value}
                   onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
                   placeholder="Search in messages"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8 w-64"
+                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8 pr-9 w-64"
                 />
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    title="Filters"
+                    className={`absolute right-2 top-1/2 -translate-y-1/2 bg-transparent border-none outline-none cursor-pointer p-0 transition-colors ${
+                      hasActiveFilters ? 'text-brand' : 'text-dim hover:text-slate-50'
+                    }`}
+                  >
+                    <Filter className="size-4" />
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent className="bg-surface border-edge min-w-80 p-4" align="end">
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <Label className="font-mono text-sm text-soft">Key</Label>
+                        <Input
+                          value={filters.key}
+                          onChange={(e) => onFiltersChange({ ...filters, key: e.target.value })}
+                          placeholder="Filter by key..."
+                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="font-mono text-sm text-soft">Message</Label>
+                        <Input
+                          value={filters.value}
+                          onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
+                          placeholder="Filter by message content..."
+                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          id="case-sensitive"
+                          checked={filters.case_sensitive}
+                          onCheckedChange={(checked) =>
+                            onFiltersChange({ ...filters, case_sensitive: checked === true })
+                          }
+                        />
+                        <Label
+                          htmlFor="case-sensitive"
+                          className="font-mono text-sm text-soft cursor-pointer"
+                        >
+                          Case sensitive
+                        </Label>
+                      </div>
+                      <div className="flex gap-2 pt-2">
+                        <Button
+                          onClick={() => onFiltersChange(EMPTY_FILTER)}
+                          variant="outline"
+                          size="sm"
+                          className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                        >
+                          Clear
+                        </Button>
+                      </div>
+                    </div>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
             </div>
           </MenuItem>
         )}
 
-        {/* Направление чтения. Не косметика: топик перечитывается с другого
-            конца, поэтому селектор стоит рядом с партициями, а не в фильтрах. */}
+        {/* Порядок и границы чтения. Не косметика: топик перечитывается с
+            другого конца или по другому куску, поэтому селектор стоит рядом с
+            партициями, а не в фильтрах. */}
         {topic && (
           <MenuItem>
             <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-8 py-4 relative shrink-0">
-              <DropdownMenu>
-                <DropdownMenuTrigger className="font-mono font-[450] text-[16px] text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-2 flex items-center border-none outline-none cursor-pointer">
-                  {startFrom === 'newest' ? (
-                    <ArrowDown className="size-4" />
-                  ) : (
-                    <ArrowUp className="size-4" />
-                  )}
-                  <span>{startFrom === 'newest' ? 'newest first' : 'oldest first'}</span>
-                  <ChevronDown className="size-4" />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent className="bg-surface border-edge min-w-72" align="end">
-                  {START_FROM_OPTIONS.map((option) => (
-                    <DropdownMenuItem
-                      key={option.value}
-                      className={`font-mono cursor-pointer flex-col items-start gap-0.5 ${
-                        startFrom === option.value
-                          ? 'bg-edge text-slate-50'
-                          : 'text-soft hover:bg-edge hover:text-slate-50'
-                      }`}
-                      onClick={() => onStartFromChange(option.value)}
-                    >
-                      <span>{option.label}</span>
-                      <span className="text-xs text-dim">{option.hint}</span>
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <ReadOrder
+                mode={readMode}
+                range={range}
+                singlePartition={selectedPartitions?.length === 1}
+                onChange={onReadChange}
+              />
             </div>
           </MenuItem>
         )}
 
         {topic && (
           <MenuItem>
-            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-8 py-4 relative shrink-0">
+            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-6 py-4 relative shrink-0">
+              {/* Два уровня, а не «partitions: 0, 2, 5» в строку: перечисление
+                  растёт с числом выбранных, и одной строкой оно раздувало шапку
+                  до того, что переставало в неё влезать. Подпись сверху
+                  постоянной ширины, значение под ней. */}
               <DropdownMenu>
-                <DropdownMenuTrigger className="font-mono font-[450] text-[16px] text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-2 flex items-center border-none outline-none cursor-pointer">
-                  <span>partitions: {partitionsLabel(selectedPartitions, partitions.length)}</span>
-                  <ChevronDown className="size-4" />
+                <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
+                  <div className="flex flex-col items-start leading-tight">
+                    <span className="text-dim">partitions</span>
+                    <span
+                      className="text-soft max-w-40 truncate"
+                      title={partitionsTitle(selectedPartitions, partitions.length)}
+                    >
+                      {partitionsLabel(selectedPartitions, partitions.length)}
+                    </span>
+                  </div>
+                  <ChevronDown className="size-3.5 mt-0.5" />
                 </DropdownMenuTrigger>
                 {/* Меню не закрывается по клику (`onSelect` гасится): выбрать
                     три партиции из двадцати, открывая список заново на каждую,
@@ -355,68 +372,6 @@ export function HeaderDesktop({
                       </DropdownMenuCheckboxItem>
                     );
                   })}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </MenuItem>
-        )}
-
-        {topic && (
-          <MenuItem>
-            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-8 py-4 relative shrink-0">
-              <DropdownMenu>
-                <DropdownMenuTrigger
-                  className={`font-mono font-[450] text-[16px] hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-2 flex items-center border-none outline-none cursor-pointer ${
-                    hasActiveFilters ? 'text-brand' : 'text-soft'
-                  }`}
-                >
-                  <Filter className="size-4" />
-                  <span>filters</span>
-                  <ChevronDown className="size-4" />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent className="bg-surface border-edge min-w-80 p-4" align="end">
-                  <div className="space-y-4">
-                    <div className="space-y-2">
-                      <Label className="font-mono text-sm text-soft">Key</Label>
-                      <Input
-                        value={filters.key}
-                        onChange={(e) => onFiltersChange({ ...filters, key: e.target.value })}
-                        placeholder="Filter by key..."
-                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label className="font-mono text-sm text-soft">Message</Label>
-                      <Input
-                        value={filters.value}
-                        onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
-                        placeholder="Filter by message content..."
-                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-                      />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Checkbox
-                        id="case-sensitive"
-                        checked={filters.case_sensitive}
-                        onCheckedChange={(checked) =>
-                          onFiltersChange({ ...filters, case_sensitive: checked === true })
-                        }
-                      />
-                      <Label htmlFor="case-sensitive" className="font-mono text-sm text-soft cursor-pointer">
-                        Case sensitive
-                      </Label>
-                    </div>
-                    <div className="flex gap-2 pt-2">
-                      <Button
-                        onClick={() => onFiltersChange(EMPTY_FILTER)}
-                        variant="outline"
-                        size="sm"
-                        className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
-                      >
-                        Clear
-                      </Button>
-                    </div>
-                  </div>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>

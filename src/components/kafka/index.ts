@@ -13,6 +13,7 @@ export { DialogContentNoClose } from './DialogContentNoClose';
 export { HeaderDesktop } from './Header';
 export { TopicsPanel } from './TopicsPanel';
 export { MessagesPanel } from './MessagesPanel';
+export { StatusBar } from './StatusBar';
 
 // Modals
 export { MessageDetailsModal } from './modals/MessageDetailsModal';

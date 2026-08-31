@@ -58,6 +58,69 @@ impl MessageFilter {
     }
 }
 
+/// Границы чтения — «не всё, а вот отсюда досюда».
+///
+/// Мода не задаётся отдельным полем: она однозначно следует из того, какие
+/// границы заполнены. Пустая структура — обычное чтение с конца или с начала.
+///
+/// Офсет и время здесь не смешиваются: фронт заполняет либо пару офсетов, либо
+/// пару отметок времени. Офсеты свои в каждой партиции, поэтому диапазон по ним
+/// осмыслен только при ОДНОЙ выбранной партиции — это проверяет фронт, где
+/// видно, что именно выбрано в селекторе. Время сквозное, и по нему диапазон
+/// осмыслен на любом их числе.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReadRange {
+    /// Офсет первого нужного сообщения, inclusive.
+    #[serde(default)]
+    pub from_offset: Option<i64>,
+    /// Офсет последнего нужного сообщения, inclusive.
+    #[serde(default)]
+    pub to_offset: Option<i64>,
+    /// Unix millis. Первое сообщение со временем не раньше этого.
+    #[serde(default)]
+    pub from_timestamp: Option<i64>,
+    /// Unix millis. Последнее сообщение со временем не позже этого —
+    /// сам момент входит в диапазон.
+    #[serde(default)]
+    pub to_timestamp: Option<i64>,
+}
+
+impl ReadRange {
+    pub fn is_empty(&self) -> bool {
+        !self.has_from() && !self.has_to()
+    }
+
+    pub fn has_from(&self) -> bool {
+        self.from_offset.is_some() || self.from_timestamp.is_some()
+    }
+
+    pub fn has_to(&self) -> bool {
+        self.to_offset.is_some() || self.to_timestamp.is_some()
+    }
+
+    pub fn by_timestamp(&self) -> bool {
+        self.from_timestamp.is_some() || self.to_timestamp.is_some()
+    }
+
+    /// В какую сторону читать с такими границами.
+    ///
+    /// Названа только верхняя граница — значит пользователь указал точку, ОТ
+    /// которой хочет посмотреть НАЗАД, и порядок должен быть по убыванию.
+    /// Названа нижняя — читаем вперёд от неё. Границ нет — как выбрано в
+    /// селекторе.
+    ///
+    /// Правило живёт здесь, а не на фронте: иначе направление сортировки и
+    /// направление обхода окон определялись бы в двух местах и могли разойтись.
+    pub fn newest_first(&self, start_from: StartFrom) -> bool {
+        match (self.has_from(), self.has_to()) {
+            (false, true) => true,
+            (true, _) => false,
+            (false, false) => start_from == StartFrom::Newest,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OpenTopicParams {
@@ -76,6 +139,10 @@ pub struct OpenTopicParams {
     pub partitions: Option<Vec<i32>>,
     #[serde(default)]
     pub filter: MessageFilter,
+    /// Границы чтения. Пустые — читаем топик целиком с того конца, который
+    /// назван в `start_from`.
+    #[serde(default)]
+    pub range: ReadRange,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,10 +163,28 @@ pub struct OpenTopicResult {
     /// Сколько байт занимает арена. Приложение обещает быть экономным —
     /// пусть эта цифра будет наблюдаемой, а не на словах.
     pub buffer_bytes: usize,
+    #[serde(flatten)]
+    pub memory: MemoryUsage,
     /// true — упёрлись в лимит или таймаут, в топике есть ещё.
     pub truncated: bool,
     #[serde(flatten)]
     pub quota: QuotaInfo,
+}
+
+/// Сколько памяти держит буфер сообщений и сколько ему позволено.
+///
+/// Показывается шкалой в футере. Приложение обещает быть экономным на топиках,
+/// где сообщения весят десятки килобайт, — и это обещание должно быть
+/// проверяемым на глаз, а не на словах. Заодно из шкалы видно, почему выдача
+/// оказалась усечённой: упёрлись в потолок, а не «приложение сломалось».
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryUsage {
+    /// Занято по-настоящему: арена вместе с запасом ёмкости плюс индекс.
+    /// Больше `buffer_bytes`, который считает только полезные байты.
+    pub memory_bytes: usize,
+    /// Потолок, на котором чтение останавливается.
+    pub memory_limit: usize,
 }
 
 /// Что кластер реально даёт по скорости. Измеряется косвенно — см.
@@ -109,10 +194,16 @@ pub struct OpenTopicResult {
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct QuotaInfo {
-    /// None — измерений пока недостаточно.
+    /// None — измерений пока недостаточно. Это СУММА по всем брокерам, с
+    /// которых шли данные, — см. `active_brokers`.
     pub read_bytes_per_sec: Option<u64>,
     /// Самая длинная задержка, наложенная брокером, мс. 0 — не придерживал.
     pub peak_throttle_ms: u64,
+    /// Со скольких брокеров шли данные. Нужно затем, что `consumer_byte_rate`
+    /// применяет каждый брокер самостоятельно: под квотой 200 КБ/с чтение с
+    /// семи брокеров законно даёт около 1.4 МБ/с суммарно, и без этого числа
+    /// измеренная скорость выглядит невозможной.
+    pub active_brokers: u32,
 }
 
 /// Снимок хода ещё не завершённого чтения — опрашивается фронтом по таймеру,
@@ -129,6 +220,8 @@ pub struct OpenTopicProgress {
     /// Размер арены. Раньше его тут не было, и шапка во время загрузки честно
     /// показывала «0 B» — единственное поле, которого не хватало.
     pub buffer_bytes: usize,
+    #[serde(flatten)]
+    pub memory: MemoryUsage,
     pub truncated: bool,
     /// true — чтения в фоне уже нет, снимок финальный.
     pub done: bool,
@@ -187,10 +280,15 @@ mod tests {
             total: 10,
             loaded: 10,
             buffer_bytes: 4096,
+            memory: MemoryUsage {
+                memory_bytes: 8192,
+                memory_limit: 256 * 1024 * 1024,
+            },
             truncated: true,
             quota: QuotaInfo {
                 read_bytes_per_sec: Some(204_800),
                 peak_throttle_ms: 9_000,
+                active_brokers: 7,
             },
         })
         .unwrap();
@@ -198,7 +296,11 @@ mod tests {
         assert_eq!(json["read_bytes_per_sec"], 204_800);
         assert_eq!(json["peak_throttle_ms"], 9_000);
         assert_eq!(json["buffer_bytes"], 4096);
+        // Шкала памяти читает эти два поля с верхнего уровня.
+        assert_eq!(json["memory_bytes"], 8192);
+        assert_eq!(json["memory_limit"], 256 * 1024 * 1024);
         assert!(json.get("quota").is_none(), "поля должны быть плоскими");
+        assert!(json.get("memory").is_none(), "поля должны быть плоскими");
     }
 
     #[test]
@@ -208,6 +310,7 @@ mod tests {
             loaded: 5,
             total: 5,
             buffer_bytes: 128,
+            memory: MemoryUsage::default(),
             truncated: false,
             done: false,
             quota: QuotaInfo::default(),

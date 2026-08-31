@@ -57,7 +57,34 @@ export const EMPTY_FILTER: MessageFilter = {
   case_sensitive: false,
 };
 
+/** С какого конца читать. То, что понимает бэкенд, когда границ не задано. */
 export type StartFrom = 'oldest' | 'newest';
+
+/**
+ * Что выбрано в селекторе порядка чтения.
+ *
+ * `offset` и `timestamp` — это не «ещё два порядка», а чтение куска топика:
+ * направление у них следует из того, какая граница задана, и считает его
+ * бэкенд (см. `ReadRange::newest_first`), чтобы сортировка и обход окон не
+ * разъехались.
+ */
+export type ReadMode = StartFrom | 'offset' | 'timestamp';
+
+/** Границы чтения. `null` — граница не задана. Обе inclusive. */
+export interface ReadRange {
+  from_offset: number | null;
+  to_offset: number | null;
+  /** Unix millis. */
+  from_timestamp: number | null;
+  to_timestamp: number | null;
+}
+
+export const EMPTY_RANGE: ReadRange = {
+  from_offset: null,
+  to_offset: null,
+  from_timestamp: null,
+  to_timestamp: null,
+};
 
 /**
  * Что кластер реально даёт по скорости — измеряется косвенно, по статистике
@@ -68,13 +95,34 @@ export type StartFrom = 'oldest' | 'newest';
  * придерживает ответы по квоте.
  */
 export interface QuotaInfo {
-  /** null — измерений пока недостаточно. */
+  /** null — измерений пока недостаточно. Это СУММА по всем брокерам. */
   read_bytes_per_sec: number | null;
   /** Самая длинная задержка, наложенная брокером, мс. 0 — не придерживал. */
   peak_throttle_ms: number;
+  /**
+   * Со скольких брокеров шли данные. `consumer_byte_rate` применяет каждый
+   * брокер самостоятельно, поэтому суммарная скорость кратна их числу — без
+   * этой цифры измеренные мегабайты выглядят невозможными под квотой в
+   * сотни килобайт.
+   */
+  active_brokers: number;
 }
 
-export interface OpenTopicResult extends QuotaInfo {
+/**
+ * Сколько памяти держит буфер сообщений и сколько ему позволено.
+ *
+ * Приложение обещает быть экономным на топиках, где сообщения весят десятки
+ * килобайт, — шкала в футере делает это обещание проверяемым на глаз. Заодно
+ * из неё видно, почему выдача оказалась усечённой: упёрлись в потолок, а не
+ * «приложение сломалось».
+ */
+export interface MemoryUsage {
+  /** Занято по-настоящему: арена с запасом ёмкости плюс индекс сообщений. */
+  memory_bytes: number;
+  memory_limit: number;
+}
+
+export interface OpenTopicResult extends QuotaInfo, MemoryUsage {
   /** Число видимых строк с учётом фильтра — это totalCount для списка. */
   total: number;
   /** Сколько всего вычитано в буфер до фильтрации. */
@@ -92,7 +140,7 @@ export interface LoadMoreParams {
 
 /** Снимок хода ещё не завершённого `open_topic`/`load_more` — опрашивается
  *  по таймеру, пока идёт загрузка. */
-export interface OpenTopicProgress extends QuotaInfo {
+export interface OpenTopicProgress extends QuotaInfo, MemoryUsage {
   /** Топик, к которому относится снимок: ответ опроса может разминуться со
    *  сменой топика, и без этой проверки счётчики перепутались бы. */
   topic: string | null;

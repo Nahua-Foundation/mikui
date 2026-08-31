@@ -198,7 +198,9 @@ export function MessagesPanel({
   return (
     <div
       ref={rootRef}
-      className="flex-1 min-h-0 flex flex-col h-full"
+      // `h-full` здесь больше нет: под таблицей появилась полоска состояния,
+      // и высота в 100% родителя спорила бы с ней за место.
+      className="flex-1 min-h-0 flex flex-col"
       style={{ '--mikui-grid': gridTemplate } as React.CSSProperties}
     >
       <div className="border-b border-edge bg-surface">

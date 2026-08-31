@@ -15,6 +15,7 @@ import {
   MessageFilter,
   OpenTopicProgress,
   OpenTopicResult,
+  ReadRange,
   RowPreview,
   Settings,
   StartFrom,
@@ -109,6 +110,8 @@ export const openTopic = (params: {
   /** null — все партиции топика. */
   partitions: number[] | null;
   filter: MessageFilter;
+  /** Границы чтения. Пустые — весь топик с конца, названного в `start_from`. */
+  range: ReadRange;
 }) => invoke<OpenTopicResult>('open_topic', { params });
 
 export const loadMore = (params: LoadMoreParams) =>

@@ -9,13 +9,16 @@ import {
   MessageFilter,
   KafkaCluster,
   OpenTopicResult,
-  StartFrom,
+  ReadMode,
+  ReadRange,
   EMPTY_FILTER,
+  EMPTY_RANGE,
 } from './kafka';
 import * as api from './kafka/api';
 import { HeaderDesktop } from './kafka';
 import { TopicsPanel } from './kafka';
 import { MessagesPanel } from './kafka';
+import { StatusBar } from './kafka/StatusBar';
 import { MessageDetailsModal } from './kafka';
 import { TopicConfigModal } from './kafka';
 import { ClusterConfigModal } from './kafka';
@@ -51,9 +54,12 @@ export function KafkaExplorerPortfolio() {
   const [selectedTopic, setSelectedTopic] = useState<Topic | null>(null);
   /** Из каких партиций читаем. null — из всех. */
   const [selectedPartitions, setSelectedPartitions] = useState<number[] | null>(null);
-  /** С какого конца топика читать. Определяет и порядок строк в таблице, и
-   *  направление, в котором догружаются следующие порции. */
-  const [startFrom, setStartFrom] = useState<StartFrom>('newest');
+  /** Что выбрано в селекторе порядка чтения: с какого конца читать топик либо
+   *  какой его кусок. Определяет и порядок строк в таблице, и направление, в
+   *  котором догружаются следующие порции. */
+  const [readMode, setReadMode] = useState<ReadMode>('newest');
+  /** Границы чтения для режимов `offset` и `timestamp`. */
+  const [range, setRange] = useState<ReadRange>(EMPTY_RANGE);
   const [selectedMessage, setSelectedMessage] = useState<FullMessage | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [configTopic, setConfigTopic] = useState<Topic | null>(null);
@@ -126,6 +132,7 @@ export function KafkaExplorerPortfolio() {
   }, []);
 
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
+  const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
 
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
@@ -147,10 +154,13 @@ export function KafkaExplorerPortfolio() {
     invoke<OpenTopicResult>('open_topic', {
       params: {
         topic: selectedTopic.name,
-        start_from: startFrom,
+        // Границы задают направление сами (см. `ReadRange::newest_first`),
+        // и когда они есть, это поле бэкенду не указ.
+        start_from: readMode === 'newest' ? 'newest' : 'oldest',
         limit: DEFAULT_PARTITION_LIMIT,
         partitions: selectedPartitions,
         filter: filters,
+        range,
       },
     })
       .then((result) => {
@@ -167,6 +177,13 @@ export function KafkaExplorerPortfolio() {
         toast.error(`Failed to read topic: ${describeError(e)}`);
         setTotal(0);
         setStats(null);
+        // Заданные границы в топик не попали — оставлять их выбранными значит
+        // оставлять пользователя перед пустой таблицей, из которой он выйдет
+        // только вспомнив, что надо переключить селектор.
+        if (readMode === 'offset' || readMode === 'timestamp') {
+          setReadMode('newest');
+          setRange(EMPTY_RANGE);
+        }
       })
       .finally(() => {
         if (!cancelled) setIsLoadingMessages(false);
@@ -178,13 +195,13 @@ export function KafkaExplorerPortfolio() {
       cancelled = true;
     };
     // filters здесь намеренно не в зависимостях: их применяет set_filter,
-    // без повторного чтения из Kafka. А вот startFrom — в зависимостях:
-    // сменить направление можно только перечитав топик с другого конца.
+    // без повторного чтения из Kafka. А вот порядок и границы — в
+    // зависимостях: и то, и другое требует перечитать топик заново.
     //
-    // Партиции — строкой, а не массивом: у массива каждый рендер новая
-    // идентичность, и топик перечитывался бы на ровном месте.
+    // Партиции и границы — строкой, а не объектом: у объекта каждый рендер
+    // новая идентичность, и топик перечитывался бы на ровном месте.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTopic, partitionsKey, startFrom]);
+  }, [selectedTopic, partitionsKey, rangeKey]);
 
   // Опрос хода чтения — общий для открытия топика и для "Load more".
   //
@@ -207,9 +224,12 @@ export function KafkaExplorerPortfolio() {
             total: p.total,
             loaded: p.loaded,
             buffer_bytes: p.buffer_bytes,
+            memory_bytes: p.memory_bytes,
+            memory_limit: p.memory_limit,
             truncated: p.truncated,
             read_bytes_per_sec: p.read_bytes_per_sec,
             peak_throttle_ms: p.peak_throttle_ms,
+            active_brokers: p.active_brokers,
           });
         })
         .catch(() => {});
@@ -476,11 +496,21 @@ export function KafkaExplorerPortfolio() {
     [connectedClusterId],
   );
 
-  /** Выбор партиций осмыслен только для того топика, на котором сделан: у
-   *  соседнего их может быть меньше, и чтение упёрлось бы в «out of range». */
+  /** И выбор партиций, и границы чтения осмыслены только для того топика, на
+   *  котором сделаны: у соседнего и партиций может быть меньше, и офсеты свои
+   *  — иначе чтение упёрлось бы в «out of range» на ровном месте. */
   const handleSelectTopic = useCallback((topic: Topic | null) => {
-    if (topicRef.current !== (topic?.name ?? null)) setSelectedPartitions(null);
+    if (topicRef.current !== (topic?.name ?? null)) {
+      setSelectedPartitions(null);
+      setReadMode((mode) => (mode === 'offset' || mode === 'timestamp' ? 'newest' : mode));
+      setRange(EMPTY_RANGE);
+    }
     setSelectedTopic(topic);
+  }, []);
+
+  const handleReadChange = useCallback((mode: ReadMode, next: ReadRange) => {
+    setReadMode(mode);
+    setRange(next);
   }, []);
 
   const handleRefresh = useCallback(() => {
@@ -516,8 +546,9 @@ export function KafkaExplorerPortfolio() {
       <HeaderDesktop
         selectedPartitions={selectedPartitions}
         onSelectPartitions={setSelectedPartitions}
-        startFrom={startFrom}
-        onStartFromChange={setStartFrom}
+        readMode={readMode}
+        range={range}
+        onReadChange={handleReadChange}
         topic={selectedTopic}
         clusterName={connectedName}
         cluster={connectedCluster}
@@ -530,7 +561,6 @@ export function KafkaExplorerPortfolio() {
         onFiltersChange={setFilters}
         onRefresh={handleRefresh}
         onOpenFavorites={handleOpenFavorites}
-        stats={stats}
       />
 
       <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">
@@ -543,19 +573,22 @@ export function KafkaExplorerPortfolio() {
 
         <div className="flex-1 min-h-0 flex flex-col h-full">
           {selectedTopic && (
-            <MessagesPanel
-              total={total}
-              getRow={getRow}
-              onRangeChanged={ensureRange}
-              onSelectMessage={handleSelectMessage}
-              isLoading={isLoadingMessages}
-              version={version}
-              canLoadMore={!!stats?.truncated}
-              // Пока идёт начальное чтение, воркер откажет ("a read is already
-              // in progress") — кнопку не предлагаем вовсе.
-              isLoadingMore={isLoadingMore || isLoadingMessages}
-              onLoadMore={handleLoadMore}
-            />
+            <>
+              <MessagesPanel
+                total={total}
+                getRow={getRow}
+                onRangeChanged={ensureRange}
+                onSelectMessage={handleSelectMessage}
+                isLoading={isLoadingMessages}
+                version={version}
+                canLoadMore={!!stats?.truncated}
+                // Пока идёт начальное чтение, воркер откажет ("a read is already
+                // in progress") — кнопку не предлагаем вовсе.
+                isLoadingMore={isLoadingMore || isLoadingMessages}
+                onLoadMore={handleLoadMore}
+              />
+              <StatusBar stats={stats} />
+            </>
           )}
         </div>
       </div>

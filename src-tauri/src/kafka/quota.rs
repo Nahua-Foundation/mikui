@@ -32,8 +32,15 @@
 //! наблюдались всплески до 2 МБ/с, за которыми следовала девятисекундная
 //! остановка. Усреднение короче этого цикла принимает burst-кредит за
 //! настоящую скорость и тут же за это платит.
+//!
+//! **Суммарно по всем брокерам — и отдельно их число.** Это не мелочь учёта:
+//! `consumer_byte_rate` в Kafka применяет КАЖДЫЙ брокер самостоятельно, к
+//! своей доле трафика. Клиент, читающий партиции с семи брокеров под квотой
+//! 200 КБ/с, законно получает около 1.4 МБ/с суммарно — и измеренная цифра
+//! выглядит противоречащей настроенной квоте, пока рядом не стоит число
+//! брокеров, на которое она делится.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -57,6 +64,10 @@ pub struct QuotaEstimate {
     /// Самая длинная задержка, которую брокер накладывал на ответ. Ненулевая
     /// означает: медленно не потому, что приложение тормозит.
     pub peak_throttle: Duration,
+    /// Сколько брокеров отдавало данные. `bytes_per_sec` — сумма по всем ним,
+    /// а квота применяется каждым по отдельности; без этого числа измеренная
+    /// скорость необъяснимо превышает настроенную квоту.
+    pub brokers: u32,
 }
 
 /// Один интервал статистики.
@@ -64,6 +75,8 @@ struct Bucket {
     elapsed: Duration,
     rx_bytes: u64,
     offsets: i64,
+    /// Сколько брокеров прислало хоть что-то за этот интервал.
+    brokers: u32,
 }
 
 #[derive(Default)]
@@ -74,6 +87,9 @@ struct Meter {
     offsets: i64,
     /// Предыдущий снимок — статистика librdkafka кумулятивна.
     last_rx_total: Option<u64>,
+    /// То же по каждому брокеру: нужно, чтобы отличить брокера, который
+    /// действительно отдаёт данные, от того, с кем просто есть соединение.
+    last_rx_by_broker: HashMap<i32, u64>,
     last_tick: Option<Instant>,
     /// Офсеты, пройденные с прошлого тика статистики.
     pending_offsets: i64,
@@ -124,7 +140,14 @@ impl QuotaMeter {
 
     /// Очередной снимок статистики librdkafka.
     pub fn observe(&self, stats: &Statistics) {
-        let rx_total = stats.brokers.values().map(|b| b.rxbytes).sum();
+        let brokers: Vec<(i32, u64)> = stats
+            .brokers
+            .values()
+            // `nodeid` -1 — это ещё не опознанный bootstrap-узел: соединение
+            // есть, данных по нему нет, и в число отдающих он не входит.
+            .filter(|b| b.nodeid >= 0)
+            .map(|b| (b.nodeid, b.rxbytes))
+            .collect();
         let throttle_ms = stats
             .brokers
             .values()
@@ -132,14 +155,25 @@ impl QuotaMeter {
             .map(|w| w.max.max(0) as u64)
             .max()
             .unwrap_or(0);
-        self.tick(rx_total, Duration::from_millis(throttle_ms), Instant::now());
+        self.tick(&brokers, Duration::from_millis(throttle_ms), Instant::now());
     }
 
     /// Отделено от `observe`, чтобы измеритель проверялся без конструирования
     /// статистики librdkafka.
-    fn tick(&self, rx_total: u64, throttle: Duration, now: Instant) {
+    fn tick(&self, brokers: &[(i32, u64)], throttle: Duration, now: Instant) {
         let mut m = self.lock();
         m.peak_throttle = m.peak_throttle.max(throttle);
+
+        let rx_total: u64 = brokers.iter().map(|&(_, bytes)| bytes).sum();
+        // Брокеры, чей счётчик вырос с прошлого тика. Ровно они и делят между
+        // собой измеренную скорость, и ровно на их число делится квота.
+        let mut active: u32 = 0;
+        for &(id, total) in brokers {
+            let previous = m.last_rx_by_broker.insert(id, total);
+            if previous.is_some_and(|p| total > p) {
+                active += 1;
+            }
+        }
 
         let (Some(last_rx), Some(last_tick)) = (m.last_rx_total, m.last_tick) else {
             m.last_rx_total = Some(rx_total);
@@ -168,6 +202,7 @@ impl QuotaMeter {
             elapsed,
             rx_bytes,
             offsets,
+            brokers: active,
         });
 
         while m.span > WINDOW && m.buckets.len() > 1 {
@@ -190,6 +225,10 @@ impl QuotaMeter {
             bytes_per_sec: m.rx_bytes as f64 / m.span.as_secs_f64(),
             bytes_per_offset: m.rx_bytes as f64 / m.offsets as f64,
             peak_throttle: m.peak_throttle,
+            // Максимум, а не среднее: отдельный брокер вполне может промолчать
+            // один интервал, и среднее занижало бы делитель квоты именно там,
+            // где на него смотрят.
+            brokers: m.buckets.iter().map(|b| b.brokers).max().unwrap_or(0),
         })
     }
 
@@ -207,18 +246,19 @@ mod tests {
 
     /// Прогоняет измеритель через последовательность тиков по секунде.
     /// Каждый элемент — (принято байт за секунду, офсетов за секунду).
+    /// Всё приходит с одного брокера.
     fn run(ticks: &[(u64, i64)]) -> QuotaMeter {
         let meter = QuotaMeter::new();
         meter.set_reading(true);
         let start = Instant::now();
         let mut rx_total = 0;
         // Первый тик только задаёт точку отсчёта, второй — первый засчитанный.
-        meter.tick(rx_total, Duration::ZERO, start);
+        meter.tick(&[(0, rx_total)], Duration::ZERO, start);
         for (i, &(bytes, offsets)) in ticks.iter().enumerate() {
             rx_total += bytes;
             meter.record_offsets(offsets);
             meter.tick(
-                rx_total,
+                &[(0, rx_total)],
                 Duration::ZERO,
                 start + Duration::from_secs(i as u64 + 1),
             );
@@ -276,16 +316,24 @@ mod tests {
         let meter = QuotaMeter::new();
         let start = Instant::now();
         meter.set_reading(true);
-        meter.tick(0, Duration::ZERO, start);
+        meter.tick(&[(0, 0)], Duration::ZERO, start);
         for i in 1..=6 {
             meter.record_offsets(20);
-            meter.tick(200_000 * i, Duration::ZERO, start + Duration::from_secs(i));
+            meter.tick(
+                &[(0, 200_000 * i)],
+                Duration::ZERO,
+                start + Duration::from_secs(i),
+            );
         }
         let before = meter.estimate().unwrap();
 
         // Полчаса простоя без единого байта.
         meter.set_reading(false);
-        meter.tick(1_200_000, Duration::ZERO, start + Duration::from_secs(1800));
+        meter.tick(
+            &[(0, 1_200_000)],
+            Duration::ZERO,
+            start + Duration::from_secs(1800),
+        );
 
         let after = meter.estimate().unwrap();
         assert_eq!(
@@ -300,11 +348,11 @@ mod tests {
         let meter = QuotaMeter::new();
         let start = Instant::now();
         meter.set_reading(true);
-        meter.tick(0, Duration::ZERO, start);
+        meter.tick(&[(0, 0)], Duration::ZERO, start);
         for i in 1..=4 {
             meter.record_offsets(10);
             meter.tick(
-                100_000 * i,
+                &[(0, 100_000 * i)],
                 Duration::from_millis(if i == 2 { 9_000 } else { 120 }),
                 start + Duration::from_secs(i),
             );
@@ -313,6 +361,39 @@ mod tests {
             meter.estimate().unwrap().peak_throttle,
             Duration::from_millis(9_000)
         );
+    }
+
+    /// Ровно то, из-за чего измеренная скорость выглядит противоречащей
+    /// настроенной квоте: `consumer_byte_rate` применяет каждый брокер
+    /// самостоятельно, и суммарная скорость клиента кратна их числу.
+    #[test]
+    fn counts_the_brokers_the_bytes_came_from() {
+        let meter = QuotaMeter::new();
+        let start = Instant::now();
+        meter.set_reading(true);
+
+        // Пять брокеров отдают по 200 КБ/с каждый, шестой только подключён.
+        let snapshot = |second: u64| -> Vec<(i32, u64)> {
+            let mut brokers: Vec<(i32, u64)> =
+                (0..5).map(|id| (id, 200_000 * second)).collect();
+            brokers.push((5, 0));
+            brokers
+        };
+
+        meter.tick(&snapshot(0), Duration::ZERO, start);
+        for second in 1..=5 {
+            meter.record_offsets(100);
+            meter.tick(
+                &snapshot(second),
+                Duration::ZERO,
+                start + Duration::from_secs(second),
+            );
+        }
+
+        let est = meter.estimate().unwrap();
+        assert_eq!(est.brokers, 5, "молчащий брокер не отдаёт данные: {est:?}");
+        // Один миллион в секунду суммарно — при квоте 200 КБ/с на брокера.
+        assert!((est.bytes_per_sec - 1_000_000.0).abs() < 1.0, "{est:?}");
     }
 
     #[test]
