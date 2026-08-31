@@ -230,6 +230,7 @@ export function KafkaExplorerPortfolio() {
             read_bytes_per_sec: p.read_bytes_per_sec,
             peak_throttle_ms: p.peak_throttle_ms,
             active_brokers: p.active_brokers,
+            known_brokers: p.known_brokers,
           });
         })
         .catch(() => {});
@@ -456,6 +457,21 @@ export function KafkaExplorerPortfolio() {
     [connect, connectedClusterId],
   );
 
+  /**
+   * Полный разрыв подключения.
+   *
+   * Состояние UI обязано это отразить целиком: и шапка, и список топиков, и
+   * открытая таблица — иначе останется картинка живого сеанса, которого нет.
+   */
+  const disconnect = useCallback(async () => {
+    await api.clusterDisconnect().catch((e) => console.error('Disconnect failed', e));
+    setConnectedClusterId(null);
+    setConnectedUserId(null);
+    setConnectedName(null);
+    setTopics([]);
+    setSelectedTopic(null);
+  }, []);
+
   /** `fromConfig` — пришли из настроек кластера, значит есть куда вернуться. */
   const handleManageUsers = useCallback((cluster: KafkaCluster, fromConfig = false) => {
     setUsersModalClusterId(cluster.id);
@@ -641,6 +657,12 @@ export function KafkaExplorerPortfolio() {
         // даже если новый пароль неверен: иначе чтение продолжало бы работать
         // по паролю, которого больше нет, и смена пароля выглядела бы фикцией.
         onReconnect={(user) => connectAsUser(user, { replace: true })}
+        // Удалили учётку, на которой держалось подключение: сеанс аутентифицирован
+        // паролем, которого больше нет, и оставлять его работающим — та же
+        // фикция, что была со сменой пароля.
+        onDisconnect={() => {
+          disconnect().then(() => toast.info('Disconnected: the active user was deleted'));
+        }}
         // Из настроек кластера сюда приходят через кнопку — значит есть куда
         // вернуться. Из шапки списком заведуют напрямую, и кнопки нет.
         onBack={

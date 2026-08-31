@@ -19,6 +19,8 @@ interface ClusterUsersModalProps {
   onChanged: (cluster: KafkaCluster) => void;
   /** Переподключиться под этой учёткой: её креды только что изменились. */
   onReconnect?: (user: ClusterUser) => void;
+  /** Разорвать подключение: учётки, на которой оно держалось, больше нет. */
+  onDisconnect?: () => void;
   onBack?: () => void;
 }
 
@@ -29,6 +31,7 @@ export function ClusterUsersModal({
   activeUserId,
   onChanged,
   onReconnect,
+  onDisconnect,
   onBack,
 }: ClusterUsersModalProps) {
   const [username, setUsername] = useState('');
@@ -124,9 +127,18 @@ export function ClusterUsersModal({
   const handleDelete = async (user: ClusterUser) => {
     try {
       setBusy(true);
+      const wasActive = user.id === activeUserId;
       const updated = await api.deleteClusterUser(cluster.id, user.id);
       onChanged(updated);
       setConfirmingId(null);
+
+      // Удалили учётку, на которой держалось подключение. Пароля больше нет, а
+      // живой сеанс аутентифицирован им один раз при подключении и продолжал бы
+      // читать как ни в чём не бывало — то есть по кредам, которых уже не
+      // существует. Переподключаться тут не под кем: молча пересесть на
+      // соседнюю учётку значило бы сменить пользователю права, не спросив.
+      if (wasActive) onDisconnect?.();
+
       toast.success(`User "${user.username}" deleted`);
     } catch (e) {
       console.error('Failed to delete user', e);
@@ -273,7 +285,11 @@ export function ClusterUsersModal({
                       если удаляем текущую учётку, — поэтому в два шага. */}
                   {isConfirming ? (
                     <div className="flex items-center gap-2 shrink-0">
-                      <span className="font-mono text-xs text-soft">Delete?</span>
+                      {/* Последствие называется до клика, а не после: удаление
+                          текущей учётки рвёт подключение. */}
+                      <span className="font-mono text-xs text-soft">
+                        {user.id === activeUserId ? 'Delete and disconnect?' : 'Delete?'}
+                      </span>
                       <Button
                         onClick={() => handleDelete(user)}
                         disabled={busy}

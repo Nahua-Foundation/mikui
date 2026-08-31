@@ -1741,6 +1741,7 @@ impl Worker {
                 read_bytes_per_sec: Some(est.bytes_per_sec as u64),
                 peak_throttle_ms: est.peak_throttle.as_millis() as u64,
                 active_brokers: est.brokers,
+                known_brokers: est.known_brokers,
             },
             None => QuotaInfo::default(),
         }
@@ -2117,6 +2118,7 @@ mod tests {
             bytes_per_offset,
             peak_throttle: Duration::ZERO,
             brokers: 1,
+            known_brokers: 1,
         })
     }
 

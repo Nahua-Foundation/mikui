@@ -31,14 +31,20 @@ function formatDuration(millis: number): string {
  * измеренные мегабайты в секунду под квотой в сотни килобайт выглядят
  * невозможными, пока не сказано, что это сумма по брокерам.
  */
-function throughputHint(bytesPerSec: number, brokers: number): string {
+function throughputHint(stats: OpenTopicResult): string {
+  const { read_bytes_per_sec: rate, active_brokers: active, known_brokers: known } = stats;
   const base =
     'Bytes received from the network, averaged over up to 20 s of active reading' +
     ' (the clock stops between reads, so this is the last measured rate).';
-  if (brokers <= 1) return base;
+  if (rate === null || active <= 1) return base;
+
+  // Знаменатель тут не для полноты: без «из десяти» число отдающих не с чем
+  // сверить, а лидеры читаемых партиций почти всегда сидят на подмножестве
+  // узлов — и «семь» при десяти брокерах не ошибка, а норма.
+  const of = known > active ? ` of ${known} in the cluster` : '';
   return (
-    `${base} Summed across ${brokers} brokers — about ` +
-    `${formatBytes(Math.round(bytesPerSec / brokers))}/s each. Kafka enforces a consumer ` +
+    `${base} Summed across ${active} brokers${of} — about ` +
+    `${formatBytes(Math.round(rate / active))}/s each. Kafka enforces a consumer ` +
     'byte-rate quota per broker, so the total legitimately exceeds a per-broker limit.'
   );
 }
@@ -70,7 +76,7 @@ export function StatusBar({ stats }: StatusBarProps) {
         {stats.read_bytes_per_sec !== null && (
           <>
             <span>·</span>
-            <span title={throughputHint(stats.read_bytes_per_sec, stats.active_brokers)}>
+            <span title={throughputHint(stats)}>
               {formatBytes(stats.read_bytes_per_sec)}/s
               {stats.active_brokers > 1 && (
                 <span className="text-dim">
