@@ -196,10 +196,7 @@ export function MessageDetailsModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* 73rem — прежние max-w-4xl (56rem) плюс 30%. Обе ширины заданы явно:
-          в DialogContentNoClose лежит свой `sm:max-w-lg`, и без парного
-          `sm:` результат зависел бы от порядка правил в собранном CSS. */}
-      <DialogContentNoClose className="max-w-[73rem] sm:max-w-[73rem] max-h-[90vh] bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="max-w-[58rem] sm:max-w-[58rem] max-h-[90vh] bg-surface border-edge text-slate-50">
         <DialogHeader className="border-b border-edge pb-4">
           <DialogTitle className="font-mono text-soft text-lg">
             Message Details
