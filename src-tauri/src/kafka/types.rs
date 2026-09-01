@@ -247,7 +247,12 @@ pub struct RowPreview {
     pub preview: String,
     pub value_size: usize,
     /// Тело не является валидным UTF-8 (Avro, Protobuf, произвольные байты).
+    /// У декодированного protobuf это false: наружу уехал JSON, а не байты.
     pub binary: bool,
+    /// Схема к топику загружена, но это сообщение по ней не разобралось.
+    /// В `preview` тогда лежит обычное текстовое представление: одно битое
+    /// сообщение не повод перестать показывать топик.
+    pub decode_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,9 +269,20 @@ pub struct FullMessage {
     pub offset: i64,
     pub timestamp: i64,
     pub key: String,
+    /// Декодированный protobuf приезжает сюда компактным JSON — модалка
+    /// разложит его отступами тем же кодом, каким давно печатает JSON-топики.
     pub value: String,
+    /// Размер тела НА ПРОВОДЕ, а не длина `value`: модалка показывает, сколько
+    /// сообщение весит в Kafka, и декодирование этого числа не меняет.
     pub value_size: usize,
     pub binary: bool,
+    /// См. `RowPreview::decode_error`.
+    pub decode_error: Option<String>,
+    /// Имена enum-значений схемы, применённой к этому телу — модалка красит
+    /// их отдельным цветом. Пусто, если тело не декодировано protobuf'ом: у
+    /// произвольного JSON или текста никакой схемы, с которой можно было бы
+    /// сверяться, попросту нет.
+    pub enum_values: Vec<String>,
     pub headers: Vec<MessageHeader>,
 }
 

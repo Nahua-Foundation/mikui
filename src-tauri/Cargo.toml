@@ -29,6 +29,17 @@ tokio = { version = "1", features = ["sync"] }
 keyring = { version = "4.1.6", features = ["apple-native-keyring-store"] }
 chrono = { version = "0.4.45", features = ["clock"] }
 
+# Protobuf-схемы топиков.
+#
+# protobuf-parse разбирает .proto ЧИСТЫМ РУСТОМ (`Parser::pure`) — внешний
+# protoc на машине пользователя не нужен, а он бы и не был там гарантирован.
+# protobuf даёт reflection: descriptor-граф и разбор тела по нему без кодогенерации.
+# protobuf-json-mapping печатает разобранное сообщение в канонический JSON —
+# тем самым и таблица, и модалка переиспользуют уже готовый JSON-путь фронта.
+protobuf = "3.7"
+protobuf-parse = "3.7"
+protobuf-json-mapping = "3.7"
+
 # librdkafka.
 #
 # ssl-vendored — OpenSSL собирается из исходников вместо системного: на Windows

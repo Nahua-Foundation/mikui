@@ -80,6 +80,7 @@ use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
 use super::types::*;
 use crate::helpers::get_cluster_config;
+use crate::proto::ProtoDecoder;
 
 /// Потолок времени на одно чтение (открытие топика или "загрузить ещё").
 /// Проверяется НА ГРАНИЦЕ РАУНДА: чтение останавливается, не потеряв ни одного
@@ -368,6 +369,12 @@ pub enum Command {
         reply: Reply<Result<Vec<RowPreview>, String>>,
     },
     GetBody(usize, Reply<Result<FullMessage, String>>),
+    /// Чем декодировать тела открытого топика. `None` — отдавать как есть.
+    ///
+    /// Отдельная команда, а не поле в `OpenTopic`: выбор message в настройках
+    /// топика обязан примениться сразу, а перечитывать ради этого весь топик из
+    /// Kafka — значит платить квотой на чтение за смену способа показа.
+    SetDecoder(Option<Arc<ProtoDecoder>>, Reply<()>),
     CloseTopic(Reply<()>),
 }
 
@@ -416,6 +423,25 @@ fn absorb(store: &mut MessageStore, msg: &RawMessage) -> bool {
         msg.payload().unwrap_or(&[]),
         &headers,
     )
+}
+
+/// Результат попытки декодировать тело.
+///
+/// Оба поля пустые — декодера нет, тело показывается как раньше. Именно поэтому
+/// это не `Result`: «декодера не задали» и «декодер не справился» ведут к разным
+/// строкам таблицы, и слить их в одну ветку значило бы врать про первый случай.
+#[derive(Default)]
+struct Rendered {
+    decoded: Option<String>,
+    error: Option<String>,
+}
+
+impl Rendered {
+    /// Показывать ли тело как двоичное. Успешно разобранный protobuf двоичным
+    /// не считается: наружу уехал JSON, и метка `[binary]` на нём была бы ложью.
+    fn binary(&self, raw: &[u8]) -> bool {
+        self.decoded.is_none() && !text::is_text(raw)
+    }
 }
 
 /// Что известно про партицию между раундами. Переживает завершение чтения:
@@ -726,6 +752,9 @@ struct Worker {
     /// та считает сетевую цену офсета и потому зависит от размера окна, а эта
     /// — свойство самих данных. Отсюда берётся пол окна (`window_floor`).
     kept_per_offset: Option<f64>,
+    /// Чем декодировать тела. Ставится командой `SetDecoder` перед открытием
+    /// топика и переживает `load_more`; `close_topic` его снимает.
+    decoder: Option<Arc<ProtoDecoder>>,
 }
 
 impl Worker {
@@ -747,6 +776,7 @@ impl Worker {
             last_round: None,
             has_timestamps: false,
             kept_per_offset: None,
+            decoder: None,
         }
     }
 
@@ -787,6 +817,10 @@ impl Worker {
                 }
                 Command::GetBody(index, reply) => {
                     let _ = reply.send(self.body(index));
+                }
+                Command::SetDecoder(decoder, reply) => {
+                    self.decoder = decoder;
+                    let _ = reply.send(());
                 }
                 Command::CloseTopic(reply) => {
                     self.close_topic();
@@ -1774,6 +1808,9 @@ impl Worker {
         self.view.clear();
         self.cursors.clear();
         self.has_timestamps = false;
+        // Схема принадлежит топику. Оставить её — значит показать следующий
+        // топик через чужой контракт, если фронт не успеет прислать свою.
+        self.decoder = None;
         // Освобождаем буфер целиком: держать сотни мегабайт, пока пользователь
         // ничего не смотрит, незачем.
         self.store.release();
@@ -1832,18 +1869,51 @@ impl Worker {
                     .get(i)
                     .expect("view index out of sync with store");
                 let value = self.store.value(i);
+                let shown = self.render(value);
                 RowPreview {
                     index: start + offset_in_window,
                     partition: meta.partition,
                     offset: meta.offset,
                     timestamp: meta.timestamp,
                     key: text::preview(self.store.key(i), PREVIEW_BYTES),
-                    preview: text::preview(value, PREVIEW_BYTES),
+                    preview: match &shown.decoded {
+                        // Обрезаем уже декодированное: строке таблицы нужны
+                        // первые пару сотен символов, а не всё тело.
+                        Some(json) => text::preview(json.as_bytes(), PREVIEW_BYTES),
+                        None => text::preview(value, PREVIEW_BYTES),
+                    },
                     value_size: value.len(),
-                    binary: !text::is_text(value),
+                    binary: shown.binary(value),
+                    decode_error: shown.error,
                 }
             })
             .collect()
+    }
+
+    /// Прогоняет тело через декодер, если он задан.
+    ///
+    /// Декодирование ленивое — только для строк, которые действительно уезжают
+    /// на экран, и для сообщения, которое действительно открыли. Ни кэша, ни
+    /// второй копии тела в памяти: буфер и так держит десятки тысяч сообщений,
+    /// и класть рядом их разобранные представления значило бы удвоить его цену
+    /// ради данных, которые переживут один экран прокрутки.
+    fn render(&self, value: &[u8]) -> Rendered {
+        let Some(decoder) = &self.decoder else {
+            return Rendered::default();
+        };
+        match decoder.decode(value) {
+            Ok(json) => Rendered {
+                decoded: Some(json),
+                error: None,
+            },
+            // Схему не трогаем и топик не закрываем: одно сообщение чужого
+            // формата — обычное дело в топике, который переживал смену
+            // контракта. Показываем его текстом и говорим, что случилось.
+            Err(e) => Rendered {
+                decoded: None,
+                error: Some(e),
+            },
+        }
     }
 
     /// Полное тело — только когда пользователь открыл конкретное сообщение.
@@ -1857,15 +1927,31 @@ impl Worker {
             .get(store_index)
             .ok_or("message index out of range")?;
         let value = self.store.value(store_index);
+        let shown = self.render(value);
+        // Только у декодированного тела есть enum, с которым можно сверяться:
+        // на самостоятельном JSON или тексте это был бы список из чужой схемы.
+        let enum_values = match &shown.decoded {
+            Some(_) => self
+                .decoder
+                .as_ref()
+                .map(|d| d.enum_values().to_vec())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
 
         Ok(FullMessage {
             partition: meta.partition,
             offset: meta.offset,
             timestamp: meta.timestamp,
             key: text::decode(self.store.key(store_index)),
-            value: text::decode(value),
+            binary: shown.binary(value),
+            value: match shown.decoded {
+                Some(json) => json,
+                None => text::decode(value),
+            },
             value_size: value.len(),
-            binary: !text::is_text(value),
+            decode_error: shown.error,
+            enum_values,
             headers: self
                 .store
                 .headers(store_index)

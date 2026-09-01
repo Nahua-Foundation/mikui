@@ -3,9 +3,11 @@
 mod config;
 mod helpers;
 mod kafka;
+mod proto;
 
 use config::{ClusterConfig, ClusterUser, Settings};
 use kafka::*;
+use proto::{BodyFormat, TopicSchemaView};
 
 /// Подставляет пароль из keychain, если фронт его не прислал.
 ///
@@ -129,6 +131,11 @@ async fn delete_cluster(app: tauri::AppHandle, id: String) -> Result<(), String>
         if let Err(e) = config::secrets::delete_password(&user.id) {
             eprintln!("can't delete password of user {}: {e}", user.id);
         }
+    }
+    // Схемы топиков привязаны к кластеру — вместе с ним они и уходят. Ошибку,
+    // как и с паролями, наверх не поднимаем: кластер уже удалён.
+    if let Err(e) = proto::forget_cluster(&app, &id) {
+        eprintln!("can't delete proto schemas of cluster {id}: {e}");
     }
     Ok(())
 }
@@ -310,6 +317,92 @@ async fn close_topic(worker: tauri::State<'_, WorkerHandle>) -> Result<(), Strin
     worker.call(Command::CloseTopic).await
 }
 
+// --- Protobuf-схемы топиков --------------------------------------------------
+//
+// Все команды ниже возвращают схему целиком, а не подтверждение: форма настроек
+// топика показывает список файлов, список message и выбранный из них, и любая
+// операция меняет сразу несколько из них (см. `proto::store`). Отдавать
+// «ок» и заставлять фронт досчитывать новое состояние самому — верный способ
+// разъехаться с диском.
+
+#[tauri::command]
+async fn get_topic_schema(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+) -> Result<Option<TopicSchemaView>, String> {
+    proto::view(&app, &cluster, &topic)
+}
+
+/// Добавляет .proto к топику. Невалидный набор не сохраняется вовсе — ошибка
+/// уезжает наверх, а на диске остаётся то, что работало.
+#[tauri::command]
+async fn add_proto_files(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    paths: Vec<String>,
+) -> Result<TopicSchemaView, String> {
+    proto::add_files(&app, &cluster, &topic, &paths)
+}
+
+/// Перечитывает .proto с диска: `name` — конкретный файл, `None` — все.
+#[tauri::command]
+async fn refresh_proto_files(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    name: Option<String>,
+) -> Result<TopicSchemaView, String> {
+    proto::refresh(&app, &cluster, &topic, name.as_deref())
+}
+
+#[tauri::command]
+async fn remove_proto_file(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    name: String,
+) -> Result<Option<TopicSchemaView>, String> {
+    proto::remove_file(&app, &cluster, &topic, &name)
+}
+
+/// Сохраняет выбор из формы: формат тела и основной message.
+#[tauri::command]
+async fn save_topic_schema(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    format: BodyFormat,
+    message: Option<String>,
+) -> Result<TopicSchemaView, String> {
+    proto::set_options(&app, &cluster, &topic, format, message)
+}
+
+/// Сообщает воркеру, чем декодировать тела открытого топика, и возвращает
+/// схему — фронту она нужна, чтобы знать, в каком виде приедет тело.
+///
+/// Зовётся перед каждым открытием топика и после каждого сохранения настроек.
+/// Схема, которая перестала разбираться, не должна мешать смотреть топик:
+/// ошибка возвращается, декодер при этом снимается, и тела едут текстом.
+#[tauri::command]
+async fn apply_topic_schema(
+    app: tauri::AppHandle,
+    worker: tauri::State<'_, WorkerHandle>,
+    cluster: String,
+    topic: String,
+) -> Result<Option<TopicSchemaView>, String> {
+    let built = proto::decoder(&app, &cluster, &topic);
+    // Воркеру говорим в любом случае, в том числе и «декодера нет»: иначе на
+    // сломавшейся схеме он продолжил бы разбирать прежней и показывать чужое.
+    let decoder = built.as_ref().ok().and_then(Clone::clone);
+    worker
+        .call(|reply| Command::SetDecoder(decoder, reply))
+        .await?;
+    built?;
+    proto::view(&app, &cluster, &topic)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -336,6 +429,12 @@ pub fn run() {
             get_window,
             get_message_body,
             close_topic,
+            get_topic_schema,
+            add_proto_files,
+            refresh_proto_files,
+            remove_proto_file,
+            save_topic_schema,
+            apply_topic_schema,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -33,7 +33,16 @@ interface CachedChunk {
  * остаётся валидным. Раньше generation дёргался на каждый тик прогресса, кэш
  * обнулялся четыре раза в секунду — отсюда и были вечно мигающие плейсхолдеры.
  */
-export function useMessageWindow(generation: number, total: number) {
+export function useMessageWindow(
+  generation: number,
+  total: number,
+  /**
+   * Хоть одно сообщение в приехавшем окне не разобралось по загруженной схеме.
+   * Сообщается ПЕРВАЯ ошибка окна, а не каждая: чужой формат в топике обычно
+   * идёт полосой, и тост на каждую строку залил бы экран.
+   */
+  onDecodeError?: (error: string) => void,
+) {
   const chunks = useRef(new Map<number, CachedChunk>());
   const inFlight = useRef(new Set<number>());
   const genRef = useRef(generation);
@@ -41,6 +50,11 @@ export function useMessageWindow(generation: number, total: number) {
   /** Последний диапазон, о котором сообщил Virtuoso. */
   const range = useRef({ start: 0, end: 0 });
   const [version, bump] = useReducer((n: number) => n + 1, 0);
+
+  // Через ref, чтобы `ensureRange` осталась без зависимостей: её пересоздание
+  // сбрасывает подписку Virtuoso, а колбэк меняется на каждый рендер родителя.
+  const reportDecodeError = useRef(onDecodeError);
+  reportDecodeError.current = onDecodeError;
 
   totalRef.current = total;
 
@@ -87,6 +101,9 @@ export function useMessageWindow(generation: number, total: number) {
           chunks.current.set(chunk, { rows, totalAtFetch: totalNow });
           evictFarChunks(chunks.current, chunk);
           bump();
+
+          const failed = rows.find((row) => row.decode_error);
+          if (failed?.decode_error) reportDecodeError.current?.(failed.decode_error);
         })
         .catch((e) => console.error('get_window failed', e))
         .finally(() => inFlight.current.delete(chunk));

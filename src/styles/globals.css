@@ -31,6 +31,9 @@
   /* Подсветка JSON в просмотре сообщения */
   --color-syntax-brace: #c27aff;
   --color-syntax-bracket: #615fff;
+  --color-syntax-string: #2dd4bf;
+  --color-syntax-boolean: #fb7185;
+  --color-syntax-enum: #22d3ee;
 }
 
 :root {

@@ -7,6 +7,7 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import {
+  BodyFormat,
   ClusterConnectPayload,
   ClusterUser,
   FullMessage,
@@ -20,7 +21,19 @@ import {
   Settings,
   StartFrom,
   Topic,
+  TopicSchema,
 } from './types';
+
+/**
+ * Текст ошибки, пришедшей из Rust.
+ *
+ * Пустое или невнятное `e` превратилось бы в тост «Failed to …: », который
+ * ничего не сообщает и выглядит как поломка самого приложения.
+ */
+export function describeError(e: unknown): string {
+  const text = e instanceof Error ? e.message : String(e ?? '');
+  return text.trim() || 'unknown error';
+}
 
 // --- Подключение ------------------------------------------------------------
 
@@ -129,3 +142,42 @@ export const getMessageBody = (index: number) =>
   invoke<FullMessage>('get_message_body', { index });
 
 export const closeTopic = () => invoke<void>('close_topic');
+
+// --- Protobuf-схемы топиков --------------------------------------------------
+//
+// Каждая операция возвращает схему ЦЕЛИКОМ: список файлов, список message и
+// выбранный из них меняются вместе, и досчитывать новое состояние на фронте
+// значило бы разъезжаться с диском. Неудача не меняет на диске ничего —
+// достаточно показать ошибку и оставить показанное как есть.
+
+export const getTopicSchema = (cluster: string, topic: string) =>
+  invoke<TopicSchema | null>('get_topic_schema', { cluster, topic });
+
+/** Добавляет .proto. Невалидный набор не сохраняется вовсе — прилетит ошибка. */
+export const addProtoFiles = (cluster: string, topic: string, paths: string[]) =>
+  invoke<TopicSchema>('add_proto_files', { cluster, topic, paths });
+
+/** Перечитывает .proto с диска: `name` — конкретный файл, иначе все. */
+export const refreshProtoFiles = (cluster: string, topic: string, name?: string) =>
+  invoke<TopicSchema>('refresh_proto_files', { cluster, topic, name: name ?? null });
+
+export const removeProtoFile = (cluster: string, topic: string, name: string) =>
+  invoke<TopicSchema | null>('remove_proto_file', { cluster, topic, name });
+
+/** Сохраняет выбор из формы: формат тела и основной message. */
+export const saveTopicSchema = (
+  cluster: string,
+  topic: string,
+  format: BodyFormat,
+  message: string | null,
+) => invoke<TopicSchema>('save_topic_schema', { cluster, topic, format, message });
+
+/**
+ * Сообщает бэкенду, чем декодировать тела открытого топика.
+ *
+ * Зовётся перед каждым открытием топика и после каждой правки схемы. Смена
+ * схемы не требует перечитывать топик из Kafka: декодирование происходит на
+ * выдаче окна, а буфер в Rust хранит сырые байты.
+ */
+export const applyTopicSchema = (cluster: string, topic: string) =>
+  invoke<TopicSchema | null>('apply_topic_schema', { cluster, topic });

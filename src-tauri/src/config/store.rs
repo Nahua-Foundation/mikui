@@ -11,7 +11,7 @@ use super::types::{ClusterConfig, Settings};
 const CLUSTERS_FILE: &str = "clusters.json";
 const SETTINGS_FILE: &str = "settings.json";
 
-fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
@@ -26,7 +26,7 @@ fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Прямая запись поверх существующего файла означает, что падение или
 /// отключение питания на середине оставит обрезанный JSON и потерю всех
 /// сохранённых подключений. `rename` в пределах одной ФС атомарен.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, bytes).map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("can't replace {}: {e}", path.display()))?;
@@ -38,7 +38,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Битый файл не роняет приложение и не молча теряется: он отодвигается в
 /// `<имя>.bad`, а вызывающему возвращается ошибка с путём, чтобы можно было
 /// посмотреть глазами. Следующий запуск стартует с чистого листа.
-fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
+pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(T::default()),

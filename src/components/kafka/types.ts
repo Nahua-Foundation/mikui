@@ -18,8 +18,13 @@ export interface RowPreview {
   key: string;
   preview: string;
   value_size: number;
-  /** Тело не является валидным UTF-8: Avro, Protobuf, произвольные байты. */
+  /** Тело не является валидным UTF-8: Avro, Protobuf, произвольные байты.
+   *  У декодированного protobuf — false: приехал JSON, а не байты. */
   binary: boolean;
+  /** Схема к топику загружена, но это сообщение по ней не разобралось.
+   *  В `preview` тогда обычный текст: одно битое сообщение не повод
+   *  перестать показывать топик. */
+  decode_error: string | null;
 }
 
 export interface MessageHeader {
@@ -33,9 +38,18 @@ export interface FullMessage {
   offset: number;
   timestamp: number;
   key: string;
+  /** Декодированный protobuf приезжает сюда компактным JSON — модалка
+   *  разложит его отступами тем же кодом, каким печатает JSON-топики. */
   value: string;
+  /** Размер тела НА ПРОВОДЕ, а не длина `value`. */
   value_size: number;
   binary: boolean;
+  /** См. `RowPreview.decode_error`. */
+  decode_error: string | null;
+  /** Имена enum-значений схемы, применённой к телу — модалка красит их
+   *  отдельным цветом вместо того, чтобы гадать по формату строки. Пусто,
+   *  если тело не декодировано protobuf'ом. */
+  enum_values: string[];
   headers: MessageHeader[];
 }
 
@@ -223,6 +237,53 @@ export function needsSasl(securityProtocol: string): boolean {
  */
 export function newId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// --- Схемы топиков ----------------------------------------------------------
+
+/**
+ * Как показывать тело сообщений топика.
+ *
+ * `json` — исходное поведение: тело едет текстом, а форматирует его фронт.
+ * `proto` включает декодирование по загруженной схеме ещё в Rust.
+ * `avro` хранится, но пока ничего не меняет: схем-реестра в приложении нет.
+ */
+export type BodyFormat = 'json' | 'text' | 'proto' | 'avro';
+
+/** Один .proto, привязанный к топику. */
+export interface ProtoFile {
+  /** Путь внутри каталога схемы — он же имя, под которым файл виден в
+   *  `import`. Служит идентификатором в операциях обновления и удаления. */
+  name: string;
+  /** Откуда файл взяли. По нему работает «перечитать с диска». */
+  source: string;
+}
+
+/** Схема топика вместе с результатом её разбора. */
+export interface TopicSchema {
+  cluster: string;
+  topic: string;
+  format: BodyFormat;
+  files: ProtoFile[];
+  /** Полное имя message, которым декодируется тело. */
+  message: string | null;
+  /** Все message из добавленных файлов, по алфавиту — содержимое селектора. */
+  messages: string[];
+  /** Схема на диске есть, но не разбирается. Файлы всё равно показываем:
+   *  иначе пользователю нечего чинить. */
+  error: string | null;
+}
+
+/**
+ * Ключ кластера в привязке схемы.
+ *
+ * Топики с одинаковыми именами в dev и prod несут разные контракты, поэтому
+ * привязка идёт по паре кластер-топик. У сохранённого кластера ключ — его id,
+ * у подключения из формы — то имя, под которым оно показано в шапке: другого
+ * устойчивого признака у него нет.
+ */
+export function clusterKey(clusterId: string | null, clusterName: string | null): string | null {
+  return clusterId ?? clusterName ?? null;
 }
 
 /** Файл настроек. Своих полей пока нет — see config/types.rs. */

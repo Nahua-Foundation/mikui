@@ -41,7 +41,15 @@ const MessageRow = memo(function MessageRow({ row, onSelect }: MessageRowProps) 
       <div className="font-mono text-soft">{row.offset}</div>
       <div className="font-mono text-soft truncate">{row.key}</div>
       <div className="font-mono text-soft truncate">
-        {row.binary && (
+        {/* Схема есть, но это сообщение по ней не разобралось. Метка нужна
+            затем, что дальше идёт обычный текст, и без неё строка выглядела бы
+            так, будто схема к топику вовсе не загружена. */}
+        {row.decode_error && (
+          <span className="text-brand mr-2" title={row.decode_error}>
+            [undecoded]
+          </span>
+        )}
+        {row.binary && !row.decode_error && (
           <span
             className="text-brand mr-2"
             title={`${row.value_size} bytes, not valid UTF-8`}

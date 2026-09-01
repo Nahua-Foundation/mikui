@@ -11,8 +11,10 @@ import {
   OpenTopicResult,
   ReadMode,
   ReadRange,
+  TopicSchema,
   EMPTY_FILTER,
   EMPTY_RANGE,
+  clusterKey,
 } from './kafka';
 import * as api from './kafka/api';
 import { HeaderDesktop } from './kafka';
@@ -41,14 +43,13 @@ const FILTER_DEBOUNCE_MS = 200;
 /** Бэкенд отвечает так на чтение, отменённое сменой топика — см. worker.rs. */
 const READ_SUPERSEDED = 'read superseded';
 
+/** Не чаще одного тоста об ошибке декодирования за это время. Сообщения чужого
+ *  формата идут полосой, и без паузы каждое окно выдачи заливало бы экран. */
+const DECODE_ERROR_TOAST_MS = 5000;
+
 const isSuperseded = (e: unknown) => String(e).includes(READ_SUPERSEDED);
 
-/** Пустое или невнятное `e` превратилось бы в тост «Failed to …: », который
- *  ничего не сообщает и выглядит как поломка самого приложения. */
-function describeError(e: unknown): string {
-  const text = e instanceof Error ? e.message : String(e ?? '');
-  return text.trim() || 'unknown error';
-}
+const describeError = api.describeError;
 
 export function KafkaExplorerPortfolio() {
   const [selectedTopic, setSelectedTopic] = useState<Topic | null>(null);
@@ -61,6 +62,9 @@ export function KafkaExplorerPortfolio() {
   /** Границы чтения для режимов `offset` и `timestamp`. */
   const [range, setRange] = useState<ReadRange>(EMPTY_RANGE);
   const [selectedMessage, setSelectedMessage] = useState<FullMessage | null>(null);
+  /** Позиция открытого сообщения в таблице — по ней стрелки находят соседей.
+   *  null у сообщения, открытого не из таблицы (из избранного). */
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [configTopic, setConfigTopic] = useState<Topic | null>(null);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
@@ -82,7 +86,22 @@ export function KafkaExplorerPortfolio() {
   // запросы. Фоновая догрузка сюда не относится — она только дописывает строки
   // в конец, и сбрасывать из-за неё кэш нельзя (см. useMessageWindow).
   const [generation, setGeneration] = useState(0);
-  const { ensureRange, getRow, version } = useMessageWindow(generation, total);
+
+  /** Схема ОТКРЫТОГО топика. Нужна модалке, чтобы знать, в каком виде приехало
+   *  тело; всем остальным заведует бэкенд. */
+  const [openSchema, setOpenSchema] = useState<TopicSchema | null>(null);
+
+  const lastDecodeToast = useRef(0);
+  const reportDecodeError = useCallback((error: string) => {
+    const now = Date.now();
+    if (now - lastDecodeToast.current < DECODE_ERROR_TOAST_MS) return;
+    lastDecodeToast.current = now;
+    // Схему не сбрасываем: одно сообщение чужого формата — обычное дело в
+    // топике, переживавшем смену контракта, и терять из-за него схему нельзя.
+    toast.error(`Some messages don't match the schema: ${error}`);
+  }, []);
+
+  const { ensureRange, getRow, version } = useMessageWindow(generation, total, reportDecodeError);
 
   // Какой топик открыт ПРЯМО СЕЙЧАС — чтобы ответ на давно улетевший запрос
   // не приехал в чужую таблицу. Ref, а не state: нужно значение на момент
@@ -134,12 +153,16 @@ export function KafkaExplorerPortfolio() {
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
 
+  /** Под каким ключом искать схемы топиков этого подключения. */
+  const schemaCluster = clusterKey(connectedClusterId, connectedName);
+
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
   useEffect(() => {
     if (!selectedTopic) {
       setTotal(0);
       setStats(null);
+      setOpenSchema(null);
       invoke('close_topic').catch(() => {});
       return;
     }
@@ -151,18 +174,39 @@ export function KafkaExplorerPortfolio() {
     setTotal(0);
     setGeneration((g) => g + 1);
 
-    invoke<OpenTopicResult>('open_topic', {
-      params: {
-        topic: selectedTopic.name,
-        // Границы задают направление сами (см. `ReadRange::newest_first`),
-        // и когда они есть, это поле бэкенду не указ.
-        start_from: readMode === 'newest' ? 'newest' : 'oldest',
-        limit: DEFAULT_PARTITION_LIMIT,
-        partitions: selectedPartitions,
-        filter: filters,
-        range,
-      },
-    })
+    // Схема ставится ДО чтения: она решает, в каком виде уедут строки. Прислать
+    // её после первого окна значило бы показать сырые байты и молча подменить
+    // их разобранным телом секундой позже.
+    //
+    // Сломавшаяся схема топик не запирает: сообщаем и читаем как есть — иначе
+    // один испорченный .proto лишал бы доступа к данным.
+    const withSchema = schemaCluster
+      ? api.applyTopicSchema(schemaCluster, selectedTopic.name).catch((e) => {
+          if (!cancelled) {
+            console.error('Failed to apply topic schema', e);
+            toast.error(`Proto schema is not applied: ${describeError(e)}`);
+          }
+          return null;
+        })
+      : Promise.resolve(null);
+
+    withSchema
+      .then((schema) => {
+        if (cancelled) return Promise.reject(new Error(READ_SUPERSEDED));
+        setOpenSchema(schema);
+        return invoke<OpenTopicResult>('open_topic', {
+          params: {
+            topic: selectedTopic.name,
+            // Границы задают направление сами (см. `ReadRange::newest_first`),
+            // и когда они есть, это поле бэкенду не указ.
+            start_from: readMode === 'newest' ? 'newest' : 'oldest',
+            limit: DEFAULT_PARTITION_LIMIT,
+            partitions: selectedPartitions,
+            filter: filters,
+            range,
+          },
+        });
+      })
       .then((result) => {
         if (cancelled) return;
         setTotal(result.total);
@@ -285,22 +329,77 @@ export function KafkaExplorerPortfolio() {
     };
   }, [filters, selectedTopic]);
 
-  const handleSelectMessage = useCallback((index: number) => {
+  // Тело сообщения читается из арены в Rust — быстро, но не мгновенно, а
+  // стрелками по таблице бегают быстрее, чем приходят ответы. Талон отсекает
+  // опоздавшие: без него зажатая стрелка оставляла бы в модалке то тело,
+  // которое приехало последним, а не то, на котором остановились.
+  const bodyRequest = useRef(0);
+
+  const showMessageAt = useCallback((index: number) => {
+    const ticket = ++bodyRequest.current;
+    const topicAtRequest = topicRef.current;
     invoke<FullMessage>('get_message_body', { index })
       .then((message) => {
+        if (bodyRequest.current !== ticket || topicRef.current !== topicAtRequest) return;
         setSelectedMessage(message);
+        setSelectedIndex(index);
         setIsModalOpen(true);
       })
       .catch((e) => {
+        if (bodyRequest.current !== ticket) return;
         console.error('Failed to load message body', e);
         toast.error('Failed to load message');
       });
   }, []);
 
+  /** Шаг по таблице из открытой модалки. За её краями — ничего не делаем:
+   *  закрывать модалку или заворачивать список на другой конец пользователь
+   *  не просил, а `total` меняется на ходу при догрузке хвоста. */
+  const handleNavigateMessage = useCallback(
+    (delta: -1 | 1) => {
+      if (selectedIndex === null) return;
+      const next = selectedIndex + delta;
+      if (next < 0 || next >= total) return;
+      showMessageAt(next);
+    },
+    [selectedIndex, total, showMessageAt],
+  );
+
   const handleConfigClick = useCallback((topic: Topic) => {
     setConfigTopic(topic);
     setIsConfigModalOpen(true);
   }, []);
+
+  /**
+   * Схему топика поправили в настройках.
+   *
+   * Перечитывать топик из Kafka незачем: буфер в Rust хранит сырые байты, а
+   * декодирование происходит на выдаче окна. Достаточно переставить декодер и
+   * обесценить кэш окон — за это платится ноль трафика и ноль квоты.
+   *
+   * Настраивать можно и топик, который сейчас не открыт: тогда делать нечего,
+   * его схема приедет при открытии.
+   */
+  const handleSchemaChanged = useCallback(
+    (topic: string, schema: TopicSchema | null) => {
+      if (!schemaCluster || topicRef.current !== topic) return;
+      api
+        .applyTopicSchema(schemaCluster, topic)
+        .then((applied) => {
+          if (topicRef.current !== topic) return;
+          setOpenSchema(applied);
+          setGeneration((g) => g + 1);
+        })
+        .catch((e) => {
+          console.error('Failed to apply topic schema', e);
+          toast.error(`Proto schema is not applied: ${describeError(e)}`);
+          // Форма уже показывает новую схему, а строки остались прежними —
+          // держать в состоянии картинку, которой нет в воркере, нельзя.
+          setOpenSchema(schema);
+        });
+    },
+    [schemaCluster],
+  );
 
   const handleClusterClick = useCallback(() => setIsClusterArchiveModalOpen(true), []);
 
@@ -594,7 +693,7 @@ export function KafkaExplorerPortfolio() {
                 total={total}
                 getRow={getRow}
                 onRangeChanged={ensureRange}
-                onSelectMessage={handleSelectMessage}
+                onSelectMessage={showMessageAt}
                 isLoading={isLoadingMessages}
                 version={version}
                 canLoadMore={!!stats?.truncated}
@@ -614,12 +713,16 @@ export function KafkaExplorerPortfolio() {
         open={isModalOpen}
         onOpenChange={setIsModalOpen}
         onAddToFavorite={handleAddToFavorite}
+        onNavigate={handleNavigateMessage}
+        format={openSchema?.format}
       />
 
       <TopicConfigModal
         topic={configTopic}
+        cluster={schemaCluster}
         open={isConfigModalOpen}
         onOpenChange={setIsConfigModalOpen}
+        onSchemaChanged={handleSchemaChanged}
       />
 
       <ClusterArchiveModal
@@ -681,6 +784,11 @@ export function KafkaExplorerPortfolio() {
         onOpenChange={setIsFavoritesModalOpen}
         onRemoveFavorite={handleRemoveFavorite}
         onSelectMessage={(message) => {
+          // Сообщение из избранного не привязано к строке таблицы: индекса у
+          // него нет (стрелки промолчат), а талон надо забрать себе — иначе
+          // не доехавший ответ по таблице подменил бы его телом соседа.
+          bodyRequest.current += 1;
+          setSelectedIndex(null);
           setSelectedMessage(message);
           setIsFavoritesModalOpen(false);
           setIsModalOpen(true);
