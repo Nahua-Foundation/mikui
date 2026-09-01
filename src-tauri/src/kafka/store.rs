@@ -243,8 +243,20 @@ impl MessageStore {
     pub fn sort_staged(&mut self, newest_first: bool) {
         let staged = &mut self.index[self.committed..];
         if newest_first {
-            staged
-                .sort_unstable_by_key(|m| (std::cmp::Reverse(m.timestamp), m.partition, m.offset));
+            // Тай-брейк должен идти в ТУ ЖЕ сторону, что и основной порядок:
+            // при совпавшем timestamp в одной партиции больший offset новее
+            // и обязан оказаться выше, иначе "newest first" внутри партиции
+            // на самом деле шёл бы старым-вперёд именно там, где сообщения
+            // совпали по времени (обычное дело — брокер отдаёт millis, и в
+            // быстром потоке несколько сообщений легко ловят одну и ту же
+            // миллисекунду).
+            staged.sort_unstable_by_key(|m| {
+                (
+                    std::cmp::Reverse(m.timestamp),
+                    m.partition,
+                    std::cmp::Reverse(m.offset),
+                )
+            });
         } else {
             staged.sort_unstable_by_key(|m| (m.timestamp, m.partition, m.offset));
         }
@@ -375,6 +387,35 @@ mod tests {
         assert_eq!(store.value(0), b"value-2");
         assert_eq!(store.get(2).unwrap().timestamp, 100);
         assert_eq!(store.value(2), b"value-1");
+    }
+
+    #[test]
+    fn same_partition_and_timestamp_breaks_ties_by_offset_in_sort_direction() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        // Один и тот же timestamp в миллисекундах — обычное дело для быстрого
+        // продюсера. Offset внутри партиции всё равно строго возрастающий во
+        // времени, и тай-брейк обязан это уважать.
+        push_simple(&mut store, 0, 1, 500);
+        push_simple(&mut store, 0, 2, 500);
+        push_simple(&mut store, 0, 3, 500);
+
+        store.sort_staged(true);
+        assert_eq!(
+            (0..3)
+                .map(|i| store.get(i).unwrap().offset)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "newest first: больший offset у той же партиции и времени идёт выше"
+        );
+
+        store.sort_staged(false);
+        assert_eq!(
+            (0..3)
+                .map(|i| store.get(i).unwrap().offset)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "oldest first: меньший offset у той же партиции и времени идёт выше"
+        );
     }
 
     #[test]

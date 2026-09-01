@@ -11,6 +11,7 @@ import {
   OpenTopicResult,
   ReadMode,
   ReadRange,
+  SortSpec,
   TopicSchema,
   EMPTY_FILTER,
   EMPTY_RANGE,
@@ -73,6 +74,9 @@ export function KafkaExplorerPortfolio() {
   const [isClusterUsersModalOpen, setIsClusterUsersModalOpen] = useState(false);
   const [isFavoritesModalOpen, setIsFavoritesModalOpen] = useState(false);
   const [filters, setFilters] = useState<MessageFilter>(EMPTY_FILTER);
+  /** Сортировка по клику на заголовок колонки. `null` — обычный порядок
+   *  чтения из `readMode`. */
+  const [sort, setSort] = useState<SortSpec | null>(null);
   const [favorites, setFavorites] = useState<FavoriteMessage[]>([]);
   const [topics, setTopics] = useState<Topic[]>([]);
 
@@ -204,6 +208,7 @@ export function KafkaExplorerPortfolio() {
             partitions: selectedPartitions,
             filter: filters,
             range,
+            sort,
           },
         });
       })
@@ -328,6 +333,38 @@ export function KafkaExplorerPortfolio() {
       if (filterTimer.current !== null) window.clearTimeout(filterTimer.current);
     };
   }, [filters, selectedTopic]);
+
+  // Клик по заголовку колонки — как фильтр, пересчитывается в Rust по уже
+  // загруженному буферу. В отличие от фильтра, который только выбрасывает
+  // строки, сортировка может переставить их местами, поэтому кэш окон сбрасываем.
+  const sortRef = useRef(sort);
+  useEffect(() => {
+    if (!selectedTopic) return;
+    // На первом рендере после открытия топика сортировка уже применена
+    // параметром `open_topic` — второй раз посылать её незачем.
+    if (sortRef.current === sort) return;
+    sortRef.current = sort;
+
+    invoke<number>('set_sort', { sort })
+      .then((visible) => {
+        setTotal(visible);
+        setGeneration((g) => g + 1);
+      })
+      .catch((e) => console.error('set_sort failed', e));
+  }, [sort, selectedTopic]);
+
+  // Пока сортировка по столбцу активна, фоновая догрузка может вклинить новые
+  // строки куда угодно, а не только в хвост — обычная гарантия "хвост дописывается,
+  // экран не едет" здесь не работает (см. `Worker::sort_view`). Приходится
+  // сбрасывать кэш окон на каждый прирост `total`, а не только при явной смене
+  // сортировки.
+  const sortedTotalRef = useRef(total);
+  useEffect(() => {
+    if (!sort) return;
+    if (sortedTotalRef.current === total) return;
+    sortedTotalRef.current = total;
+    setGeneration((g) => g + 1);
+  }, [sort, total]);
 
   // Тело сообщения читается из арены в Rust — быстро, но не мгновенно, а
   // стрелками по таблице бегают быстрее, чем приходят ответы. Талон отсекает
@@ -701,6 +738,8 @@ export function KafkaExplorerPortfolio() {
                 // in progress") — кнопку не предлагаем вовсе.
                 isLoadingMore={isLoadingMore || isLoadingMessages}
                 onLoadMore={handleLoadMore}
+                sort={sort}
+                onSortChange={setSort}
               />
               <StatusBar stats={stats} />
             </>

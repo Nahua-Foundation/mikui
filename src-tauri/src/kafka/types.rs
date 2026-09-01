@@ -39,6 +39,32 @@ pub enum StartFrom {
     Newest,
 }
 
+/// Столбец, по которому таблица сортирована поверх обычного порядка чтения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumn {
+    Partition,
+    Offset,
+    Key,
+    Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+/// Клик по заголовку колонки. `None` (нет активной сортировки) — обычный
+/// порядок чтения из `ReadRange::newest_first`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SortSpec {
+    pub column: SortColumn,
+    pub direction: SortDirection,
+}
+
 /// Фильтр применяется в Rust по сырым байтам, до того как что-либо пересечёт
 /// границу IPC. Пустые поля означают «не фильтровать».
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -143,6 +169,10 @@ pub struct OpenTopicParams {
     /// назван в `start_from`.
     #[serde(default)]
     pub range: ReadRange,
+    /// Сортировка по столбцу, выбранная в таблице до открытия этого топика.
+    /// `None` — обычный порядок чтения.
+    #[serde(default)]
+    pub sort: Option<SortSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

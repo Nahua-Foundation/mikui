@@ -265,6 +265,16 @@ async fn set_filter(
         .await?
 }
 
+/// Клик по заголовку колонки. Работает по буферу в памяти — как `set_filter`,
+/// ни одного сетевого запроса.
+#[tauri::command]
+async fn set_sort(
+    worker: tauri::State<'_, WorkerHandle>,
+    sort: Option<SortSpec>,
+) -> Result<usize, String> {
+    worker.call(|reply| Command::SetSort(sort, reply)).await?
+}
+
 /// Отдаёт ровно те строки, что видны на экране.
 #[tauri::command]
 async fn get_window(
@@ -426,6 +436,7 @@ pub fn run() {
             load_more,
             get_open_topic_progress,
             set_filter,
+            set_sort,
             get_window,
             get_message_body,
             close_topic,

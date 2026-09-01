@@ -363,6 +363,10 @@ pub enum Command {
     LoadMore(LoadMoreParams, Reply<Result<OpenTopicResult, String>>),
     GetOpenTopicProgress(Reply<Result<OpenTopicProgress, String>>),
     SetFilter(MessageFilter, Reply<Result<usize, String>>),
+    /// Клик по заголовку колонки. `None` возвращает обычный порядок чтения.
+    /// Как и `SetFilter`, считается по уже загруженному буферу — без единого
+    /// сетевого запроса.
+    SetSort(Option<SortSpec>, Reply<Result<usize, String>>),
     GetWindow {
         start: usize,
         count: usize,
@@ -729,6 +733,9 @@ struct Worker {
     /// Это и есть то, что видит UI.
     view: Vec<u32>,
     filter: MessageFilter,
+    /// Сортировка по столбцу поверх обычного порядка чтения. `None` — порядок
+    /// как есть в `store` (уже отфильтрованный, см. `rebuild_view`).
+    sort: Option<SortSpec>,
     open_topic: Option<String>,
     /// Сортировать ли по убыванию времени. Ставится при `open_topic`,
     /// переиспользуется без изменений в `load_more` того же топика.
@@ -767,6 +774,7 @@ impl Worker {
             store: MessageStore::default(),
             view: Vec::new(),
             filter: MessageFilter::default(),
+            sort: None,
             open_topic: None,
             newest_first: false,
             pending_read: None,
@@ -805,6 +813,11 @@ impl Worker {
                 }
                 Command::SetFilter(filter, reply) => {
                     self.filter = filter;
+                    self.rebuild_view();
+                    let _ = reply.send(Ok(self.view.len()));
+                }
+                Command::SetSort(sort, reply) => {
+                    self.sort = sort;
                     self.rebuild_view();
                     let _ = reply.send(Ok(self.view.len()));
                 }
@@ -992,6 +1005,7 @@ impl Worker {
 
         self.store.clear();
         self.filter = params.filter;
+        self.sort = params.sort;
         self.newest_first = params.range.newest_first(params.start_from);
         self.open_topic = Some(params.topic.clone());
         self.cursors.clear();
@@ -1805,6 +1819,7 @@ impl Worker {
         self.cancel_pending_read();
         self.open_topic = None;
         self.filter = MessageFilter::default();
+        self.sort = None;
         self.view.clear();
         self.cursors.clear();
         self.has_timestamps = false;
@@ -1849,7 +1864,44 @@ impl Worker {
             }
         }
 
+        if let Some(sort) = self.sort {
+            self.sort_view(&mut view, sort);
+        }
+
         self.view = view;
+    }
+
+    /// Сортировка по клику на заголовок колонки, поверх фильтра.
+    ///
+    /// `sort_by` — стабильная сортировка: сообщения с одинаковым значением
+    /// столбца остаются в том порядке, в котором их поставил обычный порядок
+    /// чтения (время, а внутри него — офсет), а не в произвольном. Пока идёт
+    /// прогрессивная подгрузка, эта сортировка пересчитывается на весь `view`
+    /// при каждом новом раунде — если она активна, уже показанные строки
+    /// перестают быть застрахованы от переезда, в отличие от обычного порядка.
+    fn sort_view(&self, view: &mut [u32], sort: SortSpec) {
+        let desc = sort.direction == SortDirection::Desc;
+        view.sort_by(|&a, &b| {
+            let ma = self
+                .store
+                .get(a as usize)
+                .expect("view index out of sync with store");
+            let mb = self
+                .store
+                .get(b as usize)
+                .expect("view index out of sync with store");
+            let cmp = match sort.column {
+                SortColumn::Partition => ma.partition.cmp(&mb.partition),
+                SortColumn::Offset => ma.offset.cmp(&mb.offset),
+                SortColumn::Timestamp => ma.timestamp.cmp(&mb.timestamp),
+                SortColumn::Key => self.store.key(a as usize).cmp(self.store.key(b as usize)),
+            };
+            if desc {
+                cmp.reverse()
+            } else {
+                cmp
+            }
+        });
     }
 
     /// Отдаёт ровно то, что видно на экране, а не весь буфер.

@@ -1,13 +1,27 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RowPreview } from './types';
+import { RowPreview, SortColumn, SortDirection, SortSpec } from './types';
 import { Virtuoso } from 'react-virtuoso';
 
 const COLUMNS = ['partition', 'offset', 'key', 'message', 'timestamp'] as const;
 const DEFAULT_WIDTHS = ['80px', '100px', '120px', '1fr', '190px'];
 const MIN_COLUMN_PX = 60;
 
+/** `message` не несёт своего значения для сортировки — это склеенный из
+ *  нескольких полей превью тела, кликать по нему незачем. */
+function sortColumnFor(label: (typeof COLUMNS)[number]): SortColumn | null {
+  return label === 'message' ? null : label;
+}
+
+/** unsorted → asc → desc → unsorted. */
+function nextDirection(current: SortDirection | null): SortDirection | null {
+  if (current === null) return 'asc';
+  if (current === 'asc') return 'desc';
+  return null;
+}
+
 /** Один экземпляр на приложение: пересоздавать форматтер на каждую строку
- *  заметно дороже самого форматирования. */
+ *  заметно дороже самого форматирования. `Intl.DateTimeFormat` секунд точнее
+ *  не берёт, поэтому миллисекунды дописываются отдельно. */
 const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
   year: 'numeric',
   month: '2-digit',
@@ -20,7 +34,8 @@ const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
 
 function formatTimestamp(millis: number): string {
   if (!millis) return '—';
-  return TIME_FORMAT.format(new Date(millis));
+  const ms = String(((millis % 1000) + 1000) % 1000).padStart(3, '0');
+  return `${TIME_FORMAT.format(new Date(millis))}.${ms}`;
 }
 
 interface MessageRowProps {
@@ -91,6 +106,9 @@ interface MessagesPanelProps {
   canLoadMore: boolean;
   isLoadingMore: boolean;
   onLoadMore: () => void;
+  /** Клик по заголовку колонки. `null` — обычный порядок чтения. */
+  sort: SortSpec | null;
+  onSortChange: (sort: SortSpec | null) => void;
 }
 
 export function MessagesPanel({
@@ -103,6 +121,8 @@ export function MessagesPanel({
   canLoadMore,
   isLoadingMore,
   onLoadMore,
+  sort,
+  onSortChange,
 }: MessagesPanelProps) {
   const [colWidths, setColWidths] = useState<string[]>(DEFAULT_WIDTHS);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -170,6 +190,17 @@ export function MessagesPanel({
     [onMouseMove, stopDragging],
   );
 
+  const handleHeaderClick = useCallback(
+    (label: (typeof COLUMNS)[number]) => {
+      const column = sortColumnFor(label);
+      if (!column) return;
+      const current = sort?.column === column ? sort.direction : null;
+      const direction = nextDirection(current);
+      onSortChange(direction ? { column, direction } : null);
+    },
+    [sort, onSortChange],
+  );
+
   const handleRangeChanged = useCallback(
     ({ startIndex, endIndex }: { startIndex: number; endIndex: number }) =>
       onRangeChanged(startIndex, endIndex),
@@ -223,9 +254,17 @@ export function MessagesPanel({
             const flexIndex = colWidths.indexOf('1fr');
             const showRightHandle = colWidths[i] !== '1fr' && (flexIndex === -1 || i < flexIndex);
             const showLeftHandle = colWidths[i] !== '1fr' && flexIndex !== -1 && i > flexIndex;
+            const column = sortColumnFor(label);
+            const active = column && sort?.column === column ? sort.direction : null;
             return (
               <div key={label} className="relative">
-                <div>{label}</div>
+                <div
+                  className={column ? 'cursor-pointer hover:text-brand' : undefined}
+                  onClick={column ? () => handleHeaderClick(label) : undefined}
+                >
+                  {label}
+                  {active && <span className="ml-1">{active === 'asc' ? '▲' : '▼'}</span>}
+                </div>
                 {showRightHandle && (
                   <div
                     onMouseDown={(e) => startDragging(i, 1, e)}

@@ -71,6 +71,17 @@ export const EMPTY_FILTER: MessageFilter = {
   case_sensitive: false,
 };
 
+/** Столбцы, по которым можно кликнуть заголовок и отсортировать таблицу. */
+export type SortColumn = 'partition' | 'offset' | 'key' | 'timestamp';
+export type SortDirection = 'asc' | 'desc';
+
+/** Сортировка поверх обычного порядка чтения. `null` — обычный порядок,
+ *  заданный `ReadMode` (см. `ReadRange.newest_first` в Rust). */
+export interface SortSpec {
+  column: SortColumn;
+  direction: SortDirection;
+}
+
 /** С какого конца читать. То, что понимает бэкенд, когда границ не задано. */
 export type StartFrom = 'oldest' | 'newest';
 

@@ -10,6 +10,14 @@ import { BodyFormat, FullMessage, MessageHeader } from '../types';
  *  ещё до того, как пользователь что-то увидит. */
 const MAX_RENDERED_LINES = 2000;
 
+/** `toLocaleString` секунд точнее не берёт, поэтому миллисекунды дописываются
+ *  отдельно — как в таблице сообщений. */
+function formatTimestamp(millis: number): string {
+  if (!millis) return '—';
+  const ms = String(((millis % 1000) + 1000) % 1000).padStart(3, '0');
+  return `${new Date(millis).toLocaleString()}.${ms}`;
+}
+
 /** Токены JSON: ключ, строка, число, boolean, null, пунктуация. */
 const JSON_TOKEN =
   /("(?:\\.|[^"\\])*")\s*:|("(?:\\.|[^"\\])*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|(true|false)|(null)|([{}[\],:])/g;
@@ -223,7 +231,7 @@ export function MessageDetailsModal({
             </div>
             <div>
               <div className="font-mono text-sm text-soft mb-1">Timestamp</div>
-              <div className="font-mono text-slate-50">{message.timestamp ? new Date(message.timestamp).toLocaleString() : '—'}</div>
+              <div className="font-mono text-slate-50">{formatTimestamp(message.timestamp)}</div>
             </div>
           </div>
           
