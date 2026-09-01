@@ -48,7 +48,7 @@ export function ClusterArchiveModal({
               onClick={onCreateNew}
               className="bg-brand text-surface hover:bg-brand-hover font-mono"
             >
-              <Plus className="size-4 mr-2" />
+              <Plus className="size-4" />
               Create New
             </Button>
           </div>

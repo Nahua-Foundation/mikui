@@ -115,7 +115,10 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
   const [toOffset, setToOffset] = useState('');
   const [fromTime, setFromTime] = useState('');
   const [toTime, setToTime] = useState('');
-  const [manualTime, setManualTime] = useState(false);
+  // По умолчанию — ручной ввод: нативный datetime-local неудобен для того,
+  // как время обычно и получают — скопированным из лога, а не подобранным
+  // в пикере по клику.
+  const [manualTime, setManualTime] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Открыли меню — показываем то, что читается сейчас, а не остатки прошлой
@@ -196,7 +199,7 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
         <ChevronDown className="size-3.5" />
       </DropdownMenuTrigger>
 
-      <DropdownMenuContent className="bg-surface border-edge min-w-56" align="end">
+      <DropdownMenuContent className="bg-surface border-edge w-56" align="end">
         <DropdownMenuItem
           className={`font-mono cursor-pointer ${
             mode === 'newest' ? 'bg-edge text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
@@ -220,52 +223,7 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
 
         <DropdownMenuSub>
           <DropdownMenuSubTrigger
-            disabled={!singlePartition}
-            className={`font-mono ${
-              mode === 'offset' ? 'bg-edge text-slate-50' : 'text-soft'
-            } data-[disabled]:text-dim`}
-          >
-            <Hash className="size-4" />
-            specific offset
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="bg-surface border-edge w-64 p-3 space-y-3">
-            <div className="space-y-1.5">
-              <Label className="font-mono text-xs text-soft">From offset</Label>
-              <Input
-                value={fromOffset}
-                onChange={(e) => setFromOffset(e.target.value)}
-                onKeyDown={keepKeysInInput(applyOffsets)}
-                placeholder="from offset"
-                className={inputClass}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="font-mono text-xs text-soft">To offset</Label>
-              <Input
-                value={toOffset}
-                onChange={(e) => setToOffset(e.target.value)}
-                onKeyDown={keepKeysInInput(applyOffsets)}
-                placeholder="to offset"
-                className={inputClass}
-              />
-            </div>
-            <p className="font-mono text-xs text-dim">
-              Leave one side empty to read from — or up to — that offset.
-            </p>
-            {error && <p className="font-mono text-xs text-danger">{error}</p>}
-            <Button
-              onClick={applyOffsets}
-              size="sm"
-              className="w-full bg-brand text-surface hover:bg-brand-hover font-mono"
-            >
-              Apply
-            </Button>
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
-            className={`font-mono ${
+            className={`font-mono flex items-center gap-2 ${
               mode === 'timestamp' ? 'bg-edge text-slate-50' : 'text-soft'
             }`}
           >
@@ -299,16 +257,64 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
             </div>
             {/* Пикер удобнее для «примерно тогда-то», но время из лога в него
                 не вставить — а именно так его обычно и получают. */}
-            <button
-              type="button"
-              onClick={() => setManualTime((v) => !v)}
-              className="font-mono text-xs text-dim hover:text-brand bg-transparent border-none p-0 cursor-pointer"
-            >
-              {manualTime ? 'Use the date picker' : 'Type an exact value instead'}
-            </button>
+            <p className="font-mono text-xs text-dim">
+              Or{' '}
+              <button
+                type="button"
+                onClick={() => setManualTime((v) => !v)}
+                className="font-mono text-xs text-brand hover:text-brand-hover bg-transparent border-none p-0 cursor-pointer"
+              >
+                {manualTime ? 'use the date picker' : 'type an exact value'}
+              </button>
+            </p>
             {error && <p className="font-mono text-xs text-danger">{error}</p>}
             <Button
               onClick={applyTimestamps}
+              size="sm"
+              className="w-full bg-brand text-surface hover:bg-brand-hover font-mono"
+            >
+              Apply
+            </Button>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger
+            disabled={!singlePartition}
+            className={`font-mono flex items-center gap-2 ${
+              mode === 'offset' ? 'bg-edge text-slate-50' : 'text-soft'
+            } data-[disabled]:text-dim`}
+          >
+            <Hash className="size-4" />
+            specific offset
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent className="bg-surface border-edge w-64 p-3 space-y-3">
+            <div className="space-y-1.5">
+              <Label className="font-mono text-xs text-soft">From offset</Label>
+              <Input
+                value={fromOffset}
+                onChange={(e) => setFromOffset(e.target.value)}
+                onKeyDown={keepKeysInInput(applyOffsets)}
+                placeholder="from offset"
+                className={inputClass}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="font-mono text-xs text-soft">To offset</Label>
+              <Input
+                value={toOffset}
+                onChange={(e) => setToOffset(e.target.value)}
+                onKeyDown={keepKeysInInput(applyOffsets)}
+                placeholder="to offset"
+                className={inputClass}
+              />
+            </div>
+            <p className="font-mono text-xs text-dim">
+              Leave one side empty to read from — or up to — that offset.
+            </p>
+            {error && <p className="font-mono text-xs text-danger">{error}</p>}
+            <Button
+              onClick={applyOffsets}
               size="sm"
               className="w-full bg-brand text-surface hover:bg-brand-hover font-mono"
             >

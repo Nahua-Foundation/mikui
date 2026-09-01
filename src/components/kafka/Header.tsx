@@ -340,7 +340,7 @@ export function HeaderDesktop({
                 {/* Меню не закрывается по клику (`onSelect` гасится): выбрать
                     три партиции из двадцати, открывая список заново на каждую,
                     — это не выбор, а перебор. */}
-                <DropdownMenuContent className="bg-surface border-edge min-w-40 max-h-80 overflow-auto" align="end">
+                <DropdownMenuContent className="bg-surface border-edge min-w-24 max-h-80 overflow-auto" align="end">
                   <DropdownMenuCheckboxItem
                     checked={allPartitions}
                     onSelect={(e) => e.preventDefault()}

@@ -1351,6 +1351,14 @@ impl Worker {
             cursor.high = high;
             cursor.next = if newest_first { high } else { low };
             cursor.exhausted = low >= high;
+            // Явный диапазон — это законченный запрос «всё между A и B», а не
+            // открытое чтение постранично. Дефолтный `budget` (лимит страницы
+            // для `newest`/`oldest`) здесь не должен обрывать раньше настоящей
+            // границы диапазона — иначе «to» молча превращалось бы в очередной
+            // «Load more», хотя пользователь его не просил. Раунд всё равно
+            // остановят дедлайн и байтовый бюджет чтения, если диапазон и
+            // правда огромен.
+            cursor.budget = cursor.budget.max(high - low);
         }
         Ok(())
     }
@@ -2094,6 +2102,31 @@ mod tests {
         assert_eq!(
             walk(cursor(0, 1000, OLDEST, 300), OLDEST, 250),
             vec![(0, 250), (250, 300)],
+        );
+    }
+
+    /// Регрессия: явный диапазон "от A до B" останавливался на дефолтном
+    /// лимите страницы задолго до B — `apply_range` сужал `[low, high)` до
+    /// запрошенных границ, но не трогал унаследованный от `open_topic`
+    /// `budget`, и `next_window` бросал раунды, даже не дойдя до настоящего
+    /// конца диапазона. Фикс раздвигает `budget` под весь узкий диапазон —
+    /// точно так же, как это теперь делает `apply_range`.
+    #[test]
+    fn a_bounded_range_walks_all_the_way_to_its_far_edge() {
+        // Диапазон [0, 1000) при странично-мелком бюджете 300 обрывался бы
+        // на 300, не дойдя до 1000 — см. `budget_caps_the_last_window_and_stops_the_walk`.
+        let mut c = cursor(0, 1000, OLDEST, 300);
+        c.budget = c.budget.max(c.high - c.low);
+        assert_eq!(
+            walk(c, OLDEST, 250),
+            vec![(0, 250), (250, 500), (500, 750), (750, 1000)],
+        );
+
+        let mut c = cursor(0, 1000, NEWEST, 300);
+        c.budget = c.budget.max(c.high - c.low);
+        assert_eq!(
+            walk(c, NEWEST, 250),
+            vec![(750, 1000), (500, 750), (250, 500), (0, 250)],
         );
     }
 
