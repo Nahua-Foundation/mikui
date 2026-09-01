@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::kafka::ClusterConnectPayload;
 use rdkafka::ClientConfig;
 
@@ -12,7 +14,15 @@ pub fn supported_sasl_mechanisms() -> Vec<&'static str> {
     mechs
 }
 
-pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
+/// Общая часть конфигурации: адреса, сеть, безопасность.
+///
+/// Отдельно от `get_cluster_config` потому, что отправка сообщения поднимает
+/// продьюсера на том же подключении, а консьюмерские настройки (`fetch.*`,
+/// `queued.*`, `auto.offset.reset`) для него не значат ничего: librdkafka
+/// сложит их в конфиг, увидит чужой scope и на каждую напишет предупреждение.
+/// Держать «куда и под кем подключаемся» в одном месте, а «читаем или пишем» —
+/// в другом, заодно избавляет от риска, что продьюсер уедет мимо TLS.
+pub fn base_config(conf: &ClusterConnectPayload) -> ClientConfig {
     let mut cc = ClientConfig::new();
 
     cc.set("bootstrap.servers", &conf.brokers);
@@ -70,6 +80,14 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
     cc.set("connections.max.idle.ms", "540000");
     cc.set("reconnect.backoff.ms", "300");
     cc.set("reconnect.backoff.max.ms", "10000");
+
+    apply_security(&mut cc, conf);
+
+    cc
+}
+
+pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
+    let mut cc = base_config(conf);
 
     // --- Fetch ------------------------------------------------------------
     // Пара (min.bytes=1, wait.max.ms=500) — дефолт librdkafka, и она лучше
@@ -139,10 +157,50 @@ pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
     // реально уцелело.
     cc.set("auto.offset.reset", "earliest");
 
-    apply_security(&mut cc, conf);
+    cc
+}
+
+/// Конфигурация продьюсера поверх уже настроенного подключения.
+///
+/// Берёт готовый `base_config`, а не payload: пароль сохранённой учётки живёт
+/// в keychain и подставляется один раз, при подключении. Второй раз ходить за
+/// ним ради отправки одного сообщения незачем.
+pub fn producer_config(base: &ClientConfig) -> ClientConfig {
+    let mut cc = base.clone();
+
+    // Java-совместимый хэш ключа. Дефолт librdkafka (`consistent_random`)
+    // считает CRC32 и раскладывает ключи ИНАЧЕ, чем штатный продьюсер сервиса:
+    // тестовое сообщение легло бы не в ту партицию, в которую ходят боевые, и
+    // весь смысл отправки «как настоящее» пропал бы. Оба варианта одинаково
+    // кладут сообщение без ключа в случайную партицию.
+    cc.set("partitioner", "murmur2_random");
+
+    // Подтверждение от ВСЕЙ ISR. Просмотрщик отправляет по одному сообщению
+    // руками и сразу показывает партицию с офсетом — обещать это, не дождавшись
+    // реплик, значит показать офсет, который может и не пережить смену лидера.
+    cc.set("acks", "all");
+
+    // Столько librdkafka пытается доставить сообщение, прежде чем сдаться. Та же
+    // константа — потолок ожидания в `Worker::produce`: показать «отправлено»
+    // без отчёта о доставке нельзя, а ждать дольше библиотеки бессмысленно.
+    cc.set("message.timeout.ms", PRODUCE_TIMEOUT.as_millis().to_string());
+
+    // Дефолт librdkafka — 5 мс накопления батча. Батчить тут нечего: сообщение
+    // ровно одно, и эти миллисекунды были бы чистой задержкой ответа.
+    cc.set("linger.ms", "0");
+
+    // enable.idempotence НЕ включаем: она требует отдельного права
+    // IdempotentWrite на кластере, которого у учётки для ручной отправки
+    // обычно нет, — а без него продьюсер не создастся вовсе.
 
     cc
 }
+
+/// Потолок доставки одного сообщения — общий для librdkafka и для собственного
+/// ожидания отчёта в `Worker::produce`. Разъехаться этим двум числам нельзя:
+/// меньшее из них решало бы за большее, и либо воркер сдавался бы раньше
+/// библиотеки, либо ждал впустую после того, как та уже всё бросила.
+pub const PRODUCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn apply_security(cc: &mut ClientConfig, conf: &ClusterConnectPayload) {
     // Механизм по умолчанию. PLAIN/SCRAM/OAUTHBEARER librdkafka умеет сама,

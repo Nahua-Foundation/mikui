@@ -1,4 +1,4 @@
-import { ChevronDown, Filter, RefreshCw, Play, Folder, Search, User, Users } from 'lucide-react';
+import { ChevronDown, Filter, RefreshCw, Play, Folder, Search, Send, User, Users } from 'lucide-react';
 import { Button } from '../ui/button';
 import {
   DropdownMenu,
@@ -55,6 +55,7 @@ interface HeaderDesktopProps {
   onFiltersChange: (filters: MessageFilter) => void;
   onRefresh: () => void;
   onOpenFavorites: () => void;
+  onProduce: () => void;
 }
 
 /**
@@ -108,6 +109,7 @@ export function HeaderDesktop({
   onFiltersChange,
   onRefresh,
   onOpenFavorites,
+  onProduce,
 }: HeaderDesktopProps) {
   const partitions = topic ? Array.from({ length: topic.partitions }, (_, i) => i) : [];
   const hasActiveFilters = filters.key.trim() !== '' || filters.value.trim() !== '';
@@ -404,6 +406,23 @@ export function HeaderDesktop({
                 title="Live tail — not implemented yet"
               >
                 <Play className="size-4" />
+              </button>
+            </div>
+          </MenuItem>
+        )}
+
+        {/* Отправка стоит рядом с чтением, а не в настройках топика: это
+            действие над теми же данными, что и в таблице, и делают его в том же
+            заходе — посмотреть, что лежит, и положить рядом своё. */}
+        {topic && (
+          <MenuItem>
+            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
+              <button
+                onClick={onProduce}
+                className="text-soft hover:text-brand bg-transparent border-none outline-none cursor-pointer p-0 transition-colors"
+                title="Produce a message"
+              >
+                <Send className="size-4" />
               </button>
             </div>
           </MenuItem>

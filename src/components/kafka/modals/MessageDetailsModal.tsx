@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { BodyFormat, FullMessage, MessageHeader } from '../types';
+import { highlightLine } from '../syntax';
 
 /** Потолок отрисовки. Тело на 10 МБ иначе положило бы вкладку на лопатки
  *  ещё до того, как пользователь что-то увидит. */
@@ -16,60 +17,6 @@ function formatTimestamp(millis: number): string {
   if (!millis) return '—';
   const ms = String(((millis % 1000) + 1000) % 1000).padStart(3, '0');
   return `${new Date(millis).toLocaleString()}.${ms}`;
-}
-
-/** Токены JSON: ключ, строка, число, boolean, null, пунктуация. */
-const JSON_TOKEN =
-  /("(?:\\.|[^"\\])*")\s*:|("(?:\\.|[^"\\])*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|(true|false)|(null)|([{}[\],:])/g;
-
-/**
- * Раскрашивает строку JSON несколькими span-ами.
- *
- * Раньше здесь был `line.split('')` с одним `<span>` на КАЖДЫЙ символ: тело
- * в 100 КБ превращалось в сотню тысяч DOM-узлов и намертво вешало окно.
- * Теперь на строку приходится несколько узлов вместо сотни.
- *
- * `enumValues` — имена значений из СХЕМЫ (`FullMessage.enum_values`), а не
- * догадка по виду строки: decoder.rs печатает enum тем же JSON-string, что и
- * обычную строку, и обычные значения вроде `"USDT"` или `"RUB"` выглядят
- * ровно как КАПС-имя enum. Раньше здесь была именно такая догадка по
- * регулярке — и красила подобные строки как enum, хотя по контракту это
- * просто строки.
- */
-function highlightLine(line: string, enumValues: ReadonlySet<string>) {
-  const parts: React.ReactNode[] = [];
-  let last = 0;
-  let match: RegExpExecArray | null;
-
-  JSON_TOKEN.lastIndex = 0;
-  while ((match = JSON_TOKEN.exec(line)) !== null) {
-    if (match.index > last) {
-      parts.push(<span key={`t${last}`} className="text-soft">{line.slice(last, match.index)}</span>);
-    }
-    const [full, propertyKey, str, num, bool, nul, punct] = match;
-    const key = `m${match.index}`;
-    if (propertyKey !== undefined) {
-      parts.push(<span key={key} className="text-brand">{propertyKey}</span>);
-      parts.push(<span key={`${key}c`} className="text-syntax-brace">{full.slice(propertyKey.length)}</span>);
-    } else if (str !== undefined) {
-      const cls = enumValues.has(str.slice(1, -1)) ? 'text-syntax-enum' : 'text-syntax-string';
-      parts.push(<span key={key} className={cls}>{str}</span>);
-    } else if (num !== undefined) {
-      parts.push(<span key={key} className="text-syntax-bracket">{num}</span>);
-    } else if (bool !== undefined) {
-      parts.push(<span key={key} className="text-syntax-boolean">{bool}</span>);
-    } else if (nul !== undefined) {
-      parts.push(<span key={key} className="text-dim">{nul}</span>);
-    } else if (punct !== undefined) {
-      parts.push(<span key={key} className="text-syntax-brace">{punct}</span>);
-    }
-    last = match.index + full.length;
-  }
-
-  if (last < line.length) {
-    parts.push(<span key={`t${last}`} className="text-soft">{line.slice(last)}</span>);
-  }
-  return parts.length > 0 ? parts : <span className="text-soft">{line}</span>;
 }
 
 interface MessageDetailsModalProps {

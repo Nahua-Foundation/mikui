@@ -285,7 +285,9 @@ pub struct RowPreview {
     pub decode_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `Deserialize` здесь нужен ровно затем, что заголовки не только показываются
+/// у прочитанного сообщения, но и вводятся руками у отправляемого.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MessageHeader {
     pub key: String,
@@ -314,6 +316,95 @@ pub struct FullMessage {
     /// сверяться, попросту нет.
     pub enum_values: Vec<String>,
     pub headers: Vec<MessageHeader>,
+}
+
+// --- Отправка сообщения ------------------------------------------------------
+
+/// В каком виде пользователь ввёл тело отправляемого сообщения.
+///
+/// Шире, чем `proto::BodyFormat`, намеренно. Тот описывает, КАК ПОКАЗЫВАТЬ уже
+/// прочитанный топик, и hex ему не нужен: двоичное тело там и так видно меткой
+/// `[binary]`. А при отправке hex — единственный способ положить в топик байты,
+/// которых не выражает ни текст, ни схема.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadFormat {
+    Text,
+    Json,
+    Proto,
+    /// Схем-реестра в приложении пока нет: тело уезжает текстом, как `Text`.
+    Avro,
+    Hex,
+}
+
+/// Форма отправки ровно в том виде, в каком её заполнили.
+///
+/// Тело едет строкой, а не байтами: превращать его в байты — дело `lib.rs`,
+/// потому что для `proto` для этого нужны и каталог настроек, и схема топика.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProduceRequest {
+    pub topic: String,
+    /// `None` — партицию выбирает партишенер по ключу (murmur2, как в Java;
+    /// см. `helpers::producer_config`).
+    #[serde(default)]
+    pub partition: Option<i32>,
+    /// Пустая строка — ключа НЕТ, и это не то же самое, что ключ нулевой длины:
+    /// от наличия ключа зависит и партиционирование, и compaction.
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub headers: Vec<MessageHeader>,
+    pub format: PayloadFormat,
+    #[serde(default)]
+    pub payload: String,
+    /// Полное имя message, которым кодировать тело. Только для `proto`, и
+    /// вполне может отличаться от сохранённого в схеме топика: отправляют и не
+    /// тот тип, которым топик читают.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Готовая к отправке запись: тело уже в байтах.
+///
+/// Воркер не знает ни про схемы, ни про каталог настроек — к нему приезжает
+/// уже закодированное.
+#[derive(Debug, Clone)]
+pub struct ProduceRecord {
+    pub topic: String,
+    pub partition: Option<i32>,
+    pub key: Option<Vec<u8>>,
+    pub headers: Vec<MessageHeader>,
+    pub payload: Vec<u8>,
+}
+
+/// Куда легло отправленное сообщение. Берётся из отчёта о доставке, то есть
+/// это то, что подтвердил брокер, а не то, что мы попросили.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProduceResult {
+    pub partition: i32,
+    pub offset: i64,
+}
+
+/// Насколько плохо то, что ввели в поле тела.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueSeverity {
+    /// Отправить всё равно можно: байты из введённого получаются, просто это
+    /// не то, чем притворяется выбранный формат. Так ведёт себя невалидный
+    /// JSON — он уедет в топик тем самым текстом, который набрали.
+    Warning,
+    /// Байтов из введённого не получить вовсе, отправка заблокирована.
+    Error,
+}
+
+/// Что показать под полем ввода тела.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PayloadIssue {
+    pub severity: IssueSeverity,
+    pub message: String,
 }
 
 #[cfg(test)]

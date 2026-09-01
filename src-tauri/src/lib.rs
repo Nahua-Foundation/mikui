@@ -7,7 +7,7 @@ mod proto;
 
 use config::{ClusterConfig, ClusterUser, Settings};
 use kafka::*;
-use proto::{BodyFormat, TopicSchemaView};
+use proto::{BodyFormat, ProtoMessageForm, TopicSchemaView};
 
 /// Подставляет пароль из keychain, если фронт его не прислал.
 ///
@@ -413,6 +413,110 @@ async fn apply_topic_schema(
     proto::view(&app, &cluster, &topic)
 }
 
+// --- Отправка сообщения ------------------------------------------------------
+
+/// Превращает введённое тело в байты.
+///
+/// JSON здесь НЕ проверяется намеренно: невалидный JSON уезжает в топик тем
+/// самым текстом, который набрали, — предупредить о нём это дело
+/// `check_produce_payload`. А вот proto и hex либо кодируются, либо не дают
+/// байтов вовсе, и притворяться, что дали, нельзя.
+fn encode_payload(
+    app: &tauri::AppHandle,
+    cluster: Option<&str>,
+    request: &ProduceRequest,
+) -> Result<Vec<u8>, String> {
+    match request.format {
+        PayloadFormat::Text | PayloadFormat::Json | PayloadFormat::Avro => {
+            Ok(request.payload.as_bytes().to_vec())
+        }
+        PayloadFormat::Hex => kafka::decode_hex(&request.payload),
+        PayloadFormat::Proto => {
+            let cluster = cluster.ok_or("not connected to a cluster")?;
+            let message = request
+                .message
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .ok_or("pick the message type to encode with")?;
+            proto::encode(app, cluster, &request.topic, message, &request.payload)
+        }
+    }
+}
+
+/// Что показать под полем ввода тела, пока его набирают.
+///
+/// Отдельная команда, а не проверка на фронте, ровно затем, чтобы предупреждение
+/// не могло разойтись с отправкой: и то, и другое считает `encode_payload`, то
+/// есть один и тот же код. Проверка на фронте неизбежно разъехалась бы —
+/// повторить разбор .proto в TypeScript нечем.
+#[tauri::command]
+async fn check_produce_payload(
+    app: tauri::AppHandle,
+    cluster: Option<String>,
+    request: ProduceRequest,
+) -> Result<Option<PayloadIssue>, String> {
+    // Невалидный JSON — предупреждение, а не отказ: пользователь мог осознанно
+    // класть в JSON-топик что-то другое, и запрещать ему это приложение для
+    // отладки не должно.
+    if request.format == PayloadFormat::Json {
+        if request.payload.trim().is_empty() {
+            return Ok(None);
+        }
+        return Ok(serde_json::from_str::<serde_json::Value>(&request.payload)
+            .err()
+            .map(|e| PayloadIssue {
+                severity: IssueSeverity::Warning,
+                message: e.to_string(),
+            }));
+    }
+
+    Ok(encode_payload(&app, cluster.as_deref(), &request)
+        .err()
+        .map(|message| PayloadIssue {
+            severity: IssueSeverity::Error,
+            message,
+        }))
+}
+
+/// Заготовка тела и имена enum-значений выбранного message — всё, что форме
+/// отправки нужно знать про выбранный тип.
+#[tauri::command]
+async fn proto_message_form(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    message: String,
+) -> Result<ProtoMessageForm, String> {
+    proto::message_form(&app, &cluster, &topic, &message)
+}
+
+/// Кладёт сообщение в топик.
+///
+/// Тело кодируется ЗДЕСЬ, а не в воркере: для protobuf нужны каталог настроек и
+/// схема топика, а воркер про них не знает и знать не должен — так же, как
+/// декодер для чтения собирается в `apply_topic_schema`.
+#[tauri::command]
+async fn produce_message(
+    app: tauri::AppHandle,
+    worker: tauri::State<'_, WorkerHandle>,
+    cluster: Option<String>,
+    request: ProduceRequest,
+) -> Result<ProduceResult, String> {
+    let payload = encode_payload(&app, cluster.as_deref(), &request)?;
+    let record = ProduceRecord {
+        topic: request.topic,
+        partition: request.partition,
+        // Пустой ключ — это ОТСУТСТВИЕ ключа, а не ключ нулевой длины: от
+        // разницы зависит и партиционирование, и compaction.
+        key: Some(request.key).filter(|k| !k.is_empty()).map(String::into_bytes),
+        headers: request.headers,
+        payload,
+    };
+    worker
+        .call(|reply| Command::Produce(record, reply))
+        .await?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -446,6 +550,9 @@ pub fn run() {
             remove_proto_file,
             save_topic_schema,
             apply_topic_schema,
+            proto_message_form,
+            check_produce_payload,
+            produce_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

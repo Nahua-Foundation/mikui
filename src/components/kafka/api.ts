@@ -16,6 +16,10 @@ import {
   MessageFilter,
   OpenTopicProgress,
   OpenTopicResult,
+  PayloadIssue,
+  ProduceRequest,
+  ProduceResult,
+  ProtoMessageForm,
   ReadRange,
   RowPreview,
   Settings,
@@ -181,3 +185,27 @@ export const saveTopicSchema = (
  */
 export const applyTopicSchema = (cluster: string, topic: string) =>
   invoke<TopicSchema | null>('apply_topic_schema', { cluster, topic });
+
+// --- Отправка сообщения -------------------------------------------------------
+
+/** Заготовка тела и имена enum-значений выбранного message. */
+export const protoMessageForm = (cluster: string, topic: string, message: string) =>
+  invoke<ProtoMessageForm>('proto_message_form', { cluster, topic, message });
+
+/**
+ * Что показать под полем ввода тела, пока его набирают.
+ *
+ * Проверяет Rust, а не фронт, ровно затем, чтобы предупреждение не могло
+ * разойтись с отправкой: и то, и другое считает один и тот же код. Повторить
+ * разбор .proto в TypeScript всё равно нечем, а расходиться этим двум местам
+ * нельзя — иначе форма разрешала бы отправить то, что бэкенд отвергнет.
+ *
+ * `null` — претензий нет.
+ */
+export const checkProducePayload = (cluster: string | null, request: ProduceRequest) =>
+  invoke<PayloadIssue | null>('check_produce_payload', { cluster, request });
+
+/** Кладёт сообщение в топик и ждёт отчёта о доставке: партиция и офсет в
+ *  ответе — те, что подтвердил брокер. */
+export const produceMessage = (cluster: string | null, request: ProduceRequest) =>
+  invoke<ProduceResult>('produce_message', { cluster, request });

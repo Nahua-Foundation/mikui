@@ -28,6 +28,7 @@ import { ClusterConfigModal } from './kafka';
 import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
 import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
 import { FavoritesModal } from './kafka';
+import { ProduceMessageModal } from './kafka/modals/ProduceMessageModal';
 import { useMessageWindow } from './kafka/useMessageWindow';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -73,6 +74,7 @@ export function KafkaExplorerPortfolio() {
   const [isClusterArchiveModalOpen, setIsClusterArchiveModalOpen] = useState(false);
   const [isClusterUsersModalOpen, setIsClusterUsersModalOpen] = useState(false);
   const [isFavoritesModalOpen, setIsFavoritesModalOpen] = useState(false);
+  const [isProduceModalOpen, setIsProduceModalOpen] = useState(false);
   const [filters, setFilters] = useState<MessageFilter>(EMPTY_FILTER);
   /** Сортировка по клику на заголовок колонки. `null` — обычный порядок
    *  чтения из `readMode`. */
@@ -672,6 +674,8 @@ export function KafkaExplorerPortfolio() {
 
   const handleOpenFavorites = useCallback(() => setIsFavoritesModalOpen(true), []);
 
+  const handleOpenProduce = useCallback(() => setIsProduceModalOpen(true), []);
+
   const handleAddToFavorite = useCallback(
     (message: FullMessage) => {
       setFavorites((prev) => [
@@ -713,6 +717,7 @@ export function KafkaExplorerPortfolio() {
         onFiltersChange={setFilters}
         onRefresh={handleRefresh}
         onOpenFavorites={handleOpenFavorites}
+        onProduce={handleOpenProduce}
       />
 
       <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">
@@ -754,6 +759,17 @@ export function KafkaExplorerPortfolio() {
         onAddToFavorite={handleAddToFavorite}
         onNavigate={handleNavigateMessage}
         format={openSchema?.format}
+      />
+
+      {/* Схема — та же, что применена к открытому топику: форма отправки
+          предлагает те же типы, которыми таблица прямо сейчас читает, и
+          второй раз ходить за ней на диск незачем. */}
+      <ProduceMessageModal
+        topic={selectedTopic}
+        cluster={schemaCluster}
+        schema={openSchema}
+        open={isProduceModalOpen}
+        onOpenChange={setIsProduceModalOpen}
       />
 
       <TopicConfigModal

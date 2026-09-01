@@ -123,6 +123,34 @@ pub fn decoder(
     Ok(Some(Arc::new(ProtoDecoder::new(message))))
 }
 
+/// Descriptor одного message схемы — по имени, а не по тому, что выбрано в
+/// настройках топика.
+///
+/// Имя приходит отдельным аргументом ради отправки: класть в топик руками
+/// приходится и не тот тип, которым топик читают (команду, а не событие;
+/// сообщение старой версии контракта), и заставлять ради этого переключать
+/// настройки показа значило бы менять то, как выглядит уже открытая таблица.
+pub fn message(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    name: &str,
+) -> Result<protobuf::reflect::MessageDescriptor, String> {
+    let schemas = list(root)?;
+    let index = position(&schemas, cluster, topic)
+        .ok_or_else(|| format!("no .proto schema for topic {topic}"))?;
+    let schema = &schemas[index];
+    if schema.files.is_empty() {
+        return Err(format!("no .proto files loaded for topic {topic}"));
+    }
+
+    let dir = dir_of(root, schema);
+    let linked = schema::linked(&dir, &schema.files)?;
+    linked
+        .message(name)
+        .ok_or_else(|| format!("message {name} is not in the loaded .proto files"))
+}
+
 // --- Изменение --------------------------------------------------------------
 
 /// Добавляет .proto к топику.

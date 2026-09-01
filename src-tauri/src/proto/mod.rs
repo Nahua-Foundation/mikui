@@ -9,6 +9,7 @@ mod decoder;
 mod files;
 mod schema;
 mod store;
+mod template;
 mod types;
 
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 pub use decoder::ProtoDecoder;
-pub use types::{BodyFormat, TopicSchemaView};
+pub use types::{BodyFormat, ProtoMessageForm, TopicSchemaView};
 
 use crate::config;
 
@@ -75,4 +76,50 @@ pub fn set_options(
 
 pub fn forget_cluster(app: &AppHandle, cluster: &str) -> Result<(), String> {
     store::forget_cluster(&config::config_dir(app)?, cluster)
+}
+
+// --- Отправка ---------------------------------------------------------------
+//
+// Здесь схема работает в обратную сторону: не «байты из Kafka → JSON», а
+// «JSON из формы → байты в Kafka». Обе стороны обязаны ходить через один и тот
+// же descriptor, иначе приложение показывало бы одно, а отправляло другое.
+
+/// Заготовка тела и имена enum-значений выбранного message.
+pub fn message_form(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    message: &str,
+) -> Result<ProtoMessageForm, String> {
+    let md = store::message(&config::config_dir(app)?, cluster, topic, message)?;
+    let template = template::skeleton(&md);
+    // Список берётся у декодера, а не собирается здесь заново: он же красит
+    // enum в модалке чтения. Второй способ решать, что здесь enum, а что просто
+    // строка, рано или поздно разошёлся бы с первым — и одно и то же значение
+    // подсвечивалось бы по-разному при отправке и при чтении.
+    let enum_values = ProtoDecoder::new(md).enum_values().to_vec();
+    Ok(ProtoMessageForm {
+        template,
+        enum_values,
+    })
+}
+
+/// Кодирует введённый JSON в protobuf по выбранному message.
+///
+/// Неизвестные поля НЕ игнорируются (`ParseOptions` оставлены дефолтными):
+/// опечатка в имени поля иначе молча уехала бы в топик пустым значением — а
+/// это ровно та ошибка, ради обнаружения которой схему к топику и грузят.
+pub fn encode(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    message: &str,
+    json: &str,
+) -> Result<Vec<u8>, String> {
+    let md = store::message(&config::config_dir(app)?, cluster, topic, message)?;
+    let parsed = protobuf_json_mapping::parse_dyn_from_str(&md, json)
+        .map_err(|e| format!("can't encode as {}: {e}", md.full_name()))?;
+    parsed
+        .write_to_bytes_dyn()
+        .map_err(|e| format!("can't serialize {}: {e}", md.full_name()))
 }

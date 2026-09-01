@@ -17,6 +17,7 @@ export { StatusBar } from './StatusBar';
 
 // Modals
 export { MessageDetailsModal } from './modals/MessageDetailsModal';
+export { ProduceMessageModal } from './modals/ProduceMessageModal';
 export { TopicConfigModal } from './modals/TopicConfigModal';
 export { ClusterConfigModal } from './modals/ClusterConfigModal';
 export { ClusterArchiveModal } from './modals/ClusterArchiveModal';

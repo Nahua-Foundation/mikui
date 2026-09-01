@@ -64,8 +64,10 @@ use std::time::{Duration, Instant};
 
 use rdkafka::admin::AdminClient;
 use rdkafka::client::ClientContext;
-use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use rdkafka::message::{Header, Message, OwnedHeaders};
+use rdkafka::producer::{BaseProducer, BaseRecord, DeliveryResult, ProducerContext};
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -79,7 +81,7 @@ use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
 use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
 use super::types::*;
-use crate::helpers::get_cluster_config;
+use crate::helpers::{base_config, get_cluster_config, producer_config, PRODUCE_TIMEOUT};
 use crate::proto::ProtoDecoder;
 
 /// Потолок времени на одно чтение (открытие топика или "загрузить ещё").
@@ -345,6 +347,65 @@ impl ClientContext for MeteredContext {
 
 impl ConsumerContext for MeteredContext {}
 
+/// Куда легло последнее отправленное сообщение.
+///
+/// `Mutex<Option<..>>`, а не канал: отчёт о доставке приезжает колбэком из
+/// `poll`, который зовёт сам воркер, на своём же потоке, и разбирается ровно
+/// один вызов `produce` за раз. Городить вокруг этого канал не за чем.
+type Delivery = Arc<Mutex<Option<Result<ProduceResult, String>>>>;
+
+/// Контекст продьюсера.
+///
+/// Отдельно от `MeteredContext` по двум причинам. Во-первых, `ProducerContext`
+/// и `ConsumerContext` — разные трейты с разными требованиями. Во-вторых,
+/// статистику отправки нельзя сливать в измеритель квоты: он меряет, с какой
+/// скоростью кластер ОТДАЁТ данные, и подмешанные туда байты записи испортили
+/// бы расчёт размера окна чтения.
+///
+/// Отметки фатальных ошибок, как у консьюмера (`FatalError`), здесь нет и не
+/// нужно. Она заведена ради `wait_until_ready`, где отказ в аутентификации
+/// иначе неотличим от медленного кластера. У отправки такой слепоты нет: и
+/// отказ по ACL, и любая другая неустранимая ошибка приезжают отчётом о
+/// доставке немедленно — librdkafka не ретраит permanent-ошибки.
+#[derive(Clone)]
+struct ProducerCtx {
+    delivery: Delivery,
+}
+
+impl ClientContext for ProducerCtx {
+    fn log(&self, level: RDKafkaLogLevel, fac: &str, log_message: &str) {
+        if level as i32 <= RDKafkaLogLevel::Warning as i32 {
+            eprintln!("[rdkafka:{fac}] {log_message}");
+        }
+    }
+
+    fn error(&self, error: KafkaError, reason: &str) {
+        eprintln!("[rdkafka:producer] {error}: {reason}");
+    }
+}
+
+impl ProducerContext for ProducerCtx {
+    type DeliveryOpaque = ();
+
+    fn delivery(&self, result: &DeliveryResult<'_>, _: ()) {
+        let outcome = match result {
+            Ok(message) => Ok(ProduceResult {
+                partition: message.partition(),
+                offset: message.offset(),
+            }),
+            Err((error, _)) => Err(error.to_string()),
+        };
+        if let Ok(mut slot) = self.delivery.lock() {
+            *slot = Some(outcome);
+        }
+    }
+}
+
+/// Шаг ожидания отчёта о доставке. Он же — сколько воркер стоит, не обслуживая
+/// остальные команды: отправка одного сообщения занимает миллисекунды, дробить
+/// её на кооперативные шаги было бы сложностью без выигрыша.
+const DELIVERY_POLL_STEP: Duration = Duration::from_millis(100);
+
 /// Ответ на чтение, отменённое из-за того, что пользователь ушёл с топика.
 /// Фронт узнаёт его по строке и молчит: это не сбой, а нормальный ход событий.
 pub const READ_SUPERSEDED: &str = "read superseded";
@@ -379,6 +440,9 @@ pub enum Command {
     /// топика обязан примениться сразу, а перечитывать ради этого весь топик из
     /// Kafka — значит платить квотой на чтение за смену способа показа.
     SetDecoder(Option<Arc<ProtoDecoder>>, Reply<()>),
+    /// Положить сообщение в топик. Тело приезжает уже байтами: кодированием по
+    /// схеме заведует `lib.rs`, воркер про схемы не знает.
+    Produce(ProduceRecord, Reply<Result<ProduceResult, String>>),
     CloseTopic(Reply<()>),
 }
 
@@ -720,6 +784,21 @@ struct Worker {
     tx: Sender<Command>,
     consumer: Option<BaseConsumer<MeteredContext>>,
     admin: Option<AdminClient<MeteredContext>>,
+    /// Адреса, сеть и безопасность текущего подключения — то, из чего
+    /// достраивается продьюсер. Держим конфиг, а не `ClusterConnectPayload`:
+    /// пароль сохранённой учётки подставляется из keychain один раз, при
+    /// подключении, и ходить за ним второй раз ради отправки незачем.
+    connection: Option<ClientConfig>,
+    /// Продьюсер поднимается ЛЕНИВО, на первой отправке.
+    ///
+    /// Приложение прежде всего просмотрщик: за сеанс, в котором никто ничего не
+    /// отправлял, платить ещё одним соединением с кластером (а на закрытых
+    /// кластерах — ещё и рукопожатием, которое может не пройти по ACL) не за
+    /// что. Живёт до конца подключения: отправляют обычно не по одному разу.
+    producer: Option<BaseProducer<ProducerCtx>>,
+    /// Куда легло последнее отправленное сообщение — общая ячейка с колбэком
+    /// доставки `ProducerCtx`.
+    delivery: Delivery,
     /// Сколько байт в секунду кластер РЕАЛЬНО отдаёт. Живёт на уровне
     /// подключения, а не чтения: квота — свойство пары «пользователь-кластер»,
     /// и нащупывать её заново на каждое открытие топика значило бы каждый раз
@@ -770,6 +849,9 @@ impl Worker {
             tx,
             consumer: None,
             admin: None,
+            connection: None,
+            producer: None,
+            delivery: Arc::new(Mutex::new(None)),
             partition_counts: HashMap::new(),
             store: MessageStore::default(),
             view: Vec::new(),
@@ -834,6 +916,9 @@ impl Worker {
                 Command::SetDecoder(decoder, reply) => {
                     self.decoder = decoder;
                     let _ = reply.send(());
+                }
+                Command::Produce(record, reply) => {
+                    let _ = reply.send(self.produce(record));
                 }
                 Command::CloseTopic(reply) => {
                     self.close_topic();
@@ -904,6 +989,12 @@ impl Worker {
 
         self.consumer = Some(consumer);
         self.admin = Some(admin);
+        // Продьюсер аутентифицирован ПРЕЖНЕЙ учёткой и держит соединение по её
+        // кредам. Пережить смену подключения он не может ни при каких условиях:
+        // иначе отправка шла бы под пользователем, которого в шапке уже нет.
+        // Следующая отправка поднимет нового — из `connection` ниже.
+        drop(self.producer.take());
+        self.connection = Some(base_config(&payload));
         self.partition_counts.clear();
         Ok(())
     }
@@ -929,7 +1020,88 @@ impl Worker {
         self.close_topic();
         drop(self.consumer.take());
         drop(self.admin.take());
+        drop(self.producer.take());
+        self.connection = None;
         self.partition_counts.clear();
+    }
+
+    // --- Отправка -----------------------------------------------------------
+
+    /// Кладёт сообщение в топик и ждёт отчёта о доставке.
+    ///
+    /// Ждём намеренно, а не отвечаем «поставлено в очередь». Партиция и офсет,
+    /// которые показываются пользователю, известны только из отчёта: до него не
+    /// известно ни куда партишенер направил сообщение, ни удалось ли оно вообще
+    /// (отказ по ACL на запись приезжает именно так). Сказать «отправлено», не
+    /// дождавшись, значило бы сообщать об успехе, которого может не быть.
+    fn produce(&mut self, record: ProduceRecord) -> Result<ProduceResult, String> {
+        self.ensure_producer()?;
+        // Ссылку берём ПОСЛЕ создания, отдельным шагом: вернуть её прямо из
+        // `ensure_producer(&mut self)` значило бы растянуть изменяемый заём на
+        // весь метод, и `self.delivery` рядом стал бы недоступен.
+        let producer = self.producer.as_ref().expect("producer is created above");
+
+        // Очищаем ячейку ДО отправки: в ней мог остаться отчёт от предыдущей.
+        if let Ok(mut slot) = self.delivery.lock() {
+            *slot = None;
+        }
+
+        let mut headers = OwnedHeaders::new_with_capacity(record.headers.len());
+        for header in &record.headers {
+            headers = headers.insert(Header {
+                key: &header.key,
+                value: Some(header.value.as_bytes()),
+            });
+        }
+
+        let mut message: BaseRecord<[u8], [u8]> =
+            BaseRecord::to(&record.topic).payload(&record.payload);
+        if let Some(key) = &record.key {
+            message = message.key(key.as_slice());
+        }
+        if let Some(partition) = record.partition {
+            message = message.partition(partition);
+        }
+        if !record.headers.is_empty() {
+            message = message.headers(headers);
+        }
+
+        producer
+            .send(message)
+            .map_err(|(e, _)| format!("can't enqueue the message: {e}"))?;
+
+        let started = Instant::now();
+        loop {
+            producer.poll(DELIVERY_POLL_STEP);
+            if let Some(outcome) = self.delivery.lock().ok().and_then(|mut s| s.take()) {
+                return outcome;
+            }
+            if started.elapsed() > PRODUCE_TIMEOUT {
+                // Сюда попадаем, только если librdkafka не отчиталась даже о
+                // собственном `message.timeout.ms`, — то есть что-то пошло не
+                // так на её стороне. Сообщение при этом могло и уехать.
+                return Err("no delivery report from the cluster".to_string());
+            }
+        }
+    }
+
+    /// Поднимает продьюсера текущего подключения, если его ещё нет.
+    fn ensure_producer(&mut self) -> Result<(), String> {
+        if self.producer.is_some() {
+            return Ok(());
+        }
+        let conf = self
+            .connection
+            .as_ref()
+            .ok_or("not connected to a cluster")?;
+        let context = ProducerCtx {
+            delivery: Arc::clone(&self.delivery),
+        };
+        let producer: BaseProducer<ProducerCtx> = producer_config(conf)
+            .create_with_context(context)
+            .map_err(|e| format!("can't create producer: {e}"))?;
+        self.producer = Some(producer);
+        Ok(())
     }
 
     fn list_topics(&mut self) -> Result<Vec<TopicInfo>, String> {

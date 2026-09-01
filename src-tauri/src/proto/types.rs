@@ -79,6 +79,22 @@ pub struct TopicSchemaView {
     pub error: Option<String>,
 }
 
+/// Всё, что форме отправки нужно знать про выбранный message.
+///
+/// Одной структурой, а не двумя командами: обе половины описывают один и тот же
+/// тип, приезжают на одно и то же событие (пользователь выбрал message) и
+/// разъехаться не должны — подсветка обязана относиться ровно к той схеме, по
+/// которой построена заготовка.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProtoMessageForm {
+    /// JSON-заготовка: все поля на месте, значения нулевые.
+    pub template: String,
+    /// Имена enum-значений этого типа — форма красит их отдельным цветом,
+    /// как это делает модалка чтения.
+    pub enum_values: Vec<String>,
+}
+
 impl TopicSchemaView {
     pub fn new(schema: &TopicSchema, messages: Vec<String>, error: Option<String>) -> Self {
         Self {
