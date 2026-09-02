@@ -19,6 +19,7 @@ export { StatusBar } from './StatusBar';
 export { MessageDetailsModal } from './modals/MessageDetailsModal';
 export { ProduceMessageModal } from './modals/ProduceMessageModal';
 export { TopicConfigModal } from './modals/TopicConfigModal';
+export { TopicInfoModal } from './modals/TopicInfoModal';
 export { ClusterConfigModal } from './modals/ClusterConfigModal';
 export { ClusterArchiveModal } from './modals/ClusterArchiveModal';
 export { ClusterUsersModal } from './modals/ClusterUsersModal';

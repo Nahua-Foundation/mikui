@@ -12,6 +12,7 @@ import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Checkbox } from '../ui/checkbox';
 import {
+  BodyFormat,
   Topic,
   ClusterUser,
   KafkaCluster,
@@ -23,6 +24,7 @@ import {
 } from './types';
 import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
+import { FormatSelect } from './components/FormatSelect';
 import { ReadOrder } from './components/ReadOrder';
 
 /** Со скольки выбранных партиций перечисление перестаёт помещаться в шапку. */
@@ -53,6 +55,11 @@ interface HeaderDesktopProps {
   onManageUsers: () => void;
   filters: MessageFilter;
   onFiltersChange: (filters: MessageFilter) => void;
+  /** Чем показывать тела открытого топика. */
+  format: BodyFormat;
+  onFormatChange: (format: BodyFormat) => void;
+  /** Открыть настройки схемы текущего топика. */
+  onOpenSchema: () => void;
   onRefresh: () => void;
   onOpenFavorites: () => void;
   onProduce: () => void;
@@ -107,6 +114,9 @@ export function HeaderDesktop({
   onManageUsers,
   filters,
   onFiltersChange,
+  format,
+  onFormatChange,
+  onOpenSchema,
   onRefresh,
   onOpenFavorites,
   onProduce,
@@ -299,6 +309,23 @@ export function HeaderDesktop({
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
+            </div>
+          </MenuItem>
+        )}
+
+        {/* Формат тела. Стоит рядом с чтением, а не в настройках топика,
+            потому что это выбор ПОКАЗА: одно и то же тело смотрят то
+            разобранным по схеме, то сырым текстом, и открывать ради
+            переключения модальное окно незачем. Сам выбор при этом хранится
+            там же, где и раньше, — в схеме топика на диске. */}
+        {topic && (
+          <MenuItem>
+            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
+              <FormatSelect
+                format={format}
+                onChange={onFormatChange}
+                onOpenSchema={onOpenSchema}
+              />
             </div>
           </MenuItem>
         )}

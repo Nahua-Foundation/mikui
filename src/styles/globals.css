@@ -34,6 +34,22 @@
   --color-syntax-string: #2dd4bf;
   --color-syntax-boolean: #fb7185;
   --color-syntax-enum: #22d3ee;
+
+  /* Проявление элемента, которого до этого в разметке не было — им
+     появляется кнопка информации в списке топиков. Именно анимация, а не
+     transition: переход нечему запускать, элемент монтируется уже видимым.
+     Длительность совпадает с REVEAL_SHIFT_MS в TopicsPanel — сдвиг имени и
+     проявление кнопки должны заканчиваться вместе. */
+  --animate-reveal: reveal 150ms ease-out;
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 :root {

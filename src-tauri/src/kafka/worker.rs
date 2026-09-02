@@ -62,7 +62,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rdkafka::admin::AdminClient;
+use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
 use rdkafka::client::ClientContext;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
@@ -163,6 +163,17 @@ const READ_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 const WATERMARK_BATCH: usize = 2;
 const WATERMARK_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+/// Сколько ждать ответа на `DescribeConfigs`. Короче остальных: настройки
+/// спрашивают, глядя на открывшееся окно, и десять секунд серого экрана там
+/// неотличимы от зависшего приложения.
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Сколько всего времени отводится на снятие границ ВСЕХ партиций топика ради
+/// счётчика сообщений. Запрос идёт отдельный на каждую, а воркер на это время
+/// стоит — в том числе поперёк идущего чтения. Не уложились — показываем то,
+/// что успели.
+const OFFSETS_BUDGET: Duration = Duration::from_secs(2);
+/// Потолок ожидания границ ОДНОЙ партиции.
+const OFFSETS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Сколько ждать первого ответа от кластера при подключении.
 ///
@@ -417,6 +428,9 @@ pub enum Command {
     Test(ClusterConnectPayload, Reply<Result<(), String>>),
     Disconnect(Reply<()>),
     ListTopics(Reply<Result<Vec<TopicInfo>, String>>),
+    /// Устройство и настройки одного топика. Спрашивается по клику в списке и
+    /// к чтению отношения не имеет — открытый топик от неё не меняется.
+    DescribeTopic(String, Reply<Result<TopicDetails, String>>),
     OpenTopic(OpenTopicParams, Reply<Result<OpenTopicResult, String>>),
     /// Самоадресованная команда: следующий шаг уже идущего чтения. Никогда не
     /// шлётся снаружи воркера.
@@ -887,6 +901,9 @@ impl Worker {
                 Command::ListTopics(reply) => {
                     let _ = reply.send(self.list_topics());
                 }
+                Command::DescribeTopic(topic, reply) => {
+                    let _ = reply.send(self.describe_topic(&topic));
+                }
                 Command::OpenTopic(params, reply) => self.start_open_topic(params, reply),
                 Command::ContinueRead => self.continue_read(),
                 Command::LoadMore(params, reply) => self.start_load_more(params, reply),
@@ -1121,6 +1138,180 @@ impl Worker {
         Ok(topics)
     }
 
+    /// Устройство и настройки топика.
+    ///
+    /// Два источника, и они не равнозначны. Метаданные говорят, из чего топик
+    /// состоит (партиции, реплики, ISR) — в `DescribeConfigs` этого нет вовсе.
+    /// Настройки — отдельный запрос под отдельным правом, которого у учётки
+    /// может и не быть; его неудача не отменяет метаданных, а становится
+    /// строчкой `config_error` рядом с ними.
+    fn describe_topic(&self, topic: &str) -> Result<TopicDetails, String> {
+        let consumer = self.consumer.as_ref().ok_or("not connected to a cluster")?;
+        // Метаданные одного топика, а не всего кластера: на кластере с тысячами
+        // топиков полный ответ — мегабайты ради одной строки.
+        let md = consumer
+            .fetch_metadata(Some(topic), METADATA_TIMEOUT)
+            .map_err(|e| format!("can't load metadata of {topic}: {e}"))?;
+        let meta = md
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .ok_or_else(|| format!("topic {topic} is not in the cluster metadata"))?;
+        if let Some(err) = meta.error() {
+            return Err(format!(
+                "can't describe {topic}: {}",
+                raw_consumer::err_str(err)
+            ));
+        }
+
+        let bounds = self.partition_bounds(topic, meta.partitions());
+
+        let mut partitions: Vec<PartitionDetails> = meta
+            .partitions()
+            .iter()
+            .map(|p| {
+                let (low, high) = bounds.get(&p.id()).copied().unzip();
+                PartitionDetails {
+                    id: p.id(),
+                    leader: p.leader(),
+                    replicas: p.replicas().len(),
+                    in_sync: p.isr().len(),
+                    low,
+                    high,
+                }
+            })
+            .collect();
+        // Метаданные приезжают в порядке брокера, а читают эту таблицу по
+        // номеру партиции.
+        partitions.sort_by_key(|p| p.id);
+
+        let known: Vec<i64> = partitions
+            .iter()
+            .filter_map(|p| Some(p.high? - p.low?))
+            .collect();
+
+        let (config, config_error) = match self.topic_config(topic) {
+            Ok(config) => (config, None),
+            Err(e) => {
+                eprintln!("[describe_topic] {topic} settings unavailable: {e}");
+                (Vec::new(), Some(e))
+            }
+        };
+
+        // Выборка для оценки размера на диске — только у открытого топика и
+        // только из того, что уже перекачано ради показа. Ни одного лишнего
+        // байта из сети: за эти сообщения квота списана один раз, и сравнить
+        // сжатый объём с разжатым второй раз ничего не стоит.
+        let sampled = (self.open_topic.as_deref() == Some(topic))
+            .then(|| self.quota.transfer())
+            .flatten();
+
+        Ok(TopicDetails {
+            name: topic.to_string(),
+            // Максимум, а не значение первой партиции: у топика, которому
+            // добавляли партиции при другой настройке кластера, они могут
+            // отличаться, и меньшее из чисел соврало бы про топик целиком.
+            replication_factor: partitions.iter().map(|p| p.replicas).max(),
+            under_replicated: partitions.iter().filter(|p| p.in_sync < p.replicas).count(),
+            messages: (!known.is_empty()).then(|| known.iter().sum()),
+            offsets_partial: known.len() < partitions.len(),
+            sample_wire_bytes: sampled.map(|s| s.wire_bytes),
+            sample_messages: sampled.map(|s| s.messages),
+            sample_bytes: sampled.map(|s| s.message_bytes),
+            partitions,
+            config,
+            config_error,
+        })
+    }
+
+    /// Границы `[low, high)` каждой партиции.
+    ///
+    /// `ListOffsets` записей не переносит, поэтому квоту на чтение это не
+    /// тратит — но запрос идёт отдельный на каждую партицию, а воркер на это
+    /// время стоит. Отсюда общий бюджет: на топике в несколько сотен партиций
+    /// не уложились — показываем то, что успели, и говорим об этом
+    /// (`offsets_partial`). Заставлять человека ждать полминуты ради счётчика
+    /// сообщений, когда он открыл окно посмотреть retention, незачем.
+    ///
+    /// Партиция, по которой запрос не удался, просто выпадает из карты: одна
+    /// недоступная не повод не показывать остальные девятнадцать.
+    fn partition_bounds(
+        &self,
+        topic: &str,
+        partitions: &[rdkafka::metadata::MetadataPartition],
+    ) -> HashMap<i32, (i64, i64)> {
+        let Some(consumer) = self.consumer.as_ref() else {
+            return HashMap::new();
+        };
+        let started = Instant::now();
+        let mut bounds = HashMap::with_capacity(partitions.len());
+
+        for p in partitions {
+            if started.elapsed() >= OFFSETS_BUDGET {
+                eprintln!(
+                    "[describe_topic] {topic}: offsets budget spent after {}/{} partitions",
+                    bounds.len(),
+                    partitions.len()
+                );
+                break;
+            }
+            match consumer.fetch_watermarks(topic, p.id(), OFFSETS_TIMEOUT) {
+                Ok((low, high)) => {
+                    bounds.insert(p.id(), (low, high));
+                }
+                Err(e) => eprintln!(
+                    "[describe_topic] {topic} p{}: can't read offsets: {e}",
+                    p.id()
+                ),
+            }
+        }
+        bounds
+    }
+
+    /// Настройки топика через `DescribeConfigs`.
+    ///
+    /// Ответ ждём прямо здесь, блокируя воркер, — как это уже делают
+    /// `fetch_metadata` и `fetch_watermarks`. Дробить на кооперативные шаги
+    /// нечего: запрос ровно один, ждать его дольше `DESCRIBE_TIMEOUT` мы всё
+    /// равно не будем, а делается он по клику, когда чтения обычно нет.
+    ///
+    /// Исполнитель нужен только затем, что rdkafka отдаёт результат будущим.
+    /// Ни таймеров, ни ввода-вывода этому будущему не нужно: его будит
+    /// собственный поток админского клиента, поэтому хватает самого простого
+    /// однопоточного рантайма.
+    fn topic_config(&self, topic: &str) -> Result<Vec<TopicConfigEntry>, String> {
+        let admin = self.admin.as_ref().ok_or("not connected to a cluster")?;
+        let options = AdminOptions::new().request_timeout(Some(DESCRIBE_TIMEOUT));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|e| format!("can't wait for the cluster reply: {e}"))?;
+
+        let described = runtime
+            .block_on(admin.describe_configs(&[ResourceSpecifier::Topic(topic)], &options))
+            .map_err(|e| format!("can't read the settings of {topic}: {e}"))?;
+
+        let resource = described
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("the cluster returned no settings for {topic}"))?
+            .map_err(|e| format!("can't read the settings of {topic}: {e}"))?;
+
+        let mut entries: Vec<TopicConfigEntry> = resource
+            .entries
+            .into_iter()
+            .map(|entry| TopicConfigEntry {
+                name: entry.name,
+                value: entry.value,
+                is_default: entry.is_default,
+                is_read_only: entry.is_read_only,
+                is_sensitive: entry.is_sensitive,
+            })
+            .collect();
+        // Брокер отдаёт их в своём порядке, а ищут в этом списке по имени.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
     // --- Запуск чтения ------------------------------------------------------
 
     /// Открывает топик: сбрасывает буфер, снимает границы партиций и запускает
@@ -1189,6 +1380,10 @@ impl Worker {
         self.last_round = None;
         self.kept_per_offset = None;
         self.has_timestamps = false;
+        // Соотношение «сжатое к разжатому» — свойство ТОПИКА, в отличие от
+        // скорости кластера: в соседних топиках и сообщения другие, и кодек
+        // может быть другим. Наблюдение за передачей начинается заново.
+        self.quota.mark();
         self.rebuild_view();
 
         self.pending_read = Some(PendingRead {

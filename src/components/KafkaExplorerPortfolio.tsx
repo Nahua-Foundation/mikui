@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
+  BodyFormat,
   Topic,
   ClusterConnectPayload,
   ClusterUser,
@@ -24,6 +25,7 @@ import { MessagesPanel } from './kafka';
 import { StatusBar } from './kafka/StatusBar';
 import { MessageDetailsModal } from './kafka';
 import { TopicConfigModal } from './kafka';
+import { TopicInfoModal } from './kafka';
 import { ClusterConfigModal } from './kafka';
 import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
 import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
@@ -70,6 +72,11 @@ export function KafkaExplorerPortfolio() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [configTopic, setConfigTopic] = useState<Topic | null>(null);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
+  /** Топик, устройство которого показывает окно информации. Не обязательно
+   *  открытый: посмотреть настройки соседнего — обычное дело, и читать его
+   *  ради этого незачем. */
+  const [infoTopic, setInfoTopic] = useState<Topic | null>(null);
+  const [isTopicInfoOpen, setIsTopicInfoOpen] = useState(false);
   const [isClusterConfigModalOpen, setIsClusterConfigModalOpen] = useState(false);
   const [isClusterArchiveModalOpen, setIsClusterArchiveModalOpen] = useState(false);
   const [isClusterUsersModalOpen, setIsClusterUsersModalOpen] = useState(false);
@@ -409,6 +416,11 @@ export function KafkaExplorerPortfolio() {
     setIsConfigModalOpen(true);
   }, []);
 
+  const handleTopicInfo = useCallback((topic: Topic) => {
+    setInfoTopic(topic);
+    setIsTopicInfoOpen(true);
+  }, []);
+
   /**
    * Схему топика поправили в настройках.
    *
@@ -439,6 +451,38 @@ export function KafkaExplorerPortfolio() {
     },
     [schemaCluster],
   );
+
+  /**
+   * Переключение формата тела прямо из шапки.
+   *
+   * Пишется туда же, где живёт остальная схема топика, — в `proto.json` на
+   * диске. Отдельного «где-то ещё запомнить выбранный формат» здесь нет и не
+   * должно быть: он и так свойство пары кластер-топик, уже переживающее
+   * перезапуск, и второе хранилище того же самого неизбежно разъехалось бы с
+   * первым.
+   *
+   * `message` передаётся прежний: бэкенд принимает только тот, что есть в
+   * схеме, а смена формата к выбору типа отношения не имеет.
+   */
+  const handleFormatChange = useCallback(
+    (format: BodyFormat) => {
+      const topic = topicRef.current;
+      if (!schemaCluster || !topic || format === (openSchema?.format ?? 'json')) return;
+      api
+        .saveTopicSchema(schemaCluster, topic, format, openSchema?.message ?? null)
+        .then((saved) => handleSchemaChanged(topic, saved))
+        .catch((e) => {
+          console.error('Failed to save the body format', e);
+          toast.error(`Can't switch the format: ${describeError(e)}`);
+        });
+    },
+    [schemaCluster, openSchema, handleSchemaChanged],
+  );
+
+  /** Настройки схемы того топика, который открыт, — из шапки. */
+  const handleOpenSchemaSettings = useCallback(() => {
+    if (selectedTopic) handleConfigClick(selectedTopic);
+  }, [selectedTopic, handleConfigClick]);
 
   const handleClusterClick = useCallback(() => setIsClusterArchiveModalOpen(true), []);
 
@@ -715,6 +759,9 @@ export function KafkaExplorerPortfolio() {
         onClusterClick={handleClusterClick}
         filters={filters}
         onFiltersChange={setFilters}
+        format={openSchema?.format ?? 'json'}
+        onFormatChange={handleFormatChange}
+        onOpenSchema={handleOpenSchemaSettings}
         onRefresh={handleRefresh}
         onOpenFavorites={handleOpenFavorites}
         onProduce={handleOpenProduce}
@@ -725,7 +772,7 @@ export function KafkaExplorerPortfolio() {
           topics={topics}
           selectedTopic={selectedTopic}
           onTopicSelect={handleSelectTopic}
-          onTopicConfig={handleConfigClick}
+          onTopicInfo={handleTopicInfo}
         />
 
         <div className="flex-1 min-h-0 flex flex-col h-full">
@@ -778,6 +825,12 @@ export function KafkaExplorerPortfolio() {
         open={isConfigModalOpen}
         onOpenChange={setIsConfigModalOpen}
         onSchemaChanged={handleSchemaChanged}
+      />
+
+      <TopicInfoModal
+        topic={infoTopic}
+        open={isTopicInfoOpen}
+        onOpenChange={setIsTopicInfoOpen}
       />
 
       <ClusterArchiveModal

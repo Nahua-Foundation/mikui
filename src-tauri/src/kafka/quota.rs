@@ -52,6 +52,14 @@ const WINDOW: Duration = Duration::from_secs(20);
 /// burst-кредите.
 const MIN_SPAN: Duration = Duration::from_secs(3);
 
+/// Ниже этого выборка передачи не годится в оценку размера топика.
+///
+/// По сети приходит не только содержимое фетчей: одни метаданные кластера с
+/// тысячами топиков — это мегабайты. На большой выборке такой разовый ответ
+/// растворяется, на маленькой он же становится основным её содержимым.
+const MIN_SAMPLE_BYTES: u64 = 512 * 1024;
+const MIN_SAMPLE_MESSAGES: u64 = 200;
+
 /// Что кластер на самом деле даёт.
 #[derive(Debug, Clone, Copy)]
 pub struct QuotaEstimate {
@@ -74,6 +82,42 @@ pub struct QuotaEstimate {
     /// лидеры читаемых партиций сидят на подмножестве узлов, и то, что цифра
     /// не выдумана.
     pub known_brokers: u32,
+}
+
+/// Во что обошлась передача уже прочитанного — сырьё для оценки того, сколько
+/// топик занимает на диске брокера.
+///
+/// Точного числа взять негде: размер лога Kafka отдаёт запросом
+/// `DescribeLogDirs`, которого librdkafka не реализует. Но нужное отношение
+/// измеримо косвенно, причём бесплатно: `wire_bytes` — это байты С ПРОВОДА, то
+/// есть данные в том же виде, в каком они лежат у брокера (сжатыми, вместе с
+/// накладными расходами формата записи), а `message_bytes` — их же размер
+/// после распаковки.
+///
+/// Ключевая тонкость в том, ЧТО стоит в знаменателе. Читаем мы окнами и
+/// изрядную часть присланного выбрасываем — на боевом кластере наблюдался
+/// четырёхкратный перерасход. Поэтому делить сетевые байты на офсеты НАШИХ
+/// окон нельзя: получилась бы цена вместе с промахами. `messages` же считает
+/// всё, что librdkafka разобрала из фетчей, включая выброшенное нами, — и
+/// предвыборка из отношения уходит сама.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferSample {
+    /// Сжатых байт принято по сети.
+    pub wire_bytes: u64,
+    /// Сколько сообщений из них разобралось.
+    pub messages: u64,
+    /// Их суммарный размер в разжатом виде: ключ плюс тело.
+    pub message_bytes: u64,
+}
+
+/// Накопленное с последней отметки. Приращениями по тикам, а не разностью
+/// «сейчас минус отметка»: счётчики librdkafka кумулятивны, но живут вместе с
+/// объектом топика и уходят вместе с ним — на разности это дало бы отрицание.
+#[derive(Default, Clone, Copy)]
+struct Sample {
+    wire_bytes: u64,
+    messages: u64,
+    message_bytes: u64,
 }
 
 /// Один интервал статистики.
@@ -104,6 +148,13 @@ struct Meter {
     reading: bool,
     was_reading: bool,
     peak_throttle: Duration,
+    /// Передача с момента `mark()` — см. `TransferSample`. Копится независимо
+    /// от часов усреднения: отношение «сжатое к разжатому» ко времени
+    /// отношения не имеет, и выбрасывать из него интервалы, в которых чтение
+    /// только началось, незачем.
+    sample: Sample,
+    last_messages: Option<u64>,
+    last_message_bytes: Option<u64>,
 }
 
 pub struct QuotaMeter {
@@ -144,6 +195,30 @@ impl QuotaMeter {
         self.lock().pending_offsets += offsets;
     }
 
+    /// Начать наблюдение за передачей заново: открыли другой топик, и то, что
+    /// перекачано для прошлого, к размеру этого отношения не имеет.
+    ///
+    /// Измеренную скорость это не трогает: квота — свойство пары
+    /// «пользователь-кластер» и между топиками переносится (см. `Worker`).
+    pub fn mark(&self) {
+        self.lock().sample = Sample::default();
+    }
+
+    /// Во что обошлась передача с момента `mark()`. `None` — выборки пока
+    /// слишком мало, чтобы на ней что-то считать.
+    pub fn transfer(&self) -> Option<TransferSample> {
+        let m = self.lock();
+        let sample = m.sample;
+        if sample.messages < MIN_SAMPLE_MESSAGES || sample.wire_bytes < MIN_SAMPLE_BYTES {
+            return None;
+        }
+        Some(TransferSample {
+            wire_bytes: sample.wire_bytes,
+            messages: sample.messages,
+            message_bytes: sample.message_bytes,
+        })
+    }
+
     /// Очередной снимок статистики librdkafka.
     pub fn observe(&self, stats: &Statistics) {
         let brokers: Vec<(i32, u64)> = stats
@@ -161,12 +236,30 @@ impl QuotaMeter {
             .map(|w| w.max.max(0) as u64)
             .max()
             .unwrap_or(0);
-        self.tick(&brokers, Duration::from_millis(throttle_ms), Instant::now());
+        // Разобранное из фетчей — по всем топикам сразу. Читаем мы один за
+        // раз, а наблюдение начинается заново на каждом открытии (`mark`), так
+        // что чужого сюда попасть неоткуда.
+        let consumed = stats
+            .topics
+            .values()
+            .flat_map(|t| t.partitions.values())
+            .fold((0u64, 0u64), |(msgs, bytes), p| {
+                (msgs + p.rxmsgs, bytes + p.rxbytes)
+            });
+        self.tick(
+            &brokers,
+            consumed,
+            Duration::from_millis(throttle_ms),
+            Instant::now(),
+        );
     }
 
     /// Отделено от `observe`, чтобы измеритель проверялся без конструирования
     /// статистики librdkafka.
-    fn tick(&self, brokers: &[(i32, u64)], throttle: Duration, now: Instant) {
+    ///
+    /// `consumed` — кумулятивные счётчики librdkafka «разобрано сообщений» и
+    /// «их разжатый размер».
+    fn tick(&self, brokers: &[(i32, u64)], consumed: (u64, u64), throttle: Duration, now: Instant) {
         let mut m = self.lock();
         m.peak_throttle = m.peak_throttle.max(throttle);
 
@@ -181,6 +274,11 @@ impl QuotaMeter {
             }
         }
 
+        let (messages_total, message_bytes_total) = consumed;
+        let previous_consumed = (m.last_messages, m.last_message_bytes);
+        m.last_messages = Some(messages_total);
+        m.last_message_bytes = Some(message_bytes_total);
+
         let (Some(last_rx), Some(last_tick)) = (m.last_rx_total, m.last_tick) else {
             m.last_rx_total = Some(rx_total);
             m.last_tick = Some(now);
@@ -192,6 +290,17 @@ impl QuotaMeter {
         let rx_bytes = rx_total.saturating_sub(last_rx);
         m.last_rx_total = Some(rx_total);
         m.last_tick = Some(now);
+
+        // Выборка передачи копится до проверки `countable`: она не про время, а
+        // про соотношение сжатого и разжатого, и интервал, в котором чтение
+        // только началось, для неё так же хорош, как любой другой. Убывание
+        // счётчика (топик закрылся, объект партиции ушёл) даёт ноль, а не
+        // отрицание — за это отвечает `saturating_sub`.
+        if let (Some(last_messages), Some(last_bytes)) = previous_consumed {
+            m.sample.wire_bytes += rx_bytes;
+            m.sample.messages += messages_total.saturating_sub(last_messages);
+            m.sample.message_bytes += message_bytes_total.saturating_sub(last_bytes);
+        }
 
         let countable = m.reading && m.was_reading;
         m.was_reading = m.reading;
@@ -260,12 +369,13 @@ mod tests {
         let start = Instant::now();
         let mut rx_total = 0;
         // Первый тик только задаёт точку отсчёта, второй — первый засчитанный.
-        meter.tick(&[(0, rx_total)], Duration::ZERO, start);
+        meter.tick(&[(0, rx_total)], (0, 0), Duration::ZERO, start);
         for (i, &(bytes, offsets)) in ticks.iter().enumerate() {
             rx_total += bytes;
             meter.record_offsets(offsets);
             meter.tick(
                 &[(0, rx_total)],
+                (0, 0),
                 Duration::ZERO,
                 start + Duration::from_secs(i as u64 + 1),
             );
@@ -323,11 +433,12 @@ mod tests {
         let meter = QuotaMeter::new();
         let start = Instant::now();
         meter.set_reading(true);
-        meter.tick(&[(0, 0)], Duration::ZERO, start);
+        meter.tick(&[(0, 0)], (0, 0), Duration::ZERO, start);
         for i in 1..=6 {
             meter.record_offsets(20);
             meter.tick(
                 &[(0, 200_000 * i)],
+                (0, 0),
                 Duration::ZERO,
                 start + Duration::from_secs(i),
             );
@@ -337,8 +448,9 @@ mod tests {
         // Полчаса простоя без единого байта.
         meter.set_reading(false);
         meter.tick(
-            &[(0, 1_200_000)],
-            Duration::ZERO,
+                &[(0, 1_200_000)],
+                (0, 0),
+                Duration::ZERO,
             start + Duration::from_secs(1800),
         );
 
@@ -355,11 +467,12 @@ mod tests {
         let meter = QuotaMeter::new();
         let start = Instant::now();
         meter.set_reading(true);
-        meter.tick(&[(0, 0)], Duration::ZERO, start);
+        meter.tick(&[(0, 0)], (0, 0), Duration::ZERO, start);
         for i in 1..=4 {
             meter.record_offsets(10);
             meter.tick(
                 &[(0, 100_000 * i)],
+                (0, 0),
                 Duration::from_millis(if i == 2 { 9_000 } else { 120 }),
                 start + Duration::from_secs(i),
             );
@@ -387,11 +500,12 @@ mod tests {
             brokers
         };
 
-        meter.tick(&snapshot(0), Duration::ZERO, start);
+        meter.tick(&snapshot(0), (0, 0), Duration::ZERO, start);
         for second in 1..=5 {
             meter.record_offsets(100);
             meter.tick(
                 &snapshot(second),
+                (0, 0),
                 Duration::ZERO,
                 start + Duration::from_secs(second),
             );
@@ -411,5 +525,92 @@ mod tests {
         assert!(meter.estimate().is_some());
         meter.reset();
         assert!(meter.estimate().is_none());
+    }
+
+    // --- Выборка передачи ----------------------------------------------------
+
+    /// Прогоняет измеритель через `ticks` интервалов, в каждом из которых по
+    /// сети приходит `wire` байт, а из них распаковывается `msgs` сообщений
+    /// суммарным разжатым размером `bytes`.
+    fn transfer(ticks: u64, wire: u64, msgs: u64, bytes: u64) -> QuotaMeter {
+        let meter = QuotaMeter::new();
+        let start = Instant::now();
+        meter.set_reading(true);
+        meter.mark();
+
+        let (mut rx, mut m, mut b) = (0u64, 0u64, 0u64);
+        meter.tick(&[(0, rx)], (m, b), Duration::ZERO, start);
+        for second in 1..=ticks {
+            rx += wire;
+            m += msgs;
+            b += bytes;
+            meter.tick(
+                &[(0, rx)],
+                (m, b),
+                Duration::ZERO,
+                start + Duration::from_secs(second),
+            );
+        }
+        meter
+    }
+
+    /// На этом отношении держится оценка размера топика на диске: сколько
+    /// СЖАТЫХ байт с провода приходится на одно разобранное сообщение.
+    ///
+    /// Делить сетевые байты на офсеты наших окон для этого нельзя — там сидит
+    /// оплаченная, но выброшенная предвыборка. В знаменателе здесь всё, что
+    /// распаковалось, включая выброшенное, поэтому она сокращается.
+    #[test]
+    fn measures_what_a_message_costs_on_the_wire() {
+        let sample = transfer(10, 100_000, 500, 400_000)
+            .transfer()
+            .expect("выборки достаточно");
+
+        assert_eq!(sample.wire_bytes, 1_000_000);
+        assert_eq!(sample.messages, 5_000);
+        assert_eq!(sample.message_bytes, 4_000_000);
+        // 200 байт на сообщение на диске против 800 разжатых — сжатие вчетверо.
+        assert_eq!(sample.wire_bytes / sample.messages, 200);
+    }
+
+    /// Метаданные кластера с тысячами топиков — это мегабайты в одном ответе.
+    /// На маленькой выборке такой ответ и составил бы всё измеренное, поэтому
+    /// она не предлагается вовсе.
+    #[test]
+    fn a_sample_too_small_to_trust_is_not_offered() {
+        assert!(QuotaMeter::new().transfer().is_none());
+        // Байт достаточно, сообщений — нет.
+        assert!(transfer(4, 200_000, 10, 100_000).transfer().is_none());
+        // Сообщений достаточно, байт — нет.
+        assert!(transfer(4, 1_000, 500, 4_000).transfer().is_none());
+    }
+
+    /// Открыли другой топик — перекачанное для прошлого к его размеру
+    /// отношения не имеет. Измеренную скорость кластера это не трогает: квота
+    /// принадлежит паре «пользователь-кластер» и между топиками переносится.
+    #[test]
+    fn marking_starts_the_transfer_sample_over() {
+        let meter = transfer(10, 100_000, 500, 400_000);
+        assert!(meter.transfer().is_some());
+        meter.mark();
+        assert!(meter.transfer().is_none());
+    }
+
+    /// Счётчики librdkafka живут вместе с объектом партиции и уходят вместе с
+    /// ним: сумма по партициям умеет УБЫВАТЬ. На разности «сейчас минус
+    /// прошлое» это дало бы отрицание, поэтому убывший интервал стоит ноль, а
+    /// накопленное до него остаётся в силе.
+    #[test]
+    fn a_counter_that_went_away_does_not_corrupt_the_sample() {
+        let meter = transfer(10, 100_000, 500, 400_000);
+        let before = meter.transfer().expect("выборки достаточно");
+
+        // Топик закрылся: счётчики его партиций исчезли из статистики.
+        let now = Instant::now();
+        meter.tick(&[(0, 1_000_000)], (0, 0), Duration::ZERO, now);
+
+        let after = meter.transfer().expect("накопленное не должно пропадать");
+        assert_eq!(after.messages, before.messages);
+        assert_eq!(after.message_bytes, before.message_bytes);
     }
 }

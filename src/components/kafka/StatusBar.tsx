@@ -1,3 +1,4 @@
+import { formatBytes } from './format';
 import { OpenTopicResult } from './types';
 
 /**
@@ -12,13 +13,6 @@ import { OpenTopicResult } from './types';
 
 /** Доля буфера, после которой шкала перестаёт быть просто индикатором. */
 const MEMORY_WARN = 0.75;
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
 
 /** Задержка «5 ms» и задержка «5 s» — это две разные новости. */
 function formatDuration(millis: number): string {

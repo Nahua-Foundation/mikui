@@ -10,24 +10,44 @@ const DEFAULT_WIDTH = 220;
 const MIN_WIDTH = 160;
 const MAX_WIDTH = 480;
 
+/**
+ * Сколько курсор должен простоять на строке, прежде чем в ней появится кнопка
+ * информации.
+ *
+ * Пауза здесь не украшение. Список прокручивают и просматривают курсором, и
+ * кнопка, выскакивающая под каждым проездом мыши, — это мельтешение во всю
+ * панель. Задержка отделяет «веду курсор вниз по списку» от «остановился на
+ * этом топике», а второе и есть намерение, ради которого кнопка нужна.
+ */
+const REVEAL_DELAY_MS = 1000;
+/** Длительность сдвига имени — та же, что в классах `TopicRow`. */
+const REVEAL_SHIFT_MS = 150;
+
 interface TopicsPanelProps {
   topics: Topic[];
   selectedTopic: Topic | null;
   onTopicSelect: (topic: Topic) => void;
-  onTopicConfig: (topic: Topic) => void;
+  /** Показать устройство и настройки топика — не обязательно открытого. */
+  onTopicInfo: (topic: Topic) => void;
 }
 
 /** Один экземпляр на модуль: `localeCompare` создаёт коллатор на каждый вызов,
  *  что на тысячах топиков заметно. */
 const COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
-export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfig }: TopicsPanelProps) {
+export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicInfo }: TopicsPanelProps) {
   const [topicFilter, setTopicFilter] = useState('');
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const rootRef = useRef<HTMLDivElement>(null);
   const dragging = useRef<{ startX: number; startW: number } | null>(null);
   const pendingWidth = useRef<number | null>(null);
   const [peek, setPeek] = useState<PeekAnchor | null>(null);
+  /** Имя топика, в строке которого показана кнопка информации. Ровно одно:
+   *  курсор не бывает на двух строках сразу. */
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const revealTimer = useRef<number | null>(null);
+  /** Строка под курсором — с ней работает отложенное появление кнопки. */
+  const hovered = useRef<{ row: HTMLElement; name: string } | null>(null);
 
   // Как и в MessagesPanel: во время перетаскивания React не участвует,
   // ширина применяется напрямую к DOM, в state попадает один раз на mouseup.
@@ -110,23 +130,67 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
     setPeek({ name, left: labelRect.left, top: rowRect.top, height: rowRect.height });
   }, []);
 
+  const cancelReveal = useCallback(() => {
+    if (revealTimer.current === null) return;
+    window.clearTimeout(revealTimer.current);
+    revealTimer.current = null;
+  }, []);
+
+  /** Курсор зашёл на строку: вынос имени сразу, кнопка — если задержится. */
+  const enterRow = useCallback(
+    (row: HTMLElement, name: string) => {
+      hovered.current = { row, name };
+      openPeek(row, name);
+      cancelReveal();
+      revealTimer.current = window.setTimeout(() => {
+        revealTimer.current = null;
+        setRevealed(name);
+        // Имя уехало вправо и, возможно, только теперь перестало помещаться —
+        // вынос обязан переехать вместе с ним. Ждём конца сдвига: посреди него
+        // геометрия промежуточная, и вынос встал бы не там, где имя.
+        window.setTimeout(() => {
+          const still = hovered.current;
+          if (still?.name === name) openPeek(still.row, name);
+        }, REVEAL_SHIFT_MS);
+      }, REVEAL_DELAY_MS);
+    },
+    [openPeek, cancelReveal],
+  );
+
+  /** Курсор ушёл со строки — и с неё же снимается всё, что он вызвал. */
+  const leaveRow = useCallback(() => {
+    hovered.current = null;
+    cancelReveal();
+    setRevealed(null);
+    closePeek();
+  }, [cancelReveal, closePeek]);
+
   // Прокрутка и изменение размера двигают список под уже снятой геометрией,
   // а пересчитывать её на лету незачем: курсор в этот момент всё равно уходит
   // со строки. Скролл слушаем в фазе capture — он всплывает не от window,
   // а от внутреннего скроллера Virtuoso.
   useEffect(() => {
-    if (!peek) return;
-    window.addEventListener('scroll', closePeek, true);
-    window.addEventListener('resize', closePeek);
+    if (!peek && !revealed) return;
+    window.addEventListener('scroll', leaveRow, true);
+    window.addEventListener('resize', leaveRow);
     return () => {
-      window.removeEventListener('scroll', closePeek, true);
-      window.removeEventListener('resize', closePeek);
+      window.removeEventListener('scroll', leaveRow, true);
+      window.removeEventListener('resize', leaveRow);
     };
-  }, [peek, closePeek]);
+  }, [peek, revealed, leaveRow]);
 
   // Смена фильтра перетасовывает список под неподвижным курсором: строка на
   // том же месте — уже другой топик, а mouseenter об этом не сообщит.
-  useEffect(() => setPeek(null), [topicFilter]);
+  useEffect(() => {
+    leaveRow();
+    // leaveRow в зависимостях не нужен: сбрасывать надо на смену фильтра, а
+    // не всякий раз, когда пересоздалась функция.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topicFilter]);
+
+  // Отложенное появление кнопки переживает размонтирование панели, если его
+  // не снять: таймер выстрелит в пустоту, а ссылка на строку не отпустит DOM.
+  useEffect(() => cancelReveal, [cancelReveal]);
 
   return (
     <div
@@ -162,17 +226,18 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicConfi
                 key={filteredTopics[index].name}
                 className="relative shrink-0 w-full p-2"
                 data-name="topic item"
-                onMouseEnter={(e) => openPeek(e.currentTarget, filteredTopics[index].name)}
+                onMouseEnter={(e) => enterRow(e.currentTarget, filteredTopics[index].name)}
                 // Закрывает вынос в том числе когда курсор уходит ВПРАВО за
                 // границу панели: справа строки уже нет, а хвост выноса
                 // сквозной и мышь не ловит.
-                onMouseLeave={closePeek}
+                onMouseLeave={leaveRow}
               >
                 <TopicRow
                   topic={filteredTopics[index]}
                   isSelected={selectedTopic?.name === filteredTopics[index].name}
+                  revealed={revealed === filteredTopics[index].name}
                   onSelect={() => onTopicSelect(filteredTopics[index])}
-                  onConfig={onTopicConfig}
+                  onInfo={onTopicInfo}
                 />
               </div>
             )}

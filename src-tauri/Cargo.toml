@@ -25,7 +25,12 @@ tauri-plugin-dialog = "2"
 memchr = "2"
 # oneshot-каналы для ответов Kafka-воркера. Tauri-команда ждёт ответ через
 # .await, не занимая поток исполнителя.
-tokio = { version = "1", features = ["sync"] }
+#
+# `rt` — ради одного места: rdkafka отдаёт результат `DescribeConfigs` будущим,
+# а воркер живёт на обычном потоке и ждёт его синхронно (см. `topic_config`).
+# Однопоточного рантайма для этого достаточно: будущее будит собственный поток
+# админского клиента, ни таймеров, ни ввода-вывода ему не нужно.
+tokio = { version = "1", features = ["sync", "rt"] }
 keyring = { version = "4.1.6", features = ["apple-native-keyring-store"] }
 chrono = { version = "0.4.45", features = ["clock"] }
 

@@ -241,6 +241,18 @@ async fn get_topics(worker: tauri::State<'_, WorkerHandle>) -> Result<Vec<TopicI
     worker.call(Command::ListTopics).await?
 }
 
+/// Устройство и настройки топика: партиции, реплики и всё, что отдаёт
+/// `DescribeConfigs`. К чтению отношения не имеет — открытый топик не меняет.
+#[tauri::command]
+async fn describe_topic(
+    worker: tauri::State<'_, WorkerHandle>,
+    topic: String,
+) -> Result<TopicDetails, String> {
+    worker
+        .call(|reply| Command::DescribeTopic(topic, reply))
+        .await?
+}
+
 /// Вычитывает окно сообщений в буфер на стороне Rust и возвращает только
 /// счётчики. Сами строки забираются через `get_window` по мере прокрутки.
 #[tauri::command]
@@ -536,6 +548,7 @@ pub fn run() {
             get_settings,
             save_settings,
             get_topics,
+            describe_topic,
             open_topic,
             load_more,
             get_open_topic_progress,

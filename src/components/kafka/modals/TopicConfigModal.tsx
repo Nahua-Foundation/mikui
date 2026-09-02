@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '../../ui/button';
-import { Bookmark, FileText, RotateCw, Upload, X } from 'lucide-react';
+import { FileText, RotateCw, Upload, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Dialog, DialogHeader, DialogTitle } from '../../ui/dialog';
@@ -164,10 +164,6 @@ export function TopicConfigModal({
     }
   }, [cluster, topicName, format, message, onSchemaChanged, onOpenChange]);
 
-  const handleAddToFavorites = () => {
-    toast.success(`Added "${topicName}" to favorites`);
-  };
-
   if (!topic) return null;
 
   const files = schema?.files ?? [];
@@ -179,19 +175,12 @@ export function TopicConfigModal({
         className="max-w-md bg-surface border-edge text-slate-50"
         aria-describedby={undefined}
       >
+        {/* Кнопки «в избранное» здесь больше нет: она показывала тост и не
+            делала ничего — избранного у топиков в приложении не существует. */}
         <DialogHeader className="border-b border-edge pb-4 min-w-0">
-          <div className="flex items-center justify-between min-w-0">
-            <DialogTitle className="font-mono text-soft text-lg truncate min-w-0" title={topic.name}>
-              {topic.name}
-            </DialogTitle>
-            <button
-              onClick={handleAddToFavorites}
-              className="p-1 text-dim hover:text-brand transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none shrink-0"
-              title="Add to favorites"
-            >
-              <Bookmark className="size-4" />
-            </button>
-          </div>
+          <DialogTitle className="font-mono text-soft text-lg truncate min-w-0" title={topic.name}>
+            {topic.name}
+          </DialogTitle>
         </DialogHeader>
 
         {/* min-w-0: содержимое окна — ячейка грида, а она по умолчанию не уже

@@ -25,6 +25,7 @@ import {
   Settings,
   StartFrom,
   Topic,
+  TopicDetails,
   TopicSchema,
 } from './types';
 
@@ -119,6 +120,10 @@ export const saveSettings = (settings: Settings) => invoke<void>('save_settings'
 // --- Топики и сообщения -----------------------------------------------------
 
 export const getTopics = () => invoke<Topic[]>('get_topics');
+
+/** Устройство и настройки топика. Открытый топик не трогает. */
+export const describeTopic = (topic: string) =>
+  invoke<TopicDetails>('describe_topic', { topic });
 
 export const openTopic = (params: {
   topic: string;
