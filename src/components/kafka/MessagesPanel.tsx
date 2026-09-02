@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RowPreview, SortColumn, SortDirection, SortSpec } from './types';
+import { formatTimestamp } from './format';
 import { Virtuoso } from 'react-virtuoso';
 
 const COLUMNS = ['partition', 'offset', 'key', 'message', 'timestamp'] as const;
@@ -17,25 +18,6 @@ function nextDirection(current: SortDirection | null): SortDirection | null {
   if (current === null) return 'asc';
   if (current === 'asc') return 'desc';
   return null;
-}
-
-/** Один экземпляр на приложение: пересоздавать форматтер на каждую строку
- *  заметно дороже самого форматирования. `Intl.DateTimeFormat` секунд точнее
- *  не берёт, поэтому миллисекунды дописываются отдельно. */
-const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-  hour12: false,
-});
-
-function formatTimestamp(millis: number): string {
-  if (!millis) return '—';
-  const ms = String(((millis % 1000) + 1000) % 1000).padStart(3, '0');
-  return `${TIME_FORMAT.format(new Date(millis))}.${ms}`;
 }
 
 interface MessageRowProps {

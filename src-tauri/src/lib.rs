@@ -1,11 +1,13 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 mod config;
+mod favorites;
 mod helpers;
 mod kafka;
 mod proto;
 
 use config::{ClusterConfig, ClusterUser, Settings};
+use favorites::{FavoritesView, SaveFavoriteRequest, SaveFavoriteResult, SavedMessage};
 use kafka::*;
 use proto::{BodyFormat, ProtoMessageForm, TopicSchemaView};
 
@@ -137,6 +139,9 @@ async fn delete_cluster(app: tauri::AppHandle, id: String) -> Result<(), String>
     if let Err(e) = proto::forget_cluster(&app, &id) {
         eprintln!("can't delete proto schemas of cluster {id}: {e}");
     }
+    // А вот избранное этого кластера остаётся, и это не забывчивость: схема без
+    // кластера бесполезна, а сохранённое сообщение — сама ценность. Его для того
+    // и сохраняли, чтобы оно пережило и retention, и само подключение.
     Ok(())
 }
 
@@ -529,6 +534,65 @@ async fn produce_message(
         .await?
 }
 
+// --- Сохранённые сообщения ----------------------------------------------------
+//
+// Всё, что меняет архив, возвращает его ЦЕЛИКОМ вместе с занятым местом — тот
+// же приём, что у схем топиков: досчитывать новое состояние на фронте значило
+// бы разъезжаться с диском, а размеры там всё равно неоткуда взять.
+
+#[tauri::command]
+async fn list_favorites(app: tauri::AppHandle) -> Result<FavoritesView, String> {
+    favorites::list(&app)
+}
+
+/// Сохраняет сообщение так, чтобы оно пережило и перезапуск, и retention.
+///
+/// Тело берётся у воркера СЫРЫМИ байтами, а не приезжает с фронта готовой
+/// строкой: на фронте оно уже прошло через нашу схему и `from_utf8_lossy`, а
+/// схему к топику загружают когда угодно — в том числе после сохранения. Байты
+/// разберутся и завтра, испорченный текст — уже нет.
+///
+/// `partition` и `offset` присылаются вместе с индексом строки и сверяются с
+/// тем, что нашлось: индекс живёт ровно до следующей смены фильтра или
+/// сортировки, а модалка к этому моменту может стоять открытой.
+#[tauri::command]
+async fn save_favorite(
+    app: tauri::AppHandle,
+    worker: tauri::State<'_, WorkerHandle>,
+    request: SaveFavoriteRequest,
+) -> Result<SaveFavoriteResult, String> {
+    let raw = worker
+        .call(|reply| Command::GetRaw(request.index, reply))
+        .await??;
+    if raw.partition != request.partition || raw.offset != request.offset {
+        return Err("the message list has changed; reopen the message and try again".into());
+    }
+    favorites::save(
+        &app,
+        &request.cluster,
+        &request.cluster_name,
+        &request.topic,
+        &raw,
+    )
+}
+
+#[tauri::command]
+async fn delete_favorite(app: tauri::AppHandle, id: String) -> Result<FavoritesView, String> {
+    favorites::delete(&app, &id)
+}
+
+#[tauri::command]
+async fn clear_favorites(app: tauri::AppHandle) -> Result<FavoritesView, String> {
+    favorites::clear(&app)
+}
+
+/// Тело сохранённого сообщения — только когда его открыли, как и у строки
+/// таблицы, и разобранное сегодняшней схемой топика.
+#[tauri::command]
+async fn get_favorite(app: tauri::AppHandle, id: String) -> Result<SavedMessage, String> {
+    favorites::message(&app, &id)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -566,6 +630,11 @@ pub fn run() {
             proto_message_form,
             check_produce_payload,
             produce_message,
+            list_favorites,
+            save_favorite,
+            delete_favorite,
+            clear_favorites,
+            get_favorite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

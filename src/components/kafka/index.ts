@@ -24,7 +24,9 @@ export { ClusterConfigModal } from './modals/ClusterConfigModal';
 export { ClusterArchiveModal } from './modals/ClusterArchiveModal';
 export { ClusterUsersModal } from './modals/ClusterUsersModal';
 export { FavoritesModal } from './modals/FavoritesModal';
+export { SavedMessageModal } from './modals/SavedMessageModal';
 
 // Small Components
 export { Tab } from './components/Tab';
 export { MenuItem } from './components/MenuItem';
+export { IconAction } from './components/IconAction';

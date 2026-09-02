@@ -10,6 +10,7 @@ import {
   BodyFormat,
   ClusterConnectPayload,
   ClusterUser,
+  FavoritesView,
   FullMessage,
   KafkaCluster,
   LoadMoreParams,
@@ -22,6 +23,8 @@ import {
   ProtoMessageForm,
   ReadRange,
   RowPreview,
+  SavedMessage,
+  SaveFavoriteResult,
   Settings,
   StartFrom,
   Topic,
@@ -151,6 +154,44 @@ export const getMessageBody = (index: number) =>
   invoke<FullMessage>('get_message_body', { index });
 
 export const closeTopic = () => invoke<void>('close_topic');
+
+// --- Сохранённые сообщения ----------------------------------------------------
+//
+// Всё, что меняет архив, возвращает его ЦЕЛИКОМ вместе с занятым местом: тот же
+// приём, что у схем топиков. Досчитывать размеры на фронте всё равно нечем —
+// их знает только диск.
+
+export const listFavorites = () => invoke<FavoritesView>('list_favorites');
+
+/**
+ * Сохраняет сообщение на диск.
+ *
+ * Тело не передаётся: бэкенд берёт его у воркера СЫРЫМИ байтами по индексу
+ * строки. То, что лежит здесь, уже прошло через схему и `from_utf8_lossy` — а
+ * схему к топику загружают когда угодно, в том числе после сохранения, и
+ * разбирать испорченный текст назавтра было бы нечем. `partition` и `offset`
+ * едут для сверки: индекс живёт до ближайшей смены фильтра или сортировки.
+ *
+ * Повторное сохранение того же сообщения обновляет запись, а не заводит вторую
+ * — об этом говорит `updated` в ответе.
+ */
+export const saveFavorite = (request: {
+  cluster: string;
+  cluster_name: string;
+  topic: string;
+  index: number;
+  partition: number;
+  offset: number;
+}) => invoke<SaveFavoriteResult>('save_favorite', { request });
+
+export const deleteFavorite = (id: string) => invoke<FavoritesView>('delete_favorite', { id });
+
+export const clearFavorites = () => invoke<FavoritesView>('clear_favorites');
+
+/** Тело сохранённого сообщения — по требованию, как `getMessageBody` у строки
+ *  таблицы: в списке его нет. Разбирается сегодняшней схемой того топика,
+ *  откуда сообщение, а не того, что открыт сейчас. */
+export const getFavorite = (id: string) => invoke<SavedMessage>('get_favorite', { id });
 
 // --- Protobuf-схемы топиков --------------------------------------------------
 //

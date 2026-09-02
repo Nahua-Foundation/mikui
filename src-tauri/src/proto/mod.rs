@@ -8,9 +8,13 @@
 mod decoder;
 mod files;
 mod schema;
-mod store;
 mod template;
 mod types;
+
+// Видно всему крейту ради `crate::favorites`: сохранённое сообщение
+// показывается той же схемой, что и открытый топик, а весь тот модуль — как и
+// этот — работает по каталогу настроек, чтобы прогоняться на временном.
+pub(crate) mod store;
 
 use std::sync::Arc;
 

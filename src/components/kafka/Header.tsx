@@ -24,6 +24,7 @@ import {
 } from './types';
 import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
+import { IconAction } from './components/IconAction';
 import { FormatSelect } from './components/FormatSelect';
 import { ReadOrder } from './components/ReadOrder';
 
@@ -407,66 +408,35 @@ export function HeaderDesktop({
           </MenuItem>
         )}
 
-        {topic && (
-          <MenuItem>
-            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
-              <button
-                onClick={onOpenFavorites}
-                className="text-soft hover:text-brand bg-transparent border-none outline-none cursor-pointer p-0 transition-colors"
-                title="Favorites"
-              >
-                <Folder className="size-4" />
-              </button>
-            </div>
-          </MenuItem>
-        )}
+        {/* Не под условием `topic`, в отличие от соседей: сохранённые сообщения
+            лежат на диске и переживают и топик, и подключение — добраться до
+            них, ничего не открывая, обычное дело. */}
+        <IconAction onClick={onOpenFavorites} title="Saved messages">
+          <Folder className="size-4" />
+        </IconAction>
 
+        {/* Живой хвост — Фаза 3. Кнопка на месте, чтобы не менять раскладку
+            шапки, но выключена: раньше она показывала тост и не делала ничего,
+            что вводило в заблуждение. */}
         {topic && (
-          <MenuItem>
-            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
-              {/* Живой хвост — Фаза 3. Кнопка на месте, чтобы не менять раскладку
-                  шапки, но выключена: раньше она показывала тост и не делала
-                  ничего, что вводило в заблуждение. */}
-              <button
-                disabled
-                className="text-dim bg-transparent border-none outline-none p-0 cursor-not-allowed opacity-50"
-                title="Live tail — not implemented yet"
-              >
-                <Play className="size-4" />
-              </button>
-            </div>
-          </MenuItem>
+          <IconAction disabled title="Live tail — not implemented yet">
+            <Play className="size-4" />
+          </IconAction>
         )}
 
         {/* Отправка стоит рядом с чтением, а не в настройках топика: это
             действие над теми же данными, что и в таблице, и делают его в том же
             заходе — посмотреть, что лежит, и положить рядом своё. */}
         {topic && (
-          <MenuItem>
-            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
-              <button
-                onClick={onProduce}
-                className="text-soft hover:text-brand bg-transparent border-none outline-none cursor-pointer p-0 transition-colors"
-                title="Produce a message"
-              >
-                <Send className="size-4" />
-              </button>
-            </div>
-          </MenuItem>
+          <IconAction onClick={onProduce} title="Produce a message">
+            <Send className="size-4" />
+          </IconAction>
         )}
 
         {topic && (
-          <MenuItem>
-            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
-              <button
-                onClick={onRefresh}
-                className="text-soft hover:text-brand bg-transparent border-none outline-none cursor-pointer p-0 transition-colors"
-                title="Re-read the topic"
-              >
-                <RefreshCw className="size-4" />
-              </button>
-            </div>
-          </MenuItem>
+          <IconAction onClick={onRefresh} title="Re-read the topic">
+            <RefreshCw className="size-4" />
+          </IconAction>
         )}
       </div>
     </div>

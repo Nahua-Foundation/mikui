@@ -448,6 +448,8 @@ pub enum Command {
         reply: Reply<Result<Vec<RowPreview>, String>>,
     },
     GetBody(usize, Reply<Result<FullMessage, String>>),
+    /// Сообщение сырыми байтами — для архива сохранённых. См. `Worker::raw`.
+    GetRaw(usize, Reply<Result<RawBody, String>>),
     /// Чем декодировать тела открытого топика. `None` — отдавать как есть.
     ///
     /// Отдельная команда, а не поле в `OpenTopic`: выбор message в настройках
@@ -505,25 +507,6 @@ fn absorb(store: &mut MessageStore, msg: &RawMessage) -> bool {
         msg.payload().unwrap_or(&[]),
         &headers,
     )
-}
-
-/// Результат попытки декодировать тело.
-///
-/// Оба поля пустые — декодера нет, тело показывается как раньше. Именно поэтому
-/// это не `Result`: «декодера не задали» и «декодер не справился» ведут к разным
-/// строкам таблицы, и слить их в одну ветку значило бы врать про первый случай.
-#[derive(Default)]
-struct Rendered {
-    decoded: Option<String>,
-    error: Option<String>,
-}
-
-impl Rendered {
-    /// Показывать ли тело как двоичное. Успешно разобранный protobuf двоичным
-    /// не считается: наружу уехал JSON, и метка `[binary]` на нём была бы ложью.
-    fn binary(&self, raw: &[u8]) -> bool {
-        self.decoded.is_none() && !text::is_text(raw)
-    }
 }
 
 /// Что известно про партицию между раундами. Переживает завершение чтения:
@@ -929,6 +912,9 @@ impl Worker {
                 }
                 Command::GetBody(index, reply) => {
                     let _ = reply.send(self.body(index));
+                }
+                Command::GetRaw(index, reply) => {
+                    let _ = reply.send(self.raw(index));
                 }
                 Command::SetDecoder(decoder, reply) => {
                     self.decoder = decoder;
@@ -2296,7 +2282,7 @@ impl Worker {
                     .get(i)
                     .expect("view index out of sync with store");
                 let value = self.store.value(i);
-                let shown = self.render(value);
+                let shown = text::render(self.decoder.as_deref(), value);
                 RowPreview {
                     index: start + offset_in_window,
                     partition: meta.partition,
@@ -2317,68 +2303,65 @@ impl Worker {
             .collect()
     }
 
-    /// Прогоняет тело через декодер, если он задан.
-    ///
-    /// Декодирование ленивое — только для строк, которые действительно уезжают
-    /// на экран, и для сообщения, которое действительно открыли. Ни кэша, ни
-    /// второй копии тела в памяти: буфер и так держит десятки тысяч сообщений,
-    /// и класть рядом их разобранные представления значило бы удвоить его цену
-    /// ради данных, которые переживут один экран прокрутки.
-    fn render(&self, value: &[u8]) -> Rendered {
-        let Some(decoder) = &self.decoder else {
-            return Rendered::default();
-        };
-        match decoder.decode(value) {
-            Ok(json) => Rendered {
-                decoded: Some(json),
-                error: None,
-            },
-            // Схему не трогаем и топик не закрываем: одно сообщение чужого
-            // формата — обычное дело в топике, который переживал смену
-            // контракта. Показываем его текстом и говорим, что случилось.
-            Err(e) => Rendered {
-                decoded: None,
-                error: Some(e),
-            },
-        }
+    /// Индекс в буфере по индексу в текущем отфильтрованном представлении.
+    fn store_index(&self, view_index: usize) -> Result<usize, String> {
+        self.view
+            .get(view_index)
+            .map(|&i| i as usize)
+            .ok_or_else(|| "message index out of range".to_string())
     }
 
     /// Полное тело — только когда пользователь открыл конкретное сообщение.
     fn body(&self, view_index: usize) -> Result<FullMessage, String> {
-        let store_index = *self
-            .view
-            .get(view_index)
-            .ok_or("message index out of range")? as usize;
+        let store_index = self.store_index(view_index)?;
         let meta = self
             .store
             .get(store_index)
             .ok_or("message index out of range")?;
         let value = self.store.value(store_index);
-        let shown = self.render(value);
-        // Только у декодированного тела есть enum, с которым можно сверяться:
-        // на самостоятельном JSON или тексте это был бы список из чужой схемы.
-        let enum_values = match &shown.decoded {
-            Some(_) => self
-                .decoder
-                .as_ref()
-                .map(|d| d.enum_values().to_vec())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let shown = text::body(self.decoder.as_deref(), value);
 
         Ok(FullMessage {
             partition: meta.partition,
             offset: meta.offset,
             timestamp: meta.timestamp,
             key: text::decode(self.store.key(store_index)),
-            binary: shown.binary(value),
-            value: match shown.decoded {
-                Some(json) => json,
-                None => text::decode(value),
-            },
+            binary: shown.binary,
+            value: shown.value,
             value_size: value.len(),
-            decode_error: shown.error,
-            enum_values,
+            decode_error: shown.decode_error,
+            enum_values: shown.enum_values,
+            headers: self
+                .store
+                .headers(store_index)
+                .into_iter()
+                .map(|(k, v)| MessageHeader {
+                    key: k.to_string(),
+                    value: text::decode(v),
+                })
+                .collect(),
+        })
+    }
+
+    /// Сообщение в том виде, в каком оно пришло из Kafka: тело — сырыми
+    /// байтами, без всякой схемы.
+    ///
+    /// Нужно ровно одному вызывающему — архиву сохранённых. Сохранять наш способ
+    /// показа вместо самих данных значило бы потерять их навсегда: тело, не
+    /// разобравшееся схемой, уезжает в UI через `from_utf8_lossy`, и загруженная
+    /// назавтра схема разбирать было бы уже нечего.
+    fn raw(&self, view_index: usize) -> Result<RawBody, String> {
+        let store_index = self.store_index(view_index)?;
+        let meta = self
+            .store
+            .get(store_index)
+            .ok_or("message index out of range")?;
+        Ok(RawBody {
+            partition: meta.partition,
+            offset: meta.offset,
+            timestamp: meta.timestamp,
+            key: text::decode(self.store.key(store_index)),
+            value: self.store.value(store_index).to_vec(),
             headers: self
                 .store
                 .headers(store_index)

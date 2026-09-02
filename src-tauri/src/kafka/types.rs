@@ -398,7 +398,9 @@ pub struct MessageHeader {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `Deserialize` здесь ради избранного: сообщение, которое сохраняют, приезжает
+/// обратно с фронта тем же типом, каким туда уехало (см. `crate::favorites`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FullMessage {
     pub partition: i32,
@@ -419,6 +421,22 @@ pub struct FullMessage {
     /// произвольного JSON или текста никакой схемы, с которой можно было бы
     /// сверяться, попросту нет.
     pub enum_values: Vec<String>,
+    pub headers: Vec<MessageHeader>,
+}
+
+/// Сообщение в том виде, в каком оно пришло из Kafka.
+///
+/// Через границу IPC не ездит и потому не сериализуется: единственный
+/// потребитель — архив сохранённых, который кладёт эти байты на диск. Тело
+/// сырое намеренно, а вот ключ и заголовки уже текст — их и таблица показывает
+/// текстом, схема к ним отношения не имеет.
+#[derive(Debug, Clone)]
+pub struct RawBody {
+    pub partition: i32,
+    pub offset: i64,
+    pub timestamp: i64,
+    pub key: String,
+    pub value: Vec<u8>,
     pub headers: Vec<MessageHeader>,
 }
 

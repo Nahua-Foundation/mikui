@@ -1,29 +1,32 @@
-import { useEffect, useRef, useState } from 'react';
+import { ReactNode, useEffect, useRef, useState } from 'react';
 import { Button } from '../../ui/button';
-import { Copy, Star } from 'lucide-react';
+import { Copy, Star, StarOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { BodyFormat, FullMessage, MessageHeader } from '../types';
+import { formatTimestamp } from '../format';
 import { highlightLine } from '../syntax';
 
 /** Потолок отрисовки. Тело на 10 МБ иначе положило бы вкладку на лопатки
  *  ещё до того, как пользователь что-то увидит. */
 const MAX_RENDERED_LINES = 2000;
 
-/** `toLocaleString` секунд точнее не берёт, поэтому миллисекунды дописываются
- *  отдельно — как в таблице сообщений. */
-function formatTimestamp(millis: number): string {
-  if (!millis) return '—';
-  const ms = String(((millis % 1000) + 1000) % 1000).padStart(3, '0');
-  return `${new Date(millis).toLocaleString()}.${ms}`;
-}
-
 interface MessageDetailsModalProps {
   message: FullMessage | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onAddToFavorite?: (message: FullMessage) => void;
+  /** Заголовок и подпись под ним. Заданы у окна сохранённого сообщения: там
+   *  вместо «выбранной строки» надо назвать кластер и топик, откуда оно, —
+   *  открытого топика в тот момент может не быть вовсе. */
+  title?: string;
+  description?: ReactNode;
+  /** Сообщение уже лежит в архиве. Тогда кнопка сохранения превращается в
+   *  кнопку удаления: без этого клик по «Save» на уже сохранённом выглядел бы
+   *  как «ничего не произошло». */
+  saved?: boolean;
+  onAddToFavorite?: () => void;
+  onRemoveFavorite?: () => void;
   /**
    * Показать соседнее сообщение, не закрывая модалку: -1 — строкой выше по
    * таблице, +1 — строкой ниже. Порядок строк задаёт таблица, поэтому здесь
@@ -45,7 +48,11 @@ export function MessageDetailsModal({
   message,
   open,
   onOpenChange,
+  title = 'Message Details',
+  description = 'View details of the selected message',
+  saved = false,
   onAddToFavorite,
+  onRemoveFavorite,
   onNavigate,
   format = 'json',
 }: MessageDetailsModalProps) {
@@ -135,12 +142,6 @@ export function MessageDetailsModal({
     }
   };
 
-  const handleSave = () => {
-    if (message && onAddToFavorite) {
-      onAddToFavorite(message);
-    }
-  };
-
   if (!message) return null;
 
   const { text: formatted, isJson } = formatJson(message.value);
@@ -153,11 +154,9 @@ export function MessageDetailsModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContentNoClose className="max-w-[58rem] sm:max-w-[58rem] max-h-[90vh] bg-surface border-edge text-slate-50">
         <DialogHeader className="border-b border-edge pb-4">
-          <DialogTitle className="font-mono text-soft text-lg">
-            Message Details
-          </DialogTitle>
+          <DialogTitle className="font-mono text-soft text-lg">{title}</DialogTitle>
           <DialogDescription className="font-mono text-soft text-sm">
-            View details of the selected message
+            {description}
           </DialogDescription>
         </DialogHeader>
         
@@ -212,17 +211,35 @@ export function MessageDetailsModal({
                 </Button>
               </div>
               <div className="flex gap-2">
-                {onAddToFavorite && (
-                  <Button 
-                    variant="outline" 
-                    size="sm"
-                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
-                    onClick={handleSave}
-                  >
-                    <Star className="size-4 mr-1" />
-                    Save
-                  </Button>
-                )}
+                {/* Одна кнопка на два состояния, а не «Save» рядом с
+                    «Delete»: сохранённость сообщения — это одно свойство, и
+                    показывать его двумя кнопками значило бы заставлять
+                    угадывать, какая из них сейчас что-то сделает. */}
+                {saved
+                  ? onRemoveFavorite && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-transparent border-edge text-brand hover:bg-edge hover:text-danger"
+                        onClick={onRemoveFavorite}
+                        title="This message is kept on disk. Click to delete it from saved."
+                      >
+                        <StarOff className="size-4 mr-1" />
+                        Delete from saved
+                      </Button>
+                    )
+                  : onAddToFavorite && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
+                        onClick={onAddToFavorite}
+                        title="Keep this message on disk — it will outlive the topic's retention."
+                      >
+                        <Star className="size-4 mr-1" />
+                        Save
+                      </Button>
+                    )}
                 <Button 
                   variant="outline" 
                   size="sm"

@@ -130,9 +130,66 @@ export interface FullMessage {
   headers: MessageHeader[];
 }
 
-export interface FavoriteMessage extends FullMessage {
-  topicName: string;
-  savedAt: string;
+/**
+ * Строка списка сохранённых сообщений.
+ *
+ * Тела здесь нет намеренно: сохраняют как раз тяжёлое, и грузить десятки
+ * мегабайт только чтобы нарисовать список, незачем — оно лежит отдельным файлом
+ * и берётся по `getFavorite`, ровно как полное тело строки таблицы.
+ */
+export interface FavoriteInfo {
+  id: string;
+  /** Ключ кластера — тот же, что у схем топиков (`clusterKey`). */
+  cluster: string;
+  /** Как кластер назывался в момент сохранения: список общий на все кластеры,
+   *  и по идентификатору его не узнать. */
+  cluster_name: string;
+  topic: string;
+  partition: number;
+  offset: number;
+  /** Unix millis самого сообщения, а не момента сохранения. */
+  timestamp: number;
+  key: string;
+  preview: string;
+  /** Размер тела НА ПРОВОДЕ. С `bytes` не совпадает: на диске лежит UTF-8
+   *  текст в JSON, а в Kafka — сжатые байты. */
+  value_size: number;
+  binary: boolean;
+  /** RFC 3339. */
+  saved_at: string;
+  /** Сколько запись занимает на диске прямо сейчас. */
+  bytes: number;
+  /** Файла тела нет — открыть запись нечем, удалить можно. */
+  missing: boolean;
+}
+
+/** Весь архив: и список, и то, во что он обходится. */
+export interface FavoritesView {
+  items: FavoriteInfo[];
+  /** Тела плюс сам индекс. */
+  total_bytes: number;
+}
+
+export const EMPTY_FAVORITES: FavoritesView = { items: [], total_bytes: 0 };
+
+/** Ответ на сохранение. `updated` отличает «сохранили» от «обновили уже
+ *  сохранённое»: записей после повторного клика по звезде по-прежнему одна. */
+export interface SaveFavoriteResult extends FavoritesView {
+  id: string;
+  updated: boolean;
+}
+
+/**
+ * Открытое сохранённое сообщение.
+ *
+ * Тело собрано бэкендом ПРЯМО СЕЙЧАС и по той схеме, которая привязана к топику
+ * сегодня: на диске лежат сырые байты из Kafka, а не наш вчерашний способ их
+ * показать. Поэтому схема, загруженная уже после сохранения, разбирает и то,
+ * что сохранено до неё.
+ */
+export interface SavedMessage extends FullMessage {
+  /** Формат тела ТОГО топика, откуда сообщение, — не того, что открыт сейчас. */
+  format: BodyFormat;
 }
 
 /** Применяется в Rust по сырым байтам, до пересечения границы IPC. */

@@ -5,15 +5,18 @@ import {
   Topic,
   ClusterConnectPayload,
   ClusterUser,
-  FavoriteMessage,
+  FavoriteInfo,
+  FavoritesView,
   FullMessage,
   MessageFilter,
   KafkaCluster,
   OpenTopicResult,
   ReadMode,
   ReadRange,
+  SavedMessage,
   SortSpec,
   TopicSchema,
+  EMPTY_FAVORITES,
   EMPTY_FILTER,
   EMPTY_RANGE,
   clusterKey,
@@ -30,6 +33,7 @@ import { ClusterConfigModal } from './kafka';
 import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
 import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
 import { FavoritesModal } from './kafka';
+import { SavedMessageModal } from './kafka';
 import { ProduceMessageModal } from './kafka/modals/ProduceMessageModal';
 import { useMessageWindow } from './kafka/useMessageWindow';
 import { invoke } from '@tauri-apps/api/core';
@@ -66,9 +70,14 @@ export function KafkaExplorerPortfolio() {
   /** Границы чтения для режимов `offset` и `timestamp`. */
   const [range, setRange] = useState<ReadRange>(EMPTY_RANGE);
   const [selectedMessage, setSelectedMessage] = useState<FullMessage | null>(null);
-  /** Позиция открытого сообщения в таблице — по ней стрелки находят соседей.
-   *  null у сообщения, открытого не из таблицы (из избранного). */
+  /** Позиция открытого сообщения в таблице — по ней стрелки находят соседей. */
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  /** Открытое сообщение из архива. Отдельно от таблицы, а не флагом поверх неё:
+   *  у него своё окно, свой формат тела и своё происхождение — топик, который
+   *  сейчас может быть и не открыт. */
+  const [savedMessage, setSavedMessage] = useState<SavedMessage | null>(null);
+  const [savedFavorite, setSavedFavorite] = useState<FavoriteInfo | null>(null);
+  const [isSavedModalOpen, setIsSavedModalOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [configTopic, setConfigTopic] = useState<Topic | null>(null);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
@@ -86,7 +95,9 @@ export function KafkaExplorerPortfolio() {
   /** Сортировка по клику на заголовок колонки. `null` — обычный порядок
    *  чтения из `readMode`. */
   const [sort, setSort] = useState<SortSpec | null>(null);
-  const [favorites, setFavorites] = useState<FavoriteMessage[]>([]);
+  /** Архив сохранённых сообщений вместе с занятым местом. Живёт на диске;
+   *  здесь только последний отданный бэкендом снимок. */
+  const [favorites, setFavorites] = useState<FavoritesView>(EMPTY_FAVORITES);
   const [topics, setTopics] = useState<Topic[]>([]);
 
   const [total, setTotal] = useState(0);
@@ -162,6 +173,28 @@ export function KafkaExplorerPortfolio() {
         toast.error(`Failed to load saved clusters: ${e}`);
       });
   }, []);
+
+  /**
+   * Перечитывает архив с диска.
+   *
+   * Зовётся не только при старте, но и на каждое открытие списка: сохранённое
+   * тело лежит сырым, и его превью зависит от схемы топика, которую могли
+   * привязать или снять уже после сохранения. Стоит это чтения килобайтного
+   * индекса — пересчитывает бэкенд только то, что действительно разъехалось.
+   */
+  const loadFavorites = useCallback(() => {
+    api
+      .listFavorites()
+      .then(setFavorites)
+      .catch((e) => {
+        console.error('Failed to load saved messages', e);
+        toast.error(`Failed to load saved messages: ${describeError(e)}`);
+      });
+  }, []);
+
+  // При старте — с диска: в этом весь смысл архива. Подключение для этого не
+  // нужно, сообщения лежат у нас.
+  useEffect(loadFavorites, [loadFavorites]);
 
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
@@ -380,6 +413,10 @@ export function KafkaExplorerPortfolio() {
   // опоздавшие: без него зажатая стрелка оставляла бы в модалке то тело,
   // которое приехало последним, а не то, на котором остановились.
   const bodyRequest = useRef(0);
+
+  /** Тот же талон, но для окна сохранённого сообщения: окна два и живут они
+   *  независимо. */
+  const favoriteRequest = useRef(0);
 
   const showMessageAt = useCallback((index: number) => {
     const ticket = ++bodyRequest.current;
@@ -716,26 +753,114 @@ export function KafkaExplorerPortfolio() {
     setSelectedTopic((t) => (t ? { ...t } : t));
   }, []);
 
-  const handleOpenFavorites = useCallback(() => setIsFavoritesModalOpen(true), []);
+  const handleOpenFavorites = useCallback(() => {
+    // Перечитываем именно здесь: между прошлым открытием и этим могли поменять
+    // схему топика, и превью сохранённого обязано её догнать — иначе список
+    // показывает байты у сообщения, которое модалка уже разбирает по схеме.
+    loadFavorites();
+    setIsFavoritesModalOpen(true);
+  }, [loadFavorites]);
 
   const handleOpenProduce = useCallback(() => setIsProduceModalOpen(true), []);
 
-  const handleAddToFavorite = useCallback(
-    (message: FullMessage) => {
-      setFavorites((prev) => [
-        ...prev,
-        { ...message, topicName: selectedTopic?.name || '', savedAt: new Date().toISOString() },
-      ]);
-      toast.success('Message added to favorites');
-    },
-    [selectedTopic],
+  /**
+   * Кладёт открытое сообщение на диск.
+   *
+   * Наверх уезжает только индекс строки: тело бэкенд возьмёт у воркера сырыми
+   * байтами, потому что здесь оно уже прошло через схему и `from_utf8_lossy` —
+   * а схему к топику загружают когда угодно, в том числе после сохранения.
+   * Сохранённое повторно не удваивается: бэкенд узнаёт его по паре
+   * кластер-топик и координатам и обновляет запись на месте.
+   */
+  const handleAddToFavorite = useCallback(() => {
+    const topic = selectedTopic?.name;
+    if (!topic || !selectedMessage || selectedIndex === null) return;
+    api
+      .saveFavorite({
+        cluster: schemaCluster ?? '',
+        cluster_name: connectedName ?? '',
+        topic,
+        index: selectedIndex,
+        partition: selectedMessage.partition,
+        offset: selectedMessage.offset,
+      })
+      .then((result) => {
+        setFavorites({ items: result.items, total_bytes: result.total_bytes });
+        toast.success(result.updated ? 'Saved message updated' : 'Message saved to disk');
+      })
+      .catch((e) => {
+        console.error('Failed to save message', e);
+        toast.error(`Failed to save message: ${describeError(e)}`);
+      });
+  }, [selectedTopic, selectedMessage, selectedIndex, schemaCluster, connectedName]);
+
+  const removeFavorite = useCallback((id: string) => {
+    api
+      .deleteFavorite(id)
+      .then(setFavorites)
+      .catch((e) => {
+        console.error('Failed to delete saved message', e);
+        toast.error(`Failed to delete saved message: ${describeError(e)}`);
+      });
+  }, []);
+
+  const handleRemoveFavorite = useCallback(
+    (favorite: FavoriteInfo) => removeFavorite(favorite.id),
+    [removeFavorite],
   );
 
-  const handleRemoveFavorite = useCallback((favorite: FavoriteMessage) => {
-    setFavorites((prev) =>
-      prev.filter((f) => f.partition !== favorite.partition || f.offset !== favorite.offset),
-    );
-    toast.success('Message removed from favorites');
+  /**
+   * Идентификатор записи архива для открытого сообщения таблицы — `null`, если
+   * оно ещё не сохранено. По нему кнопка в окне просмотра и решает, сохранять
+   * ей или удалять.
+   */
+  const openMessageSavedId =
+    selectedMessage && selectedTopic
+      ? (favorites.items.find(
+          (f) =>
+            f.cluster === (schemaCluster ?? '') &&
+            f.topic === selectedTopic.name &&
+            f.partition === selectedMessage.partition &&
+            f.offset === selectedMessage.offset,
+        )?.id ?? null)
+      : null;
+
+  const handleClearFavorites = useCallback(() => {
+    api
+      .clearFavorites()
+      .then((view) => {
+        setFavorites(view);
+        toast.success('All saved messages deleted');
+      })
+      .catch((e) => {
+        console.error('Failed to delete saved messages', e);
+        toast.error(`Failed to delete saved messages: ${describeError(e)}`);
+      });
+  }, []);
+
+  /**
+   * Открывает сохранённое сообщение в его собственном окне: тело лежит
+   * отдельным файлом и читается по требованию, как и тело строки таблицы.
+   *
+   * Свой талон, а не общий с таблицей: окна два, и ответ на запрос из архива
+   * не должен ни отменять открытие строки, ни отменяться им.
+   */
+  const handleOpenFavorite = useCallback((favorite: FavoriteInfo) => {
+    const ticket = ++favoriteRequest.current;
+    api
+      .getFavorite(favorite.id)
+      .then((message) => {
+        if (favoriteRequest.current !== ticket) return;
+        setSavedFavorite(favorite);
+        setSavedMessage(message);
+        setIsFavoritesModalOpen(false);
+        setIsSavedModalOpen(true);
+      })
+      .catch((e) => {
+        if (favoriteRequest.current !== ticket) return;
+        console.error('Failed to load saved message', e);
+        toast.error(`Failed to load saved message: ${describeError(e)}`);
+      });
   }, []);
 
   return (
@@ -803,9 +928,23 @@ export function KafkaExplorerPortfolio() {
         message={selectedMessage}
         open={isModalOpen}
         onOpenChange={setIsModalOpen}
+        saved={openMessageSavedId !== null}
         onAddToFavorite={handleAddToFavorite}
+        onRemoveFavorite={
+          openMessageSavedId ? () => removeFavorite(openMessageSavedId) : undefined
+        }
         onNavigate={handleNavigateMessage}
         format={openSchema?.format}
+      />
+
+      {/* Сохранённое сообщение — в своём окне: у него другое происхождение и
+          другой формат тела, а топика, из которого оно взято, может не быть
+          открытым вовсе. */}
+      <SavedMessageModal
+        favorite={savedFavorite}
+        message={savedMessage}
+        open={isSavedModalOpen}
+        onOpenChange={setIsSavedModalOpen}
       />
 
       {/* Схема — та же, что применена к открытому топику: форма отправки
@@ -891,16 +1030,8 @@ export function KafkaExplorerPortfolio() {
         open={isFavoritesModalOpen}
         onOpenChange={setIsFavoritesModalOpen}
         onRemoveFavorite={handleRemoveFavorite}
-        onSelectMessage={(message) => {
-          // Сообщение из избранного не привязано к строке таблицы: индекса у
-          // него нет (стрелки промолчат), а талон надо забрать себе — иначе
-          // не доехавший ответ по таблице подменил бы его телом соседа.
-          bodyRequest.current += 1;
-          setSelectedIndex(null);
-          setSelectedMessage(message);
-          setIsFavoritesModalOpen(false);
-          setIsModalOpen(true);
-        }}
+        onClearFavorites={handleClearFavorites}
+        onSelectMessage={handleOpenFavorite}
       />
     </div>
   );
