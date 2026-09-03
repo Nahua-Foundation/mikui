@@ -75,7 +75,7 @@ use rdkafka::statistics::Statistics;
 use rdkafka::types::RDKafkaRespErr;
 use tokio::sync::oneshot;
 
-use super::filter::contains;
+use super::filter::Needle;
 use super::quota::{QuotaEstimate, QuotaMeter};
 use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
 use super::store::MessageStore;
@@ -808,6 +808,10 @@ struct Worker {
     /// Индексы в опубликованной части `store` после применения фильтра.
     /// Это и есть то, что видит UI.
     view: Vec<u32>,
+    /// Сколько записей стора уже просеяно в `view`. Опубликованный префикс
+    /// заморожен и только дописывается, поэтому всё до этой границы
+    /// пересматривать не надо — см. `extend_view`.
+    view_scanned: usize,
     filter: MessageFilter,
     /// Сортировка по столбцу поверх обычного порядка чтения. `None` — порядок
     /// как есть в `store` (уже отфильтрованный, см. `rebuild_view`).
@@ -852,6 +856,7 @@ impl Worker {
             partition_counts: HashMap::new(),
             store: MessageStore::default(),
             view: Vec::new(),
+            view_scanned: 0,
             filter: MessageFilter::default(),
             sort: None,
             open_topic: None,
@@ -2137,7 +2142,7 @@ impl Worker {
         };
 
         if published > 0 {
-            self.rebuild_view();
+            self.extend_view();
         }
     }
 
@@ -2182,6 +2187,7 @@ impl Worker {
         self.filter = MessageFilter::default();
         self.sort = None;
         self.view.clear();
+        self.view_scanned = 0;
         self.cursors.clear();
         self.has_timestamps = false;
         // Схема принадлежит топику. Оставить её — значит показать следующий
@@ -2193,76 +2199,66 @@ impl Worker {
     }
 
     /// Пересобирает отфильтрованное представление по ОПУБЛИКОВАННОЙ части
-    /// буфера. Работает в памяти, без единого сетевого запроса — поэтому смена
-    /// фильтра мгновенна.
+    /// буфера с нуля. Работает в памяти, без единого сетевого запроса —
+    /// поэтому смена фильтра мгновенна.
     ///
-    /// Публикация только дописывает записи в хвост, поэтому и `view` только
-    /// растёт: индексы уже показанных строк не меняются, и кэш окон на фронте
-    /// остаётся валидным.
+    /// Нужна там, где старый `view` больше не годится целиком: сменился фильтр
+    /// или порядок. После публикации новой порции хватает `extend_view`.
     fn rebuild_view(&mut self) {
-        // Забираем вектор себе: иначе `self.view.push` конфликтует с
-        // одновременным заимствованием `self.filter` и `self.store`.
-        // Ёмкость при этом сохраняется, повторных аллокаций нет.
+        // Забираем вектор себе: иначе `view.push` конфликтует с одновременным
+        // заимствованием `self.filter` и `self.store`. Ёмкость при этом
+        // сохраняется, повторных аллокаций нет.
         let mut view = std::mem::take(&mut self.view);
         view.clear();
-        let total = self.store.committed_len();
-
-        if self.filter.is_empty() {
-            view.extend(0..total as u32);
-        } else {
-            let key_needle = self.filter.key.as_bytes();
-            let value_needle = self.filter.value.as_bytes();
-            let cs = self.filter.case_sensitive;
-
-            for i in 0..total {
-                if !key_needle.is_empty() && !contains(self.store.key(i), key_needle, cs) {
-                    continue;
-                }
-                if !value_needle.is_empty() && !contains(self.store.value(i), value_needle, cs) {
-                    continue;
-                }
-                view.push(i as u32);
-            }
-        }
-
-        if let Some(sort) = self.sort {
-            self.sort_view(&mut view, sort);
-        }
-
+        self.view_scanned = self.grow_from(&mut view, 0);
         self.view = view;
     }
 
-    /// Сортировка по клику на заголовок колонки, поверх фильтра.
+    /// Досевает в `view` то, что опубликовалось с прошлого раза.
     ///
-    /// `sort_by` — стабильная сортировка: сообщения с одинаковым значением
-    /// столбца остаются в том порядке, в котором их поставил обычный порядок
-    /// чтения (время, а внутри него — офсет), а не в произвольном. Пока идёт
-    /// прогрессивная подгрузка, эта сортировка пересчитывается на весь `view`
-    /// при каждом новом раунде — если она активна, уже показанные строки
-    /// перестают быть застрахованы от переезда, в отличие от обычного порядка.
-    fn sort_view(&self, view: &mut [u32], sort: SortSpec) {
-        let desc = sort.direction == SortDirection::Desc;
-        view.sort_by(|&a, &b| {
-            let ma = self
-                .store
-                .get(a as usize)
-                .expect("view index out of sync with store");
-            let mb = self
-                .store
-                .get(b as usize)
-                .expect("view index out of sync with store");
-            let cmp = match sort.column {
-                SortColumn::Partition => ma.partition.cmp(&mb.partition),
-                SortColumn::Offset => ma.offset.cmp(&mb.offset),
-                SortColumn::Timestamp => ma.timestamp.cmp(&mb.timestamp),
-                SortColumn::Key => self.store.key(a as usize).cmp(self.store.key(b as usize)),
-            };
-            if desc {
-                cmp.reverse()
-            } else {
-                cmp
-            }
-        });
+    /// Опубликованный префикс `[0, committed)` заморожен и только дописывается
+    /// в хвост (см. границу `committed` в `store.rs`), поэтому пересматривать
+    /// его начало не надо. Без этого фильтр перебирал бы весь буфер заново на
+    /// каждом раунде подгрузки — а с включённым `search_decoded` ещё и
+    /// декодировал бы его целиком, то есть квадратично от числа раундов.
+    fn extend_view(&mut self) {
+        let total = self.store.committed_len();
+        debug_assert!(
+            total >= self.view_scanned,
+            "опубликованное не может убывать вне clear/release"
+        );
+        // Страховка на случай, если инвариант выше когда-нибудь нарушат:
+        // лучше лишняя пересборка, чем `view` с индексами в никуда.
+        if total < self.view_scanned {
+            self.rebuild_view();
+            return;
+        }
+        if total == self.view_scanned {
+            return;
+        }
+
+        let mut view = std::mem::take(&mut self.view);
+        self.view_scanned = self.grow_from(&mut view, self.view_scanned);
+        self.view = view;
+    }
+
+    /// Обёртка над свободной `grow_view`: собирает разобранный фильтр из
+    /// текущего состояния воркера, а саму работу отдаёт наружу.
+    ///
+    /// Фильтр готовится ЗДЕСЬ, а не хранится полем: `decoder` меняется командой
+    /// `SetDecoder` без пересборки представления, и закэшированный рядом флаг
+    /// «есть чем разбирать» протух бы молча. Две аллокации на проход по буферу
+    /// — не та цена, за которую стоит держать производное состояние.
+    fn grow_from(&self, view: &mut Vec<u32>, from: usize) -> usize {
+        let prepared = PreparedFilter::new(&self.filter, self.decoder.is_some());
+        grow_view(
+            &self.store,
+            &prepared,
+            self.decoder.as_deref(),
+            self.sort,
+            from,
+            view,
+        )
     }
 
     /// Отдаёт ровно то, что видно на экране, а не весь буфер.
@@ -2373,6 +2369,144 @@ impl Worker {
                 .collect(),
         })
     }
+}
+
+// --- Фильтрация и порядок ----------------------------------------------------
+//
+// Свободные функции, а не методы `Worker`: воркер держит хендлы rdkafka и в
+// тесте не строится, а `MessageStore` строится руками. Логика отбора строк —
+// ровно то, что стоит проверять юнит-тестами, и запирать её внутри
+// непостроимого типа значило бы оставить её непокрытой.
+
+/// Разобранный запрос: иглы готовятся один раз на проход по буферу, а не на
+/// каждое сообщение.
+struct PreparedFilter {
+    key: Needle,
+    value: Needle,
+    /// Разбирать ли тело перед поиском. Флаг фронта сам по себе ничего не
+    /// значит — без схемы разбирать нечем.
+    decode_value: bool,
+}
+
+impl PreparedFilter {
+    fn new(filter: &MessageFilter, has_decoder: bool) -> Self {
+        Self {
+            key: Needle::new(&filter.key, filter.case_sensitive),
+            value: Needle::new(&filter.value, filter.case_sensitive),
+            decode_value: filter.search_decoded && has_decoder,
+        }
+    }
+
+    /// Пусты ли обе иглы, то есть «не фильтровать».
+    ///
+    /// `search_decoded` сюда намеренно не входит: он задаёт, ГДЕ искать, а не
+    /// ЧТО. Учитывать его значило бы на голом флаге с пустыми иглами уйти в
+    /// медленный путь по всему буферу с запросом, который и так совпадает со
+    /// всем подряд.
+    fn is_empty(&self) -> bool {
+        self.key.is_empty() && self.value.is_empty()
+    }
+
+    fn matches(&self, key: &[u8], value: &[u8], decoder: Option<&ProtoDecoder>) -> bool {
+        // Ключ ищем только по сырым байтам: он не protobuf, разбирать нечего.
+        if !self.key.matches(key) {
+            return false;
+        }
+        if self.value.matches(value) {
+            return true;
+        }
+        // Сначала сырые байты, декодирование — только на промахе. Строковые
+        // поля protobuf лежат на проводе непрерывным UTF-8 и находятся без
+        // разбора, поэтому обычный запрос по содержимому не платит за декодер
+        // вовсе; платит только настоящий промах или запрос по имени поля.
+        //
+        // Это важно: `SetFilter` пересобирает представление на каждое нажатие
+        // клавиши, и полный разбор буфера там встал бы поперёк того же потока,
+        // который отдаёт окна на экран.
+        self.decode_value
+            && decoder.is_some_and(|d| {
+                d.decode(value)
+                    .is_ok_and(|json| self.value.matches(json.as_bytes()))
+            })
+    }
+}
+
+/// Просеивает `store[from..committed_len)` в хвост `view` и заново
+/// упорядочивает результат. Возвращает новую границу просеянного.
+fn grow_view(
+    store: &MessageStore,
+    prepared: &PreparedFilter,
+    decoder: Option<&ProtoDecoder>,
+    sort: Option<SortSpec>,
+    from: usize,
+    view: &mut Vec<u32>,
+) -> usize {
+    let total = store.committed_len();
+    if prepared.is_empty() {
+        view.extend(from as u32..total as u32);
+    } else {
+        append_view(store, prepared, decoder, from, view);
+    }
+
+    // Сортируем ВЕСЬ view, а не только дописанный хвост — как и раньше.
+    //
+    // Инкрементальный досев даёт при этом ровно ту же перестановку, что
+    // сортировка с нуля, и вот почему. `sort_by` стабильна; дописанные индексы
+    // строго больше всех уже лежащих; прошлый `view` сам был стабильной
+    // сортировкой возрастающих индексов. Значит внутри любой группы равных
+    // ключей конкатенация уже идёт по возрастанию индекса — ровно в том
+    // порядке, который дала бы свежая сортировка `0..total`. Ключи
+    // опубликованных записей при этом не меняются: префикс заморожен.
+    if let Some(sort) = sort {
+        sort_view(store, view, sort);
+    }
+    total
+}
+
+/// Просеивает `store[from..committed_len)` в хвост `view`.
+fn append_view(
+    store: &MessageStore,
+    prepared: &PreparedFilter,
+    decoder: Option<&ProtoDecoder>,
+    from: usize,
+    view: &mut Vec<u32>,
+) {
+    for i in from..store.committed_len() {
+        if prepared.matches(store.key(i), store.value(i), decoder) {
+            view.push(i as u32);
+        }
+    }
+}
+
+/// Сортировка по клику на заголовок колонки, поверх фильтра.
+///
+/// `sort_by` — стабильная сортировка: сообщения с одинаковым значением
+/// столбца остаются в том порядке, в котором их поставил обычный порядок
+/// чтения (время, а внутри него — офсет), а не в произвольном. Пока идёт
+/// прогрессивная подгрузка, эта сортировка пересчитывается на весь `view`
+/// при каждом новом раунде — если она активна, уже показанные строки
+/// перестают быть застрахованы от переезда, в отличие от обычного порядка.
+fn sort_view(store: &MessageStore, view: &mut [u32], sort: SortSpec) {
+    let desc = sort.direction == SortDirection::Desc;
+    view.sort_by(|&a, &b| {
+        let ma = store
+            .get(a as usize)
+            .expect("view index out of sync with store");
+        let mb = store
+            .get(b as usize)
+            .expect("view index out of sync with store");
+        let cmp = match sort.column {
+            SortColumn::Partition => ma.partition.cmp(&mb.partition),
+            SortColumn::Offset => ma.offset.cmp(&mb.offset),
+            SortColumn::Timestamp => ma.timestamp.cmp(&mb.timestamp),
+            SortColumn::Key => store.key(a as usize).cmp(store.key(b as usize)),
+        };
+        if desc {
+            cmp.reverse()
+        } else {
+            cmp
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2853,5 +2987,263 @@ mod tests {
             c.observe(OLDEST, ts);
         }
         assert_eq!(c.frontier_ts, Some(300));
+    }
+
+    // --- Фильтрация ----------------------------------------------------------
+    //
+    // Проверяется через свободные функции: воркер держит хендлы rdkafka и в
+    // тесте не строится, а `MessageStore` строится руками. `grow_view` здесь —
+    // ровно та функция, которую зовёт воркер, а не её пересказ.
+
+    /// Кладёт строки в стор и публикует их: фильтр смотрит только на
+    /// опубликованный префикс.
+    fn store_of(rows: &[(i32, i64, i64, &str, &[u8])]) -> MessageStore {
+        let mut store = MessageStore::new(1 << 20);
+        for &(partition, offset, ts, key, value) in rows {
+            assert!(store.push(partition, offset, ts, key.as_bytes(), value, &[]));
+        }
+        store.commit_all();
+        store
+    }
+
+    fn text_rows(rows: &[(&str, &str)]) -> Vec<(i32, i64, i64, String, Vec<u8>)> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (k, v))| (0, i as i64, i as i64, k.to_string(), v.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn store_of_text(rows: &[(&str, &str)]) -> MessageStore {
+        let owned = text_rows(rows);
+        let refs: Vec<_> = owned
+            .iter()
+            .map(|(p, o, t, k, v)| (*p, *o, *t, k.as_str(), v.as_slice()))
+            .collect();
+        store_of(&refs)
+    }
+
+    fn filter_of(key: &str, value: &str) -> MessageFilter {
+        MessageFilter {
+            key: key.to_string(),
+            value: value.to_string(),
+            case_sensitive: false,
+            search_decoded: false,
+        }
+    }
+
+    fn view_of(
+        store: &MessageStore,
+        filter: &MessageFilter,
+        decoder: Option<&ProtoDecoder>,
+    ) -> Vec<u32> {
+        let prepared = PreparedFilter::new(filter, decoder.is_some());
+        let mut view = Vec::new();
+        grow_view(store, &prepared, decoder, None, 0, &mut view);
+        view
+    }
+
+    #[test]
+    fn an_empty_filter_shows_everything() {
+        let store = store_of_text(&[("k1", "v1"), ("k2", "v2")]);
+        assert_eq!(view_of(&store, &filter_of("", ""), None), vec![0, 1]);
+        // Голый `search_decoded` фильтром не считается: иглы-то пустые.
+        let mut bare = filter_of("", "");
+        bare.search_decoded = true;
+        assert_eq!(view_of(&store, &bare, None), vec![0, 1]);
+    }
+
+    #[test]
+    fn key_and_value_needles_are_combined_with_and() {
+        let store = store_of_text(&[
+            ("order-1", "paid"),
+            ("order-2", "shipped"),
+            ("refund-1", "paid"),
+        ]);
+        assert_eq!(view_of(&store, &filter_of("order", ""), None), vec![0, 1]);
+        assert_eq!(view_of(&store, &filter_of("", "paid"), None), vec![0, 2]);
+        assert_eq!(view_of(&store, &filter_of("order", "paid"), None), vec![0]);
+    }
+
+    #[test]
+    fn cyrillic_filter_finds_rows_in_any_case() {
+        // Тот самый баг: ASCII-фолдинг не складывал кириллицу, и поиск в
+        // нижнем регистре не находил ничего.
+        let store = store_of_text(&[
+            ("клиент-1", "Сбербанк"),
+            ("КЛИЕНТ-2", "ГАЗПРОМ"),
+            ("client-3", "Yandex"),
+        ]);
+        assert_eq!(view_of(&store, &filter_of("клиент", ""), None), vec![0, 1]);
+        assert_eq!(view_of(&store, &filter_of("КЛИЕНТ", ""), None), vec![0, 1]);
+        assert_eq!(view_of(&store, &filter_of("", "сбербанк"), None), vec![0]);
+        assert_eq!(view_of(&store, &filter_of("", "газпром"), None), vec![1]);
+    }
+
+    #[test]
+    fn case_sensitive_filter_still_distinguishes_cyrillic() {
+        let store = store_of_text(&[("k", "Сбербанк")]);
+        let mut exact = filter_of("", "сбербанк");
+        exact.case_sensitive = true;
+        assert!(view_of(&store, &exact, None).is_empty());
+        exact.value = "Сбербанк".to_string();
+        assert_eq!(view_of(&store, &exact, None), vec![0]);
+    }
+
+    // --- Поиск по разобранному телу ------------------------------------------
+
+    const FILTER_PROTO: &str = r#"
+        syntax = "proto3";
+        package demo;
+        message Event { string customer = 1; int32 amount = 2; }
+    "#;
+
+    /// Кодирует `Event { customer, amount }` руками по wire-формату:
+    /// генератор кода сюда не подключён, а формат достаточно прост.
+    fn event_bytes(customer: &str, amount: i32) -> Vec<u8> {
+        let mut out = vec![0x0a, customer.len() as u8];
+        out.extend_from_slice(customer.as_bytes());
+        // Поле 2, wire type 0 (varint). Значения в тестах однобайтовые.
+        out.extend_from_slice(&[0x10, amount as u8]);
+        out
+    }
+
+    /// Каталог схемы живёт во временном каталоге и удаляется вызывающим.
+    fn decoder_for(tag: &str) -> (std::path::PathBuf, Arc<ProtoDecoder>) {
+        let dir = std::env::temp_dir().join(format!("mikui-worker-filter-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("event.proto");
+        std::fs::write(&source, FILTER_PROTO).unwrap();
+        crate::proto::store::add_files(
+            &dir,
+            "cluster",
+            "topic",
+            &[source.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        let decoder = crate::proto::store::decoder(&dir, "cluster", "topic")
+            .unwrap()
+            .unwrap();
+        (dir, decoder)
+    }
+
+    #[test]
+    fn string_field_content_is_found_without_decoding() {
+        // Строковое поле protobuf лежит на проводе непрерывным UTF-8, поэтому
+        // находится и без схемы. Это и есть короткое замыкание, которое спасает
+        // обычный запрос от полного разбора буфера.
+        let store = store_of(&[
+            (0, 0, 0, "a", &event_bytes("Сбербанк", 10)),
+            (0, 1, 1, "b", &event_bytes("Тинькофф", 20)),
+        ]);
+        assert_eq!(view_of(&store, &filter_of("", "сбербанк"), None), vec![0]);
+        assert_eq!(view_of(&store, &filter_of("", "ТИНЬКОФФ"), None), vec![1]);
+    }
+
+    #[test]
+    fn a_field_name_is_found_only_when_decoding_is_asked_for() {
+        let (dir, decoder) = decoder_for("field-name");
+        let store = store_of(&[
+            (0, 0, 0, "a", &event_bytes("Сбербанк", 10)),
+            (0, 1, 1, "b", &event_bytes("Тинькофф", 20)),
+        ]);
+
+        // Имени поля в wire-формате нет — без флага его не найти даже со схемой.
+        let plain = filter_of("", "customer");
+        assert!(view_of(&store, &plain, Some(&decoder)).is_empty());
+
+        let mut decoded = plain.clone();
+        decoded.search_decoded = true;
+        assert_eq!(view_of(&store, &decoded, Some(&decoder)), vec![0, 1]);
+
+        // И числа, которых в виде текста на проводе тоже нет.
+        let mut amount = filter_of("", "20");
+        amount.search_decoded = true;
+        assert_eq!(view_of(&store, &amount, Some(&decoder)), vec![1]);
+
+        // Флаг без схемы ничего не включает: разбирать нечем.
+        assert!(view_of(&store, &decoded, None).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_undecodable_body_falls_back_to_raw_bytes() {
+        let (dir, decoder) = decoder_for("undecodable");
+        // Второе тело — просто текст, схемой не разбирается.
+        let store = store_of(&[
+            (0, 0, 0, "a", &event_bytes("Сбербанк", 10)),
+            (0, 1, 1, "b", b"plain text payload"),
+        ]);
+
+        let mut decoded = filter_of("", "payload");
+        decoded.search_decoded = true;
+        // Строка не выпала из выдачи из-за того, что разбор её тела не удался.
+        assert_eq!(view_of(&store, &decoded, Some(&decoder)), vec![1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Эквивалентность инкрементального досева ------------------------------
+
+    /// Тот самый тест, ради которого `extend_view` вообще можно считать
+    /// безопасным: досев тремя порциями обязан дать тот же `view`, что и одна
+    /// полная пересборка в конце — при любом порядке сортировки.
+    #[test]
+    fn growing_the_view_in_tranches_equals_one_full_rebuild() {
+        // Партиции и отметки времени намеренно с повторами: именно на группах
+        // равных ключей стабильность сортировки и проверяется.
+        let rows: Vec<(i32, i64, i64, String, Vec<u8>)> = vec![
+            (0, 10, 100, "ключ-a".into(), b"alpha".to_vec()),
+            (1, 11, 100, "ключ-b".into(), b"beta".to_vec()),
+            (0, 12, 200, "ключ-a".into(), b"alpha".to_vec()),
+            (2, 13, 100, "ключ-c".into(), b"gamma".to_vec()),
+            (1, 14, 200, "ключ-b".into(), b"alpha".to_vec()),
+            (0, 15, 300, "ключ-a".into(), b"beta".to_vec()),
+            (2, 16, 200, "ключ-c".into(), b"alpha".to_vec()),
+            (1, 17, 300, "ключ-b".into(), b"gamma".to_vec()),
+            (0, 18, 100, "ключ-a".into(), b"alpha".to_vec()),
+        ];
+        let columns = [
+            None,
+            Some(SortColumn::Partition),
+            Some(SortColumn::Offset),
+            Some(SortColumn::Timestamp),
+            Some(SortColumn::Key),
+        ];
+        let directions = [SortDirection::Asc, SortDirection::Desc];
+
+        for filter in [filter_of("", ""), filter_of("", "alpha"), filter_of("КЛЮЧ-A", "")] {
+            for column in columns {
+                for direction in directions {
+                    let sort = column.map(|column| SortSpec { column, direction });
+                    let prepared = PreparedFilter::new(&filter, false);
+
+                    // Инкрементально: три порции по три строки, между ними —
+                    // публикация, как её делает `publish`.
+                    let mut store = MessageStore::new(1 << 20);
+                    let mut incremental = Vec::new();
+                    let mut scanned = 0usize;
+                    for chunk in rows.chunks(3) {
+                        for (p, o, ts, k, v) in chunk {
+                            assert!(store.push(*p, *o, *ts, k.as_bytes(), v, &[]));
+                        }
+                        store.commit_all();
+                        scanned =
+                            grow_view(&store, &prepared, None, sort, scanned, &mut incremental);
+                    }
+                    assert_eq!(scanned, rows.len());
+
+                    // Одной пересборкой по тому же самому стору.
+                    let mut full = Vec::new();
+                    grow_view(&store, &prepared, None, sort, 0, &mut full);
+
+                    assert_eq!(
+                        incremental, full,
+                        "порции разошлись с полной пересборкой: {column:?} {direction:?}"
+                    );
+                }
+            }
+        }
     }
 }

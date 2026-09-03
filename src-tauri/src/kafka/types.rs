@@ -180,12 +180,15 @@ pub struct MessageFilter {
     pub value: String,
     #[serde(default)]
     pub case_sensitive: bool,
-}
-
-impl MessageFilter {
-    pub fn is_empty(&self) -> bool {
-        self.key.is_empty() && self.value.is_empty()
-    }
+    /// Искать ли по РАЗОБРАННОМУ телу, а не только по сырым байтам.
+    ///
+    /// Отдельный флаг, а не всегдашнее поведение: разбор — это рефлективный
+    /// `parse_from_bytes` плюс печать JSON на каждое сообщение, и включать
+    /// такое молча на весь буфер нельзя. Строковые поля protobuf находятся и
+    /// без него — они лежат на проводе непрерывным UTF-8; флаг добирает имена
+    /// полей, числа и метки enum.
+    #[serde(default)]
+    pub search_decoded: bool,
 }
 
 /// Границы чтения — «не всё, а вот отсюда досюда».

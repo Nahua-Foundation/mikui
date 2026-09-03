@@ -357,14 +357,26 @@ export function KafkaExplorerPortfolio() {
 
   // Смена фильтра пересчитывается в Rust по уже загруженному буферу —
   // ни одного сетевого запроса.
+  //
+  // `selectedTopic` в зависимостях, но сам по себе перепосылки не стоит: топик
+  // открывается уже со своим фильтром (`open_topic`), и второй `set_filter`
+  // следом только затирал бы растущий `total` снимком, взятым посреди
+  // подгрузки, и зря ронял кэш окон. Отсекаем тем же приёмом, что и для
+  // сортировки ниже, — по последнему applied-значению.
   const filterTimer = useRef<number | null>(null);
+  const appliedFilterRef = useRef(filters);
   useEffect(() => {
     if (!selectedTopic) return;
+    if (appliedFilterRef.current === filters) return;
     if (filterTimer.current !== null) window.clearTimeout(filterTimer.current);
 
     filterTimer.current = window.setTimeout(() => {
+      const topicAtRequest = topicRef.current;
+      appliedFilterRef.current = filters;
       invoke<number>('set_filter', { filter: filters })
         .then((visible) => {
+          // Ушли с топика, пока считалось — ответ относится к чужому буферу.
+          if (topicRef.current !== topicAtRequest) return;
           setTotal(visible);
           setGeneration((g) => g + 1);
         })
@@ -731,14 +743,24 @@ export function KafkaExplorerPortfolio() {
     [connectedClusterId],
   );
 
-  /** И выбор партиций, и границы чтения осмыслены только для того топика, на
-   *  котором сделаны: у соседнего и партиций может быть меньше, и офсеты свои
-   *  — иначе чтение упёрлось бы в «out of range» на ровном месте. */
+  /** И выбор партиций, и границы чтения, и поиск осмыслены только для того
+   *  топика, на котором сделаны: у соседнего и партиций может быть меньше, и
+   *  офсеты свои — иначе чтение упёрлось бы в «out of range» на ровном месте,
+   *  а запрос из прошлого топика встретил бы пользователя пустой таблицей.
+   *
+   *  Сброс именно здесь, а не в эффекте открытия: React сложит его в один
+   *  рендер с `setSelectedTopic`, и эффект увидит уже пустой фильтр — значит в
+   *  `open_topic` уедет он же, без отдельной передачи значения. Смена партиций
+   *  и границ через этот обработчик не идёт и поиск сохранит. */
   const handleSelectTopic = useCallback((topic: Topic | null) => {
     if (topicRef.current !== (topic?.name ?? null)) {
       setSelectedPartitions(null);
       setReadMode((mode) => (mode === 'offset' || mode === 'timestamp' ? 'newest' : mode));
       setRange(EMPTY_RANGE);
+      setFilters(EMPTY_FILTER);
+      // Пустой фильтр уедет вместе с `open_topic`, поэтому считаем его уже
+      // применённым: иначе эффект ниже послал бы вдогонку второй `set_filter`.
+      appliedFilterRef.current = EMPTY_FILTER;
     }
     setSelectedTopic(topic);
   }, []);

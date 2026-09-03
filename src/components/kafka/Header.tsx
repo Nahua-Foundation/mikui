@@ -296,6 +296,32 @@ export function HeaderDesktop({
                           Case sensitive
                         </Label>
                       </div>
+                      {/* Гасим, а не прячем: включённый флажок, которого не
+                          видно, пользователь не смог бы ни заметить, ни снять.
+                          Бэкенд без схемы его тоже игнорирует — сходятся. */}
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          id="search-decoded"
+                          checked={filters.search_decoded}
+                          disabled={format !== 'proto'}
+                          onCheckedChange={(checked) =>
+                            onFiltersChange({ ...filters, search_decoded: checked === true })
+                          }
+                        />
+                        <Label
+                          htmlFor="search-decoded"
+                          title={
+                            format === 'proto'
+                              ? 'Also search field names, numbers and enum labels. Decodes every message, so it is slower.'
+                              : 'Needs a protobuf schema for this topic'
+                          }
+                          className={`font-mono text-sm ${
+                            format === 'proto' ? 'text-soft cursor-pointer' : 'text-dim'
+                          }`}
+                        >
+                          Search decoded body
+                        </Label>
+                      </div>
                       <div className="flex gap-2 pt-2">
                         <Button
                           onClick={() => onFiltersChange(EMPTY_FILTER)}

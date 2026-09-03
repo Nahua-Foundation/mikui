@@ -197,12 +197,17 @@ export interface MessageFilter {
   key: string;
   value: string;
   case_sensitive: boolean;
+  /** Искать ли по разобранному телу, а не только по сырым байтам. Осмысленно
+   *  лишь у топика со схемой, и стоит разбора каждого тела — поэтому отдельным
+   *  флагом, а не всегда. */
+  search_decoded: boolean;
 }
 
 export const EMPTY_FILTER: MessageFilter = {
   key: '',
   value: '',
   case_sensitive: false,
+  search_decoded: false,
 };
 
 /** Столбцы, по которым можно кликнуть заголовок и отсортировать таблицу. */
