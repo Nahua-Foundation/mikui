@@ -20,6 +20,41 @@ pub struct ClusterUser {
     pub has_password: bool,
 }
 
+/// Schema Registry кластера.
+///
+/// На кластере, а не на топике: реестр в кластере один, и вводить его заново
+/// для каждого топика значило бы переписывать одно и то же по десять раз.
+/// Топику остаётся выбор subject — см. `schema::types::AvroBinding`.
+///
+/// Пароля здесь, как и у учёток, нет: он лежит в системном хранилище секретов
+/// под ключом `<id кластера>:sr`. `has_password` — признак, а не пароль.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SchemaRegistry {
+    pub url: String,
+    /// `None` или пустая строка — реестр без авторизации.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub has_password: bool,
+    /// Свой CA-бандл. Отдельно от кластерного: реестр стоит за своим фронтом и
+    /// вполне может быть подписан другим удостоверяющим центром.
+    #[serde(default)]
+    pub ssl_ca_bundle_path: Option<String>,
+}
+
+impl SchemaRegistry {
+    /// Ключ пароля в системном хранилище.
+    ///
+    /// С суффиксом, потому что остальные ключи там — идентификаторы учёток
+    /// (`ClusterUser::id`), и без него пароль реестра затёр бы пароль учётки,
+    /// у которой id совпадает с id кластера. А такие есть: ровно такой id
+    /// получают учётки, мигрированные из формата «одна пара на кластер».
+    pub fn secret_key(cluster_id: &str) -> String {
+        format!("{cluster_id}:sr")
+    }
+}
+
 /// Сохранённое подключение.
 ///
 /// Пароля здесь нет и быть не должно: он лежит в системном хранилище секретов
@@ -46,6 +81,10 @@ pub struct ClusterConfig {
     /// следующим подключением, иначе выбор пользователя не пережил бы перезапуск.
     #[serde(default)]
     pub active_user_id: Option<String>,
+    /// Schema Registry кластера. `None` — не настроен, и тогда avro-топики
+    /// читаются только по локальным .avsc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_registry: Option<SchemaRegistry>,
 
     // --- Поля старого формата ------------------------------------------------
     // Читаются, но больше не пишутся: `skip_serializing` вычищает их из файла

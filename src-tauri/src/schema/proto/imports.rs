@@ -1,23 +1,16 @@
-//! Раскладка .proto по каталогу схемы.
-//!
-//! Файлы копируются к себе, а не читаются по исходным путям: схема обязана
-//! пережить и перезапуск приложения, и переезд каталога, из которого её взяли.
-//! Исходный путь при этом запоминается — по нему работает «перечитать с диска».
+//! Под каким именем .proto ложится в каталог схемы.
 //!
 //! Тонкость здесь ровно одна — имена. Корневому файлу достаточно его basename,
 //! но `import "common/types.proto"` ищет файл по ЭТОМУ пути, а не по имени, и
 //! плоская копия рядом с корневым файлом такой импорт не разрешит. Поэтому
 //! имя внутри каталога берётся из самого импорта — см. `layout`.
+//!
+//! Сама раскладка (копирование, черновик, подмена каталога) живёт в
+//! `schema::files` и про формат схемы не знает: у Avro импортов нет вовсе, и
+//! ничего из этого файла ему не нужно.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
-
-/// Файл, готовый лечь в каталог схемы.
-pub struct Pending {
-    pub name: String,
-    pub source: String,
-    pub bytes: Vec<u8>,
-}
+use std::path::{Component, Path};
 
 /// Собирает пути из `import "...";`.
 ///
@@ -91,94 +84,6 @@ pub fn imports_in<'a>(files: impl IntoIterator<Item = &'a [u8]>) -> HashSet<Stri
     out
 }
 
-/// Отвергает имена, которые увели бы запись за пределы каталога схемы.
-///
-/// Путь берётся из текста .proto, то есть из данных, а не из кода: `..` в нём
-/// не должен превращаться в запись куда угодно по файловой системе.
-fn is_safe_name(name: &str) -> bool {
-    !name.is_empty()
-        && Path::new(name).components().all(|c| matches!(c, Component::Normal(_)))
-}
-
-/// Заново раскладывает каталог схемы под указанный набор файлов.
-///
-/// Каталог собирается рядом и подменяется целиком, и только у вызывающего есть
-/// право оставить его: `commit` вызывается ПОСЛЕ успешного разбора. Битый
-/// .proto не должен ни сохраниться сам, ни испортить схему, которая работала.
-pub struct Staged {
-    dir: PathBuf,
-    target: PathBuf,
-    committed: bool,
-}
-
-impl Staged {
-    /// Пишет файлы во временный каталог рядом с `target`.
-    pub fn write(target: PathBuf, files: &[Pending]) -> Result<Self, String> {
-        let dir = staging_path(&target);
-        // Хвост от прерванной попытки: он нам не наследство, а помеха.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("can't create {}: {e}", dir.display()))?;
-
-        let staged = Self {
-            dir,
-            target,
-            committed: false,
-        };
-
-        for file in files {
-            if !is_safe_name(&file.name) {
-                return Err(format!("unsafe proto file name: {}", file.name));
-            }
-            let path = staged.dir.join(&file.name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("can't create {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&path, &file.bytes)
-                .map_err(|e| format!("can't write {}: {e}", path.display()))?;
-        }
-        Ok(staged)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Ставит собранный каталог на место рабочего.
-    pub fn commit(mut self) -> Result<(), String> {
-        // rename поверх непустого каталога не работает — сносим старый. Окно,
-        // в котором схемы нет на диске, здесь неизбежно, но данные для новой
-        // уже целиком лежат рядом и записаны.
-        let _ = std::fs::remove_dir_all(&self.target);
-        if let Some(parent) = self.target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("can't create {}: {e}", parent.display()))?;
-        }
-        std::fs::rename(&self.dir, &self.target)
-            .map_err(|e| format!("can't replace {}: {e}", self.target.display()))?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for Staged {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-}
-
-fn staging_path(target: &Path) -> PathBuf {
-    let mut name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "schema".to_string());
-    name.push_str(".staging");
-    target.with_file_name(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,14 +147,5 @@ mod tests {
         let imports = set(&["types.proto", "common/types.proto"]);
         let name = layout(Path::new("/x/common/types.proto"), &imports);
         assert_eq!(name, "common/types.proto");
-    }
-
-    #[test]
-    fn names_escaping_the_schema_directory_are_rejected() {
-        assert!(!is_safe_name("../outside.proto"));
-        assert!(!is_safe_name("/etc/passwd"));
-        assert!(!is_safe_name(""));
-        assert!(is_safe_name("common/types.proto"));
-        assert!(is_safe_name("events.proto"));
     }
 }

@@ -60,7 +60,15 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Resul
 }
 
 pub fn load_clusters(app: &AppHandle) -> Result<Vec<ClusterConfig>, String> {
-    let mut clusters: Vec<ClusterConfig> = read_json(&config_dir(app)?.join(CLUSTERS_FILE))?;
+    clusters_at(&config_dir(app)?)
+}
+
+/// То же самое по каталогу настроек, без `AppHandle`.
+///
+/// Нужно `crate::schema`: адрес Schema Registry живёт на кластере, а модуль
+/// схем работает по каталогу — ровно затем, чтобы прогоняться на временном.
+pub fn clusters_at(root: &Path) -> Result<Vec<ClusterConfig>, String> {
+    let mut clusters: Vec<ClusterConfig> = read_json(&root.join(CLUSTERS_FILE))?;
     // Единственная точка входа для записей с диска — значит и единственное
     // место, где стоит приводить их к текущему формату. Остальной код имеет
     // дело только с мигрированными.

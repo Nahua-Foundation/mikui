@@ -17,7 +17,7 @@
 //! RFC 3339, `Duration` — строкой вроде `"1.5s"`, и так далее. В этом
 //! приложении — не печатает. Особые правила в protobuf-json-mapping включаются
 //! через `downcast_ref` к СГЕНЕРИРОВАННОМУ типу, а схемы топиков связываются
-//! динамически (`FileDescriptor::new_dynamic_fds` в `schema::parse`) — внешнего
+//! динамически (`FileDescriptor::new_dynamic_fds` в `linked::parse`) — внешнего
 //! `protoc` и кодогенерации у нас нет. Значит и при чтении, и при отправке
 //! `Timestamp` здесь — обычное сообщение с полями `seconds` и `nanos`.
 //!
@@ -159,8 +159,8 @@ fn zero_value_name(e: &EnumDescriptor) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::schema;
-    use crate::proto::types::ProtoFile;
+    use crate::schema::proto::linked;
+    use crate::schema::types::SchemaFile;
 
     /// Разбирает текст .proto во временном каталоге и достаёт из него message.
     fn message_of(name: &str, text: &str, message: &str) -> (std::path::PathBuf, MessageDescriptor) {
@@ -169,11 +169,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t.proto"), text).unwrap();
 
-        let file = ProtoFile {
+        let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
         };
-        let linked = schema::parse(&dir, &[file]).unwrap();
+        let linked = linked::parse(&dir, &[file]).unwrap();
         let md = linked.message(message).unwrap();
         (dir, md)
     }
@@ -257,7 +257,7 @@ mod tests {
         let parsed = protobuf_json_mapping::parse_dyn_from_str(&md, &filled)
             .unwrap_or_else(|e| panic!("заготовка не разбирается: {e}\n{filled}"));
         let bytes = parsed.write_to_bytes_dyn().unwrap();
-        let decoded = crate::proto::decoder::ProtoDecoder::new(md.clone())
+        let decoded = crate::schema::proto::ProtoDecoder::new(md.clone())
             .decode(&bytes)
             .unwrap();
         // Круг замкнулся: то, что уедет в топик, вернётся оттуда тем же.

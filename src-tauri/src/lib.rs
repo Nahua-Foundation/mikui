@@ -4,12 +4,28 @@ mod config;
 mod favorites;
 mod helpers;
 mod kafka;
-mod proto;
+mod schema;
 
-use config::{ClusterConfig, ClusterUser, Settings};
+use config::{ClusterConfig, ClusterUser, SchemaRegistry, Settings};
 use favorites::{FavoritesView, SaveFavoriteRequest, SaveFavoriteResult, SavedMessage};
 use kafka::*;
-use proto::{BodyFormat, ProtoMessageForm, TopicSchemaView};
+use schema::{BodyFormat, MessageForm, TopicSchemaView};
+
+/// Уводит блокирующую работу с исполнителя Tauri.
+///
+/// Всё, что ходит в Schema Registry, блокирует поток: клиент синхронный (см.
+/// `schema::avro::registry`). В async-команде это заняло бы поток исполнителя
+/// на все пять секунд таймаута, и на медленном реестре приложение перестало бы
+/// отвечать целиком.
+async fn blocking<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))?
+}
 
 /// Подставляет пароль из keychain, если фронт его не прислал.
 ///
@@ -93,7 +109,9 @@ async fn list_clusters(app: tauri::AppHandle) -> Result<Vec<ClusterConfig>, Stri
 ///
 /// Список учёток берётся из уже сохранённой записи, а не из присланной формы:
 /// пользователями заведуют `save_cluster_user`/`delete_cluster_user`, и
-/// разъехавшийся во вкладке список не должен молча затирать keychain.
+/// разъехавшийся во вкладке список не должен молча затирать keychain. Ровно то
+/// же и с реестром: им заведуют `save_schema_registry`/`delete_schema_registry`,
+/// и сохранение соседнего поля формы не должно его сносить.
 #[tauri::command]
 async fn save_cluster(
     app: tauri::AppHandle,
@@ -105,6 +123,7 @@ async fn save_cluster(
     if let Some(existing) = clusters.iter().find(|c| c.id == cluster.id) {
         cluster.users = existing.users.clone();
         cluster.active_user_id = existing.active_user_id.clone();
+        cluster.schema_registry = existing.schema_registry.clone();
     }
     cluster.migrate();
 
@@ -136,7 +155,7 @@ async fn delete_cluster(app: tauri::AppHandle, id: String) -> Result<(), String>
     }
     // Схемы топиков привязаны к кластеру — вместе с ним они и уходят. Ошибку,
     // как и с паролями, наверх не поднимаем: кластер уже удалён.
-    if let Err(e) = proto::forget_cluster(&app, &id) {
+    if let Err(e) = schema::forget_cluster(&app, &id) {
         eprintln!("can't delete proto schemas of cluster {id}: {e}");
     }
     // А вот избранное этого кластера остаётся, и это не забывчивость: схема без
@@ -348,9 +367,14 @@ async fn close_topic(worker: tauri::State<'_, WorkerHandle>) -> Result<(), Strin
 //
 // Все команды ниже возвращают схему целиком, а не подтверждение: форма настроек
 // топика показывает список файлов, список message и выбранный из них, и любая
-// операция меняет сразу несколько из них (см. `proto::store`). Отдавать
+// операция меняет сразу несколько из них (см. `schema::store`). Отдавать
 // «ок» и заставлять фронт досчитывать новое состояние самому — верный способ
 // разъехаться с диском.
+//
+// Все они уходят в `blocking`, включая чтение: вид топика включает
+// автоопределение формата, а оно спрашивает Schema Registry. Ответ кэширован и
+// в подавляющем большинстве вызовов не стоит ничего, но первый на каждый топик
+// — это сеть, и держать на ней исполнитель Tauri нельзя.
 
 #[tauri::command]
 async fn get_topic_schema(
@@ -358,7 +382,7 @@ async fn get_topic_schema(
     cluster: String,
     topic: String,
 ) -> Result<Option<TopicSchemaView>, String> {
-    proto::view(&app, &cluster, &topic)
+    blocking(move || schema::view(&app, &cluster, &topic)).await
 }
 
 /// Добавляет .proto к топику. Невалидный набор не сохраняется вовсе — ошибка
@@ -370,7 +394,7 @@ async fn add_proto_files(
     topic: String,
     paths: Vec<String>,
 ) -> Result<TopicSchemaView, String> {
-    proto::add_files(&app, &cluster, &topic, &paths)
+    blocking(move || schema::add_files(&app, &cluster, &topic, &paths)).await
 }
 
 /// Перечитывает .proto с диска: `name` — конкретный файл, `None` — все.
@@ -381,7 +405,7 @@ async fn refresh_proto_files(
     topic: String,
     name: Option<String>,
 ) -> Result<TopicSchemaView, String> {
-    proto::refresh(&app, &cluster, &topic, name.as_deref())
+    blocking(move || schema::refresh(&app, &cluster, &topic, name.as_deref())).await
 }
 
 #[tauri::command]
@@ -391,7 +415,7 @@ async fn remove_proto_file(
     topic: String,
     name: String,
 ) -> Result<Option<TopicSchemaView>, String> {
-    proto::remove_file(&app, &cluster, &topic, &name)
+    blocking(move || schema::remove_file(&app, &cluster, &topic, &name)).await
 }
 
 /// Сохраняет выбор из формы: формат тела и основной message.
@@ -403,7 +427,7 @@ async fn save_topic_schema(
     format: BodyFormat,
     message: Option<String>,
 ) -> Result<TopicSchemaView, String> {
-    proto::set_options(&app, &cluster, &topic, format, message)
+    blocking(move || schema::set_options(&app, &cluster, &topic, format, message)).await
 }
 
 /// Сообщает воркеру, чем декодировать тела открытого топика, и возвращает
@@ -419,15 +443,205 @@ async fn apply_topic_schema(
     cluster: String,
     topic: String,
 ) -> Result<Option<TopicSchemaView>, String> {
-    let built = proto::decoder(&app, &cluster, &topic);
+    // Через `blocking`: у Avro сборка декодера может сходить в реестр за
+    // схемой закреплённого subject. Оба декодера — одним заходом: у ключа
+    // схема своя, но реестр и кэш общие, и второй поход обошёлся бы дороже
+    // самой работы.
+    let (built, key) = {
+        let (app, cluster, topic) = (app.clone(), cluster.clone(), topic.clone());
+        blocking(move || {
+            let value = schema::decoder(&app, &cluster, &topic);
+            // Ключ отдельно от тела и молча: не разобрался — поедет байтами,
+            // как ездил всегда. Ошибка тела — новость (её показывают в
+            // настройках топика), ошибка ключа — нет.
+            let key = schema::key_decoder(&app, &cluster, &topic).ok().flatten();
+            Ok((value, key))
+        })
+        .await?
+    };
     // Воркеру говорим в любом случае, в том числе и «декодера нет»: иначе на
     // сломавшейся схеме он продолжил бы разбирать прежней и показывать чужое.
     let decoder = built.as_ref().ok().and_then(Clone::clone);
     worker
-        .call(|reply| Command::SetDecoder(decoder, reply))
+        .call(|reply| Command::SetDecoder {
+            value: decoder,
+            key,
+            reply,
+        })
         .await?;
     built?;
-    proto::view(&app, &cluster, &topic)
+    blocking(move || schema::view(&app, &cluster, &topic)).await
+}
+
+// --- Avro-схемы топиков -------------------------------------------------------
+//
+// Возвращают, как и protobuf-команды, схему ЦЕЛИКОМ: список файлов, выбранная
+// запись и subject меняются вместе, и досчитывать новое состояние на фронте
+// значило бы разъезжаться с диском.
+
+#[tauri::command]
+async fn add_avro_files(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    paths: Vec<String>,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || schema::add_avro_files(&app, &cluster, &topic, &paths)).await
+}
+
+#[tauri::command]
+async fn refresh_avro_files(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    name: Option<String>,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || schema::refresh_avro_files(&app, &cluster, &topic, name.as_deref())).await
+}
+
+#[tauri::command]
+async fn remove_avro_file(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    name: String,
+) -> Result<Option<TopicSchemaView>, String> {
+    blocking(move || schema::remove_avro_file(&app, &cluster, &topic, &name)).await
+}
+
+/// Привязывает топик к subject реестра. `subject` пуст — отвязать.
+#[tauri::command]
+async fn save_topic_avro_subject(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    subject: Option<String>,
+    version: Option<i32>,
+) -> Result<TopicSchemaView, String> {
+    let subject = subject.filter(|s| !s.is_empty());
+    blocking(move || schema::set_avro_subject(&app, &cluster, &topic, subject, version)).await
+}
+
+/// Выбирает запись из загруженных .avsc.
+#[tauri::command]
+async fn save_topic_avro_record(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    record: Option<String>,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || {
+        schema::set_avro_record(&app, &cluster, &topic, record.filter(|r| !r.is_empty()))
+    })
+    .await
+}
+
+// --- Schema Registry ----------------------------------------------------------
+//
+// Настройки реестра живут на КЛАСТЕРЕ, а не на топике: реестр в кластере один,
+// и вводить его заново для каждого топика значило бы переписывать одно и то же
+// по десять раз. Пароль, как и пароли учёток, в JSON не попадает и обратно
+// через IPC не уезжает.
+
+/// Сохраняет реестр кластера. Пароль трактуется так же, как у учёток:
+/// `Some(непустой)` — записать, `Some("")` — удалить, `None` — не трогать.
+#[tauri::command]
+async fn save_schema_registry(
+    app: tauri::AppHandle,
+    cluster_id: String,
+    registry: SchemaRegistry,
+    password: Option<String>,
+) -> Result<ClusterConfig, String> {
+    let mut registry = registry;
+    let mut clusters = config::load_clusters(&app)?;
+    let cluster = clusters
+        .iter_mut()
+        .find(|c| c.id == cluster_id)
+        .ok_or_else(|| format!("unknown cluster {cluster_id}"))?;
+
+    let key = SchemaRegistry::secret_key(&cluster_id);
+    match password.as_deref() {
+        Some("") => {
+            config::secrets::delete_password(&key)?;
+            registry.has_password = false;
+        }
+        Some(secret) => {
+            config::secrets::store_password(&key, secret)?;
+            registry.has_password = true;
+        }
+        // Форма могла прийти без пароля просто потому, что его не меняли.
+        None => {
+            registry.has_password = cluster
+                .schema_registry
+                .as_ref()
+                .is_some_and(|r| r.has_password)
+        }
+    }
+
+    cluster.schema_registry = Some(registry);
+    let updated = cluster.clone();
+    config::save_clusters(&app, &clusters)?;
+    Ok(updated)
+}
+
+/// Убирает реестр у кластера вместе с его паролем и кэшем схем.
+#[tauri::command]
+async fn delete_schema_registry(
+    app: tauri::AppHandle,
+    cluster_id: String,
+) -> Result<ClusterConfig, String> {
+    let mut clusters = config::load_clusters(&app)?;
+    let cluster = clusters
+        .iter_mut()
+        .find(|c| c.id == cluster_id)
+        .ok_or_else(|| format!("unknown cluster {cluster_id}"))?;
+
+    let gone = cluster.schema_registry.take();
+    let updated = cluster.clone();
+    config::save_clusters(&app, &clusters)?;
+
+    // Осиротевший кэш и пароль никому не нужны — как и при удалении кластера
+    // целиком. Ошибки не поднимаем: реестр уже отвязан, и падать после
+    // успешной операции значило бы показать сбой там, где его нет.
+    if let Some(gone) = gone {
+        if let Err(e) = config::secrets::delete_password(&SchemaRegistry::secret_key(&cluster_id)) {
+            eprintln!("can't delete the schema registry password of {cluster_id}: {e}");
+        }
+        if let Ok(root) = config::config_dir(&app) {
+            schema::forget_registry_cache(&root, &gone.url);
+        }
+    }
+    Ok(updated)
+}
+
+/// Проверяет настройки реестра, не сохраняя их: сколько subject он отдал.
+#[tauri::command]
+async fn test_schema_registry(
+    cluster_id: Option<String>,
+    registry: SchemaRegistry,
+    password: Option<String>,
+) -> Result<usize, String> {
+    blocking(move || {
+        schema::test_registry(cluster_id.as_deref(), &registry, password.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_registry_subjects(
+    app: tauri::AppHandle,
+    cluster: String,
+) -> Result<Vec<String>, String> {
+    blocking(move || schema::registry_subjects(&app, &cluster)).await
+}
+
+#[tauri::command]
+async fn list_subject_versions(
+    app: tauri::AppHandle,
+    cluster: String,
+    subject: String,
+) -> Result<Vec<i32>, String> {
+    blocking(move || schema::registry_versions(&app, &cluster, &subject)).await
 }
 
 // --- Отправка сообщения ------------------------------------------------------
@@ -436,17 +650,15 @@ async fn apply_topic_schema(
 ///
 /// JSON здесь НЕ проверяется намеренно: невалидный JSON уезжает в топик тем
 /// самым текстом, который набрали, — предупредить о нём это дело
-/// `check_produce_payload`. А вот proto и hex либо кодируются, либо не дают
-/// байтов вовсе, и притворяться, что дали, нельзя.
+/// `check_produce_payload`. А вот proto, avro и hex либо кодируются, либо не
+/// дают байтов вовсе, и притворяться, что дали, нельзя.
 fn encode_payload(
     app: &tauri::AppHandle,
     cluster: Option<&str>,
     request: &ProduceRequest,
 ) -> Result<Vec<u8>, String> {
     match request.format {
-        PayloadFormat::Text | PayloadFormat::Json | PayloadFormat::Avro => {
-            Ok(request.payload.as_bytes().to_vec())
-        }
+        PayloadFormat::Text | PayloadFormat::Json => Ok(request.payload.as_bytes().to_vec()),
         PayloadFormat::Hex => kafka::decode_hex(&request.payload),
         PayloadFormat::Proto => {
             let cluster = cluster.ok_or("not connected to a cluster")?;
@@ -455,7 +667,17 @@ fn encode_payload(
                 .as_deref()
                 .filter(|m| !m.is_empty())
                 .ok_or("pick the message type to encode with")?;
-            proto::encode(app, cluster, &request.topic, message, &request.payload)
+            schema::encode(app, cluster, &request.topic, message, &request.payload)
+        }
+        PayloadFormat::Avro => {
+            let cluster = cluster.ok_or("not connected to a cluster")?;
+            schema::encode_avro(
+                app,
+                cluster,
+                &request.topic,
+                request.subject.as_deref(),
+                &request.payload,
+            )
         }
     }
 }
@@ -487,12 +709,17 @@ async fn check_produce_payload(
             }));
     }
 
-    Ok(encode_payload(&app, cluster.as_deref(), &request)
-        .err()
-        .map(|message| PayloadIssue {
-            severity: IssueSeverity::Error,
-            message,
-        }))
+    // Через `blocking`: у avro проверка кодирует тело настоящей схемой, а за
+    // ней ходят в реестр.
+    blocking(move || {
+        Ok(encode_payload(&app, cluster.as_deref(), &request)
+            .err()
+            .map(|message| PayloadIssue {
+                severity: IssueSeverity::Error,
+                message,
+            }))
+    })
+    .await
 }
 
 /// Заготовка тела и имена enum-значений выбранного message — всё, что форме
@@ -503,8 +730,19 @@ async fn proto_message_form(
     cluster: String,
     topic: String,
     message: String,
-) -> Result<ProtoMessageForm, String> {
-    proto::message_form(&app, &cluster, &topic, &message)
+) -> Result<MessageForm, String> {
+    blocking(move || schema::message_form(&app, &cluster, &topic, &message)).await
+}
+
+/// То же самое для Avro. `subject` пуст — взять тот, что назначен топику.
+#[tauri::command]
+async fn avro_message_form(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    subject: Option<String>,
+) -> Result<MessageForm, String> {
+    blocking(move || schema::avro_message_form(&app, &cluster, &topic, subject.as_deref())).await
 }
 
 /// Кладёт сообщение в топик.
@@ -519,7 +757,17 @@ async fn produce_message(
     cluster: Option<String>,
     request: ProduceRequest,
 ) -> Result<ProduceResult, String> {
-    let payload = encode_payload(&app, cluster.as_deref(), &request)?;
+    // Кодирование — через `blocking` по той же причине, что и проверка: для
+    // avro за схемой идут в реестр.
+    let (payload, request) = {
+        let app = app.clone();
+        let cluster = cluster.clone();
+        blocking(move || {
+            let payload = encode_payload(&app, cluster.as_deref(), &request)?;
+            Ok((payload, request))
+        })
+        .await?
+    };
     let record = ProduceRecord {
         topic: request.topic,
         partition: request.partition,
@@ -539,10 +787,13 @@ async fn produce_message(
 // Всё, что меняет архив, возвращает его ЦЕЛИКОМ вместе с занятым местом — тот
 // же приём, что у схем топиков: досчитывать новое состояние на фронте значило
 // бы разъезжаться с диском, а размеры там всё равно неоткуда взять.
+//
+// И через `blocking` по той же причине: превью сохранённого сообщения строится
+// схемой его топика, а за avro-схемой ходят в Schema Registry.
 
 #[tauri::command]
 async fn list_favorites(app: tauri::AppHandle) -> Result<FavoritesView, String> {
-    favorites::list(&app)
+    blocking(move || favorites::list(&app)).await
 }
 
 /// Сохраняет сообщение так, чтобы оно пережило и перезапуск, и retention.
@@ -567,30 +818,33 @@ async fn save_favorite(
     if raw.partition != request.partition || raw.offset != request.offset {
         return Err("the message list has changed; reopen the message and try again".into());
     }
-    favorites::save(
-        &app,
-        &request.cluster,
-        &request.cluster_name,
-        &request.topic,
-        &raw,
-    )
+    blocking(move || {
+        favorites::save(
+            &app,
+            &request.cluster,
+            &request.cluster_name,
+            &request.topic,
+            &raw,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
 async fn delete_favorite(app: tauri::AppHandle, id: String) -> Result<FavoritesView, String> {
-    favorites::delete(&app, &id)
+    blocking(move || favorites::delete(&app, &id)).await
 }
 
 #[tauri::command]
 async fn clear_favorites(app: tauri::AppHandle) -> Result<FavoritesView, String> {
-    favorites::clear(&app)
+    blocking(move || favorites::clear(&app)).await
 }
 
 /// Тело сохранённого сообщения — только когда его открыли, как и у строки
 /// таблицы, и разобранное сегодняшней схемой топика.
 #[tauri::command]
 async fn get_favorite(app: tauri::AppHandle, id: String) -> Result<SavedMessage, String> {
-    favorites::message(&app, &id)
+    blocking(move || favorites::message(&app, &id)).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -627,7 +881,18 @@ pub fn run() {
             remove_proto_file,
             save_topic_schema,
             apply_topic_schema,
+            add_avro_files,
+            refresh_avro_files,
+            remove_avro_file,
+            save_topic_avro_subject,
+            save_topic_avro_record,
+            save_schema_registry,
+            delete_schema_registry,
+            test_schema_registry,
+            list_registry_subjects,
+            list_subject_versions,
             proto_message_form,
+            avro_message_form,
             check_produce_payload,
             produce_message,
             list_favorites,

@@ -225,12 +225,12 @@ export function KafkaExplorerPortfolio() {
     // их разобранным телом секундой позже.
     //
     // Сломавшаяся схема топик не запирает: сообщаем и читаем как есть — иначе
-    // один испорченный .proto лишал бы доступа к данным.
+    // одна испорченная схема лишала бы доступа к данным.
     const withSchema = schemaCluster
       ? api.applyTopicSchema(schemaCluster, selectedTopic.name).catch((e) => {
           if (!cancelled) {
             console.error('Failed to apply topic schema', e);
-            toast.error(`Proto schema is not applied: ${describeError(e)}`);
+            toast.error(`Schema is not applied: ${describeError(e)}`);
           }
           return null;
         })
@@ -492,7 +492,7 @@ export function KafkaExplorerPortfolio() {
         })
         .catch((e) => {
           console.error('Failed to apply topic schema', e);
-          toast.error(`Proto schema is not applied: ${describeError(e)}`);
+          toast.error(`Schema is not applied: ${describeError(e)}`);
           // Форма уже показывает новую схему, а строки остались прежними —
           // держать в состоянии картинку, которой нет в воркере, нельзя.
           setOpenSchema(schema);

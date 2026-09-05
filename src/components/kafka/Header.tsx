@@ -25,7 +25,7 @@ import {
 import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
 import { IconAction } from './components/IconAction';
-import { FormatSelect } from './components/FormatSelect';
+import { FormatSelect, needsSchema } from './components/FormatSelect';
 import { ReadOrder } from './components/ReadOrder';
 
 /** Со скольки выбранных партиций перечисление перестаёт помещаться в шапку. */
@@ -127,6 +127,9 @@ export function HeaderDesktop({
   const allPartitions = selectedPartitions === null;
 
   const connected = clusterName !== null;
+  /** Разбирается ли тело по схеме — от этого зависит, есть ли что искать в
+   *  разобранном виде. `json` и `text` показываются как есть. */
+  const decodes = needsSchema(format);
   const users = cluster?.users ?? [];
   const activeUser = users.find((u) => u.id === activeUserId) ?? null;
   // На PLAINTEXT-кластере логина нет и не будет — селектор там только мешал бы.
@@ -303,7 +306,7 @@ export function HeaderDesktop({
                         <Checkbox
                           id="search-decoded"
                           checked={filters.search_decoded}
-                          disabled={format !== 'proto'}
+                          disabled={!decodes}
                           onCheckedChange={(checked) =>
                             onFiltersChange({ ...filters, search_decoded: checked === true })
                           }
@@ -311,12 +314,12 @@ export function HeaderDesktop({
                         <Label
                           htmlFor="search-decoded"
                           title={
-                            format === 'proto'
+                            decodes
                               ? 'Also search field names, numbers and enum labels. Decodes every message, so it is slower.'
-                              : 'Needs a protobuf schema for this topic'
+                              : 'Needs a protobuf or Avro schema for this topic'
                           }
                           className={`font-mono text-sm ${
-                            format === 'proto' ? 'text-soft cursor-pointer' : 'text-dim'
+                            decodes ? 'text-soft cursor-pointer' : 'text-dim'
                           }`}
                         >
                           Search decoded body

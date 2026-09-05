@@ -3,7 +3,7 @@
 //! Парсер — чисто растовый (`protobuf_parse::Parser::pure`): внешнего `protoc`
 //! на машине пользователя нет и требовать его нельзя. Импорты разрешаются одним
 //! include-каталогом — самим каталогом схемы, куда файлы уложены под теми
-//! именами, под которыми их импортируют (см. `files::layout`).
+//! именами, под которыми их импортируют (см. `imports::layout`).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use protobuf::descriptor::DescriptorProto;
 use protobuf::reflect::{FileDescriptor, MessageDescriptor};
 
-use super::types::ProtoFile;
+use crate::schema::types::SchemaFile;
 
 /// Разобранная схема: связанный граф файлов и список message на выбор.
 #[derive(Debug)]
@@ -51,7 +51,7 @@ static CACHE: Mutex<Vec<(String, Arc<Linked>)>> = Mutex::new(Vec::new());
 const CACHE_LIMIT: usize = 8;
 
 /// Разбирает каталог, переиспользуя прошлый результат, если он ещё годен.
-pub fn linked(dir: &Path, files: &[ProtoFile]) -> Result<Arc<Linked>, String> {
+pub fn linked(dir: &Path, files: &[SchemaFile]) -> Result<Arc<Linked>, String> {
     let key = cache_key(dir);
     if let Some(hit) = cached(&key) {
         return Ok(hit);
@@ -65,7 +65,7 @@ pub fn linked(dir: &Path, files: &[ProtoFile]) -> Result<Arc<Linked>, String> {
 ///
 /// Нужно ровно там, где результат ещё не имеет права стать общим: файлы лежат
 /// во временном каталоге и, если разбор не удастся, будут снесены.
-pub fn parse(dir: &Path, files: &[ProtoFile]) -> Result<Linked, String> {
+pub fn parse(dir: &Path, files: &[SchemaFile]) -> Result<Linked, String> {
     if files.is_empty() {
         return Err("no .proto files".to_string());
     }
@@ -177,11 +177,11 @@ mod tests {
             Self(path)
         }
 
-        fn write(&self, name: &str, text: &str) -> ProtoFile {
+        fn write(&self, name: &str, text: &str) -> SchemaFile {
             let path = self.0.join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, text).unwrap();
-            ProtoFile {
+            SchemaFile {
                 name: name.to_string(),
                 source: path.to_string_lossy().into_owned(),
             }

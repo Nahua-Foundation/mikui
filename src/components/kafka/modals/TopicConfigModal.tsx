@@ -6,8 +6,8 @@ import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Dialog, DialogHeader, DialogTitle } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
-import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
+import { AvroSchema } from '../components/AvroSchema';
 import * as api from '../api';
 import { describeError } from '../api';
 import { BodyFormat, Topic, TopicSchema } from '../types';
@@ -46,8 +46,6 @@ export function TopicConfigModal({
   /** Идёт разбор .proto на бэкенде: кнопки, которые тоже его затронут,
    *  на это время выключены. */
   const [busy, setBusy] = useState(false);
-  const [schemaRegistry, setSchemaRegistry] = useState<string>('');
-  const [password, setPassword] = useState<string>('');
 
   const topicName = topic?.name ?? null;
 
@@ -66,7 +64,7 @@ export function TopicConfigModal({
         setFormat(loaded?.format ?? 'json');
         setMessage(loaded?.message ?? null);
         if (loaded?.error) {
-          toast.error(`Proto schema of ${topicName} is broken: ${loaded.error}`);
+          toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
         }
       })
       .catch((e) => {
@@ -97,7 +95,7 @@ export function TopicConfigModal({
         onSchemaChanged?.(topicName, updated);
         toast.success(success);
       } catch (e) {
-        console.error('Proto schema operation failed', e);
+        console.error('Schema operation failed', e);
         toast.error(describeError(e));
       } finally {
         setBusy(false);
@@ -322,28 +320,14 @@ export function TopicConfigModal({
           )}
 
           {/* Avro specific fields */}
-          {format === 'avro' && (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <Label className="font-mono text-sm text-soft">Schema Registry URL</Label>
-                <Input
-                  value={schemaRegistry}
-                  onChange={(e) => setSchemaRegistry(e.target.value)}
-                  placeholder="http://localhost:8081"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label className="font-mono text-sm text-soft">Password</Label>
-                <Input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
-                />
-              </div>
-            </div>
+          {format === 'avro' && cluster && topicName && (
+            <AvroSchema
+              cluster={cluster}
+              topic={topicName}
+              avro={schema?.avro ?? null}
+              busy={busy}
+              onApply={(action, success) => void applySchema(action, success)}
+            />
           )}
 
           {/* Action Buttons */}

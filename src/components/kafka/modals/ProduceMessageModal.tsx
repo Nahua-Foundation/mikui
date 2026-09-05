@@ -8,6 +8,7 @@ import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/d
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { highlightLine, NO_ENUM_VALUES } from '../syntax';
+import { SubjectPicker } from '../components/AvroSchema';
 import * as api from '../api';
 import { describeError } from '../api';
 import {
@@ -15,7 +16,7 @@ import {
   PayloadFormat,
   PayloadIssue,
   ProduceRequest,
-  ProtoMessageForm,
+  MessageForm,
   Topic,
   TopicSchema,
 } from '../types';
@@ -38,13 +39,26 @@ const FORMATS: { value: PayloadFormat; label: string }[] = [
   { value: 'hex', label: 'hex' },
 ];
 
-/** Форматы, тело которых — это JSON, и его надо раскрашивать. У proto тело
- *  вводится тем же JSON, каким оно потом показывается при чтении. */
-const HIGHLIGHTED: ReadonlySet<PayloadFormat> = new Set<PayloadFormat>(['json', 'proto']);
+/** Форматы, тело которых — это JSON, и его надо раскрашивать. У proto и avro
+ *  тело вводится тем же JSON, каким оно потом показывается при чтении. */
+const HIGHLIGHTED: ReadonlySet<PayloadFormat> = new Set<PayloadFormat>([
+  'json',
+  'proto',
+  'avro',
+]);
 
-/** Форматы, чьё тело проверяет бэкенд. Текст и avro отправляются как есть —
- *  ходить ради них в Rust на каждое нажатие клавиши не за чем. */
-const CHECKED: ReadonlySet<PayloadFormat> = new Set<PayloadFormat>(['json', 'proto', 'hex']);
+/** Форматы, чьё тело проверяет бэкенд. Текст отправляется как есть — ходить
+ *  ради него в Rust на каждое нажатие клавиши не за чем. */
+const CHECKED: ReadonlySet<PayloadFormat> = new Set<PayloadFormat>([
+  'json',
+  'proto',
+  'avro',
+  'hex',
+]);
+
+/** Форматы, у которых тело кодируется по схеме, а значит есть и заготовка, и
+ *  подсветка enum. */
+const SCHEMA_FORMATS: ReadonlySet<PayloadFormat> = new Set<PayloadFormat>(['proto', 'avro']);
 
 /**
  * Место под полосу прокрутки резервируется всегда — и в поле ввода, и в слое
@@ -56,19 +70,42 @@ const CHECKED: ReadonlySet<PayloadFormat> = new Set<PayloadFormat>(['json', 'pro
  */
 const SCROLLBAR_GUTTER: React.CSSProperties = { scrollbarGutter: 'stable' };
 
-/** Описание proto-типа вместе с его именем — см. `currentForm`. */
+/**
+ * Описание выбранного типа вместе с тем, чем его выбирали, — см. `currentForm`.
+ *
+ * `choice` — имя message у protobuf и subject у Avro. Хранится ВМЕСТЕ с
+ * ответом, потому что пока запрос летит, в состоянии лежит описание прежнего
+ * типа, и отличить его от нового иначе нечем.
+ */
 interface DescribedMessage {
-  message: string;
-  form: ProtoMessageForm;
+  choice: string;
+  form: MessageForm;
 }
 
 const PLACEHOLDERS: Record<PayloadFormat, string> = {
   text: 'Message body',
   json: '{ "id": 1 }',
   proto: 'Pick a message type — the template appears here',
-  avro: 'Message body',
+  avro: 'The template appears here once the schema is known',
   hex: '1a2b3c — spaces, colons and dashes are ignored',
 };
+
+/**
+ * Ключ выбранного типа для эффекта загрузки заготовки.
+ *
+ * Пустая строка — законное значение у Avro: subject может быть не выбран, и
+ * тогда берётся тот, что назначен топику. У protobuf пустой выбор означает
+ * «нечем», и запрос не уходит вовсе.
+ */
+function schemaChoice(
+  format: PayloadFormat,
+  protoMessage: string | null,
+  avroSubject: string | null,
+): string | null {
+  if (format === 'proto') return protoMessage;
+  if (format === 'avro') return avroSubject ?? '';
+  return null;
+}
 
 interface ProduceMessageModalProps {
   topic: Topic | null;
@@ -94,9 +131,11 @@ export function ProduceMessageModal({
   const [format, setFormat] = useState<PayloadFormat>('text');
   const [payload, setPayload] = useState('');
   const [protoMessage, setProtoMessage] = useState<string | null>(null);
+  /** Subject, которым кодировать. null — тот, что назначен топику. */
+  const [avroSubject, setAvroSubject] = useState<string | null>(null);
   /** Ответ бэкенда вместе с типом, к которому он относится. null — тип не
    *  выбран либо схема не разобралась. */
-  const [protoForm, setProtoForm] = useState<DescribedMessage | null>(null);
+  const [schemaForm, setSchemaForm] = useState<DescribedMessage | null>(null);
   const [issue, setIssue] = useState<PayloadIssue | null>(null);
   const [busy, setBusy] = useState(false);
   /** Список заголовков прокручен не до конца — под ним есть ещё. */
@@ -105,6 +144,9 @@ export function ProduceMessageModal({
   const topicName = topic?.name ?? null;
   const messages = useMemo(() => schema?.messages ?? [], [schema]);
   const canUseProto = messages.length > 0;
+  const avro = schema?.avro ?? null;
+  /** Кодировать Avro можно либо через реестр, либо по локальным .avsc. */
+  const canUseAvro = !!avro && (avro.registry || avro.files.length > 0);
 
   /**
    * Для какого типа заготовку уже предлагали.
@@ -135,79 +177,121 @@ export function ProduceMessageModal({
     setIssue(null);
     setBusy(false);
     setMoreHeaders(false);
-    setProtoForm(null);
+    setSchemaForm(null);
     offeredFor.current = null;
     // Тип по умолчанию — тот, которым топик читают: раз им смотрят, им скорее
     // всего и отправляют.
     setProtoMessage(current?.message ?? null);
-    // Формат тоже: у proto-топика начинать с текста значило бы предлагать
+    setAvroSubject(null);
+    // Формат тоже: у топика со схемой начинать с текста значило бы предлагать
     // положить в него заведомо нечитаемое тело.
-    setFormat(
-      current?.format === 'proto' && (current?.messages?.length ?? 0) > 0 ? 'proto' : 'text',
-    );
+    if (current?.format === 'proto' && (current?.messages?.length ?? 0) > 0) {
+      setFormat('proto');
+    } else if (
+      current?.format === 'avro' &&
+      !!current.avro &&
+      (current.avro.registry || current.avro.files.length > 0)
+    ) {
+      setFormat('avro');
+    } else {
+      setFormat('text');
+    }
   }, [open]);
 
   // Всё, что форме нужно знать про выбранный тип: заготовка тела и имена
   // enum-значений для подсветки. Одним запросом — обе половины описывают один
-  // и тот же message и приезжают на одно событие.
+  // и тот же тип и приезжают на одно событие.
+  const choice = schemaChoice(format, protoMessage, avroSubject);
   useEffect(() => {
-    if (!open || format !== 'proto' || !cluster || !topicName || !protoMessage) {
-      setProtoForm(null);
+    if (!open || !cluster || !topicName || choice === null) {
+      setSchemaForm(null);
       return;
     }
 
-    const wanted = protoMessage;
     let cancelled = false;
-    api
-      .protoMessageForm(cluster, topicName, wanted)
+    const wanted = choice;
+    const load =
+      format === 'proto'
+        ? api.protoMessageForm(cluster, topicName, wanted)
+        : // Пустой выбор у Avro законен: бэкенд возьмёт то, что назначено
+          // топику. У protobuf такого нет — там без типа кодировать нечем.
+          api.avroMessageForm(cluster, topicName, wanted || null);
+
+    load
       .then((loaded) => {
-        // Имя типа хранится ВМЕСТЕ с ответом. Пока запрос летит, в состоянии
+        // Выбор хранится ВМЕСТЕ с ответом. Пока запрос летит, в состоянии
         // лежит описание ПРЕЖНЕГО типа, и без этой отметки его нельзя отличить
         // от описания нового: подстановка успевала сработать на старом ответе,
         // и в поле оказывалась заготовка предыдущего типа, а не выбранного.
-        if (!cancelled) setProtoForm({ message: wanted, form: loaded });
+        if (!cancelled) setSchemaForm({ choice: wanted, form: loaded });
       })
       .catch((e) => {
         // Не тост: разбор схемы уже отчитался об ошибке в настройках топика, а
         // здесь это всего лишь «заготовки и подсветки не будет» — набрать тело
         // руками ничто не мешает, и проверка перед отправкой скажет своё.
-        console.error('Failed to describe the proto message', e);
-        if (!cancelled) setProtoForm(null);
+        console.error('Failed to describe the schema', e);
+        if (!cancelled) setSchemaForm(null);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [open, format, cluster, topicName, protoMessage]);
+  }, [open, format, cluster, topicName, choice]);
 
   /**
    * Описание ВЫБРАННОГО сейчас типа, а не последнего приехавшего.
    *
    * Всё, что зависит от схемы — заготовка, подсветка enum, кнопка — обязано
-   * смотреть сюда: пока ответ в пути, `protoForm` относится к прежнему типу, и
+   * смотреть сюда: пока ответ в пути, `schemaForm` относится к прежнему типу, и
    * пользоваться им значит показывать чужой контракт.
    */
-  const currentForm =
-    protoForm && protoForm.message === protoMessage ? protoForm.form : null;
+  const currentForm = schemaForm && schemaForm.choice === choice ? schemaForm.form : null;
+
+  /**
+   * Subject, которым тело в итоге закодируется.
+   *
+   * Выбранный в форме, назначенный топику или найденный в реестре по имени
+   * топика — в этом порядке. Последнее слово за бэкендом: он же и кодирует, и
+   * его ответ (`currentForm.subject`) точнее любой догадки на этой стороне —
+   * в частности, он пуст там, где схема локальная и никакого subject'а нет.
+   */
+  const usedSubject = currentForm
+    ? currentForm.subject
+    : (avroSubject ?? avro?.subject ?? avro?.detected ?? null);
+
+  /**
+   * Уедет ли тело с confluent-заголовком.
+   *
+   * Разницу видит не отправитель, а потребитель топика, поэтому форма о ней и
+   * пишет: с заголовком тело прочитает штатный десериализатор, без него — лишь
+   * тот, кто знает схему заранее. Заголовок берётся из реестра, значит и
+   * бывает он ровно там, где схему дал subject.
+   */
+  const framed = format === 'avro' && !!avro?.registry && usedSubject !== null;
+
+  /** Ключ, под которым помнится «заготовку для этого уже предлагали». С
+   *  форматом внутри: пустой выбор у Avro иначе не отличить от отсутствия
+   *  выбора у protobuf. */
+  const offerKey = choice === null ? null : `${format}:${choice}`;
 
   /** Ставит заготовку в поле. */
   const applyTemplate = useCallback(() => {
-    if (!currentForm || !protoMessage) return;
-    offeredFor.current = protoMessage;
+    if (!currentForm || offerKey === null) return;
+    offeredFor.current = offerKey;
     setPayload(currentForm.template);
-  }, [currentForm, protoMessage]);
+  }, [currentForm, offerKey]);
 
   // Заготовка подставляется сама, но ТОЛЬКО в пустое поле и только один раз на
   // тип. Смена типа в селекторе набранное тело не трогает: промахнуться в
   // списке легко, а потерять из-за этого заполненное сообщение нельзя — за
   // подмену отвечает кнопка рядом с селектором.
   useEffect(() => {
-    if (!currentForm || !protoMessage) return;
-    if (offeredFor.current === protoMessage) return;
+    if (!currentForm || offerKey === null) return;
+    if (offeredFor.current === offerKey) return;
     if (payload !== '') return;
-    offeredFor.current = protoMessage;
+    offeredFor.current = offerKey;
     setPayload(currentForm.template);
-  }, [currentForm, protoMessage, payload]);
+  }, [currentForm, offerKey, payload]);
 
   // Проверка тела. Талон отсекает опоздавшие ответы: печатают быстрее, чем
   // они приходят, и без него под полем оставалась бы ошибка от текста,
@@ -231,6 +315,7 @@ export function ProduceMessageModal({
           format,
           payload,
           message: protoMessage,
+          subject: avroSubject,
         })
         .then((found) => {
           if (checkTicket.current === ticket) setIssue(found);
@@ -245,7 +330,7 @@ export function ProduceMessageModal({
     }, CHECK_DEBOUNCE_MS);
 
     return () => window.clearTimeout(timer);
-  }, [open, cluster, topicName, format, payload, protoMessage]);
+  }, [open, cluster, topicName, format, payload, protoMessage, avroSubject]);
 
   // Список заголовков прокручиваемый, и обе беды прокрутки лечатся здесь.
   //
@@ -298,6 +383,7 @@ export function ProduceMessageModal({
       format,
       payload,
       message: protoMessage,
+      subject: avroSubject,
     };
 
     setBusy(true);
@@ -313,7 +399,18 @@ export function ProduceMessageModal({
     } finally {
       setBusy(false);
     }
-  }, [topicName, partition, key, headers, format, payload, protoMessage, cluster, onOpenChange]);
+  }, [
+    topicName,
+    partition,
+    key,
+    headers,
+    format,
+    payload,
+    protoMessage,
+    avroSubject,
+    cluster,
+    onOpenChange,
+  ]);
 
   // Подсветка живёт слоем ПОД полем ввода, а само поле прозрачное. Другого
   // способа раскрасить редактируемый текст в textarea нет, и держится это на
@@ -340,7 +437,10 @@ export function ProduceMessageModal({
    * до того, как ошибку подтвердит проверка под полем.
    */
   const enumValues = useMemo(
-    () => (format === 'proto' && currentForm ? new Set(currentForm.enum_values) : NO_ENUM_VALUES),
+    () =>
+      SCHEMA_FORMATS.has(format) && currentForm
+        ? new Set(currentForm.enum_values)
+        : NO_ENUM_VALUES,
     [format, currentForm],
   );
 
@@ -501,10 +601,11 @@ export function ProduceMessageModal({
             <div className="flex items-center justify-between gap-4">
               <div className="flex gap-1">
                 {FORMATS.map(({ value, label }) => {
-                  // proto без загруженных .proto кодировать нечем. Пункт не
-                  // прячем, а гасим: иначе непонятно, почему у одного топика
-                  // формат есть, а у соседнего нет.
-                  const disabled = value === 'proto' && !canUseProto;
+                  // Формат без схемы кодировать нечем. Пункт не прячем, а
+                  // гасим: иначе непонятно, почему у одного топика формат есть,
+                  // а у соседнего нет.
+                  const disabled =
+                    (value === 'proto' && !canUseProto) || (value === 'avro' && !canUseAvro);
                   return (
                     <Button
                       key={value}
@@ -513,7 +614,9 @@ export function ProduceMessageModal({
                       disabled={disabled}
                       title={
                         disabled
-                          ? 'Load a .proto file in the topic settings first — or send raw bytes as hex'
+                          ? value === 'avro'
+                            ? 'Add a schema registry to this connection or load an .avsc file in the topic settings — or send raw bytes as hex'
+                            : 'Load a .proto file in the topic settings first — or send raw bytes as hex'
                           : undefined
                       }
                       className={`font-mono px-3 py-1 h-auto ${
@@ -572,6 +675,41 @@ export function ProduceMessageModal({
                       ))}
                     </SelectContent>
                   </Select>
+                </div>
+              )}
+
+              {format === 'avro' && (
+                <div className="flex items-center gap-3 min-w-0">
+                  {currentForm && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={applyTemplate}
+                      title="Replace the body with a fresh template"
+                      className="h-9 shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono text-xs"
+                    >
+                      <RotateCcw className="size-3.5" />
+                      template
+                    </Button>
+                  )}
+                  {/* Селектор только у реестра: локальные .avsc задают схему
+                      топика целиком, и выбирать в них нечего — запись выбрана
+                      в настройках. */}
+                  {avro?.registry && (
+                    <div className="w-72 shrink-0">
+                      <SubjectPicker
+                        cluster={cluster ?? ''}
+                        subject={avroSubject ?? avro.subject}
+                        // Найденный сам — подписью, а не выбором: выбора не
+                        // было, и показывать его как сделанный нечестно. Но и
+                        // пустое поле над работающей заготовкой врёт сильнее.
+                        placeholder={usedSubject ? `${usedSubject} — found automatically` : undefined}
+                        disabled={!cluster}
+                        onChange={setAvroSubject}
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -641,9 +779,14 @@ export function ProduceMessageModal({
               </div>
             )}
 
+            {/* Что именно уедет в топик. Не деталь реализации: с заголовком
+                тело прочитает штатный потребитель со своим Avro-десериализатором,
+                а без него — только тот, кто знает схему заранее. */}
             {format === 'avro' && (
               <div className="font-mono text-xs text-dim">
-                No schema registry yet — the body is sent as plain text.
+                {framed
+                  ? 'Sent in the Confluent wire format: the schema id goes in front of the body.'
+                  : 'Sent as a bare Avro datum — no schema id in front. A consumer that expects the registry format will not read it.'}
               </div>
             )}
           </div>

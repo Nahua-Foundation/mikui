@@ -20,10 +20,11 @@ import {
   PayloadIssue,
   ProduceRequest,
   ProduceResult,
-  ProtoMessageForm,
+  MessageForm,
   ReadRange,
   RowPreview,
   SavedMessage,
+  SchemaRegistryConfig,
   SaveFavoriteResult,
   Settings,
   StartFrom,
@@ -232,11 +233,71 @@ export const saveTopicSchema = (
 export const applyTopicSchema = (cluster: string, topic: string) =>
   invoke<TopicSchema | null>('apply_topic_schema', { cluster, topic });
 
+// --- Avro-схемы топиков --------------------------------------------------------
+//
+// Возвращают, как и protobuf-команды, схему ЦЕЛИКОМ: файлы, выбранная запись и
+// subject меняются вместе.
+
+/** Добавляет .avsc. Невалидный набор не сохраняется вовсе. */
+export const addAvroFiles = (cluster: string, topic: string, paths: string[]) =>
+  invoke<TopicSchema>('add_avro_files', { cluster, topic, paths });
+
+export const refreshAvroFiles = (cluster: string, topic: string, name?: string) =>
+  invoke<TopicSchema>('refresh_avro_files', { cluster, topic, name: name ?? null });
+
+export const removeAvroFile = (cluster: string, topic: string, name: string) =>
+  invoke<TopicSchema | null>('remove_avro_file', { cluster, topic, name });
+
+/** Привязывает топик к subject реестра. `null` — отвязать. Загруженные .avsc
+ *  при этом убираются: два источника схемы у одного топика — это два разных
+ *  ответа на вопрос «чем декодировать». */
+export const saveTopicAvroSubject = (
+  cluster: string,
+  topic: string,
+  subject: string | null,
+  version: number | null,
+) => invoke<TopicSchema>('save_topic_avro_subject', { cluster, topic, subject, version });
+
+/** Выбирает запись из загруженных .avsc. */
+export const saveTopicAvroRecord = (cluster: string, topic: string, record: string | null) =>
+  invoke<TopicSchema>('save_topic_avro_record', { cluster, topic, record });
+
+// --- Schema Registry ------------------------------------------------------------
+//
+// Настройки живут на КЛАСТЕРЕ. Пароль ведёт себя как пароли учёток: непустая
+// строка — записать в keychain, пустая — удалить, `undefined` — не трогать.
+
+export const saveSchemaRegistry = (
+  clusterId: string,
+  registry: SchemaRegistryConfig,
+  password?: string,
+) => invoke<KafkaCluster>('save_schema_registry', { clusterId, registry, password });
+
+export const deleteSchemaRegistry = (clusterId: string) =>
+  invoke<KafkaCluster>('delete_schema_registry', { clusterId });
+
+/** Проверяет настройки, не сохраняя их: сколько subject отдал реестр. */
+export const testSchemaRegistry = (
+  clusterId: string | null,
+  registry: SchemaRegistryConfig,
+  password?: string,
+) => invoke<number>('test_schema_registry', { clusterId, registry, password });
+
+export const listRegistrySubjects = (cluster: string) =>
+  invoke<string[]>('list_registry_subjects', { cluster });
+
+export const listSubjectVersions = (cluster: string, subject: string) =>
+  invoke<number[]>('list_subject_versions', { cluster, subject });
+
 // --- Отправка сообщения -------------------------------------------------------
 
 /** Заготовка тела и имена enum-значений выбранного message. */
 export const protoMessageForm = (cluster: string, topic: string, message: string) =>
-  invoke<ProtoMessageForm>('proto_message_form', { cluster, topic, message });
+  invoke<MessageForm>('proto_message_form', { cluster, topic, message });
+
+/** То же для Avro. `subject` пуст — взять тот, что назначен топику. */
+export const avroMessageForm = (cluster: string, topic: string, subject: string | null) =>
+  invoke<MessageForm>('avro_message_form', { cluster, topic, subject });
 
 /**
  * Что показать под полем ввода тела, пока его набирают.

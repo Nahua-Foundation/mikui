@@ -30,7 +30,7 @@ use super::types::{
 };
 use crate::config;
 use crate::kafka::{text, FullMessage, RawBody};
-use crate::proto::{self, ProtoDecoder};
+use crate::schema::{self, Decoder};
 
 const INDEX_FILE: &str = "favorites.json";
 const BODIES_DIR: &str = "favorites";
@@ -55,7 +55,7 @@ fn body_path(root: &Path, id: &str) -> PathBuf {
 /// Идентификатор записи: время сохранения и хэш от того, что делает сообщение
 /// тем же самым сообщением.
 ///
-/// FNV-1a — тот же приём, что у имён каталогов схем (`proto::store`): в имени
+/// FNV-1a — тот же приём, что у имён каталогов схем (`schema::store`): в имени
 /// топика бывает что угодно, включая знаки, которых файловая система не примет.
 /// Миллисекунды впереди дают уникальность (одно и то же сообщение опознаётся по
 /// индексу раньше, чем дойдёт сюда) и заодно читаемый порядок в каталоге.
@@ -81,18 +81,18 @@ fn file_size(path: &Path) -> Option<u64> {
 /// на строку.
 #[derive(Default)]
 struct Decoders {
-    cache: HashMap<(String, String), Option<Arc<ProtoDecoder>>>,
+    cache: HashMap<(String, String), Option<Arc<Decoder>>>,
 }
 
 impl Decoders {
     /// Сломанная схема — то же, что её отсутствие: открытый топик в этом случае
     /// тоже показывает тела текстом (см. `apply_topic_schema`), и архив не
     /// должен показывать их иначе.
-    fn get(&mut self, root: &Path, cluster: &str, topic: &str) -> Option<Arc<ProtoDecoder>> {
+    fn get(&mut self, root: &Path, cluster: &str, topic: &str) -> Option<Arc<Decoder>> {
         let key = (cluster.to_string(), topic.to_string());
         self.cache
             .entry(key)
-            .or_insert_with(|| proto::store::decoder(root, cluster, topic).unwrap_or(None))
+            .or_insert_with(|| schema::store::decoder(root, cluster, topic).unwrap_or(None))
             .clone()
     }
 }
@@ -182,11 +182,11 @@ pub fn message(root: &Path, id: &str) -> Result<SavedMessage, String> {
     let raw = fs::read(&path)
         .map_err(|e| format!("can't read the saved body {}: {e}", path.display()))?;
 
-    let decoder = proto::store::decoder(root, &record.cluster, &record.topic).unwrap_or(None);
+    let decoder = schema::store::decoder(root, &record.cluster, &record.topic).unwrap_or(None);
     let shown = text::body(decoder.as_deref(), &raw);
     // Формат — тот же, каким топик показывает таблица; сломанная схема формата
     // не отменяет, поэтому берётся из записи на диске, а не из декодера.
-    let format = proto::store::view(root, &record.cluster, &record.topic)
+    let format = schema::store::view(root, &record.cluster, &record.topic)
         .unwrap_or(None)
         .map(|view| view.format)
         .unwrap_or_default();
@@ -251,7 +251,7 @@ pub fn save(
     // Превью считается тем же кодом и той же схемой, что и строка таблицы:
     // сохранённое сообщение обязано выглядеть в списке так же, как выглядело в
     // топике.
-    let decoder = proto::store::decoder(root, cluster, topic).unwrap_or(None);
+    let decoder = schema::store::decoder(root, cluster, topic).unwrap_or(None);
     let shown = text::render(decoder.as_deref(), &raw.value);
 
     let record = FavoriteRecord {
@@ -324,7 +324,7 @@ pub fn clear(root: &Path) -> Result<FavoritesView, String> {
 mod tests {
     use super::*;
     use crate::kafka::MessageHeader;
-    use crate::proto::BodyFormat;
+    use crate::schema::BodyFormat;
 
     const CLUSTER: &str = "prod";
 
@@ -557,7 +557,7 @@ mod tests {
     fn attach_schema(root: &Path, topic: &str) {
         let source = root.join("event.proto");
         fs::write(&source, PROTO).unwrap();
-        proto::store::add_files(
+        schema::store::add_files(
             root,
             CLUSTER,
             topic,
@@ -603,10 +603,64 @@ mod tests {
         sandbox.save("orders", 0, 1, &event_bytes("a-1"));
         assert!(sandbox.list().items[0].record.preview.contains("a-1"));
 
-        proto::store::remove_file(&sandbox.root, CLUSTER, "orders", "event.proto").unwrap();
+        schema::store::remove_file(&sandbox.root, CLUSTER, "orders", "event.proto").unwrap();
 
         let view = sandbox.list();
         assert!(!view.items[0].record.preview.contains("\"id\""), "разбор должен был уйти");
         assert!(!view.items[0].record.with_schema);
+    }
+
+    // --- То же самое с Avro ---------------------------------------------------
+    //
+    // Архив про формат схемы не знает вовсе: он хранит сырые байты и зовёт тот
+    // декодер, который сегодня привязан к топику. Проверяем, что это правда, а
+    // не совпадение, — на втором формате.
+
+    const AVSC: &str = r#"{
+        "type": "record", "name": "Event", "namespace": "demo",
+        "fields": [{"name": "id", "type": "string"}]
+    }"#;
+
+    /// Кодирует `Event { id }` в голый avro-datum.
+    fn avro_bytes(id: &str) -> Vec<u8> {
+        let linked =
+            crate::schema::avro::Linked::parse_files(&[AVSC.to_string()], None).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&format!(r#"{{"id": "{id}"}}"#)).unwrap();
+        linked.encode(json).unwrap()
+    }
+
+    fn attach_avro(root: &Path, topic: &str) {
+        let source = root.join("event.avsc");
+        fs::write(&source, AVSC).unwrap();
+        schema::store::add_avro_files(
+            root,
+            CLUSTER,
+            topic,
+            &[source.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_avro_schema_loaded_after_saving_decodes_the_stored_bytes() {
+        let sandbox = Sandbox::new("late-avro");
+        let id = sandbox.save("orders", 0, 1, &avro_bytes("a-1"));
+
+        // Пока схемы нет — это просто байты. Avro без схемы не разбирается
+        // вообще никак, в отличие от protobuf, где видны хотя бы номера полей.
+        let before = sandbox.list();
+        assert!(!before.items[0].record.with_schema);
+
+        attach_avro(&sandbox.root, "orders");
+
+        let saved = message(&sandbox.root, &id).unwrap();
+        assert_eq!(saved.message.value, r#"{"id":"a-1"}"#);
+        assert!(!saved.message.binary);
+        assert_eq!(saved.format, BodyFormat::Avro);
+
+        let after = sandbox.list();
+        assert!(after.items[0].record.preview.contains("a-1"));
+        assert!(after.items[0].record.with_schema);
     }
 }

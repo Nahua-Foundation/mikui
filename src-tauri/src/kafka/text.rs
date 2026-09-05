@@ -4,7 +4,7 @@
 //! угодно ещё, поэтому декодирование обязано быть безопасным и обязано
 //! сообщать вызывающему, что данные бинарные.
 
-use crate::proto::ProtoDecoder;
+use crate::schema::Decoder;
 
 /// Максимум байт тела, уезжающих в строку таблицы. Полное тело отдаётся
 /// отдельной командой, когда пользователь открывает сообщение.
@@ -50,6 +50,34 @@ pub fn preview(bytes: &[u8], max_bytes: usize) -> String {
     out
 }
 
+/// Ключ в том виде, в каком его показывают.
+///
+/// У ключа своя схема — в Kafka он сериализуется отдельно от тела, и в реестре
+/// у него отдельный subject (`<topic>-key`). Поэтому и декодер сюда приходит
+/// свой, а не тот, которым разбирается тело: разобрать ключ схемой значения
+/// значило бы показать правдоподобный мусор.
+///
+/// Три отличия от `body`, и все три — про то, что ключ не тело:
+///   * неудача разбора молчит. У avro-топика ключ бывает и avro-шным, и обычной
+///     строкой от `StringSerializer` — второе встречается чаще, чем первое, и
+///     объявлять его ошибкой было бы неверно. Не разобралось — показываем
+///     байты, как показывали всегда;
+///   * enum не нужны: ключ не подсвечивается;
+///   * строка разворачивается из кавычек. Схема ключа сплошь и рядом — это
+///     просто `"string"`, и `"TCBR"` вместо `TCBR` было бы ровно тем же
+///     мусором перед ключом, только в кавычках.
+pub fn key(decoder: Option<&Decoder>, raw: &[u8]) -> String {
+    match decoder.map(|d| d.decode(raw)) {
+        Some(Ok(json)) => unquote(&json),
+        _ => decode(raw),
+    }
+}
+
+/// Разворачивает JSON-строку в её содержимое. Всё остальное — как есть.
+fn unquote(json: &str) -> String {
+    serde_json::from_str::<String>(json).unwrap_or_else(|_| json.to_string())
+}
+
 // --- Показ тела по схеме -----------------------------------------------------
 
 /// Результат попытки декодировать тело.
@@ -78,7 +106,7 @@ impl Rendered {
 /// копии тела в памяти: буфер и так держит десятки тысяч сообщений, и класть
 /// рядом их разобранные представления значило бы удвоить его цену ради данных,
 /// которые переживут один экран прокрутки.
-pub fn render(decoder: Option<&ProtoDecoder>, value: &[u8]) -> Rendered {
+pub fn render(decoder: Option<&Decoder>, value: &[u8]) -> Rendered {
     let Some(decoder) = decoder else {
         return Rendered::default();
     };
@@ -113,18 +141,34 @@ pub struct Body {
     pub enum_values: Vec<String>,
 }
 
-pub fn body(decoder: Option<&ProtoDecoder>, raw: &[u8]) -> Body {
-    let shown = render(decoder, raw);
-    let binary = shown.binary(raw);
-    let enum_values = match (&shown.decoded, decoder) {
-        (Some(_), Some(decoder)) => decoder.enum_values().to_vec(),
-        _ => Vec::new(),
+pub fn body(decoder: Option<&Decoder>, raw: &[u8]) -> Body {
+    // Не `render`: здесь нужны ещё и enum, а у Avro они принадлежат схеме
+    // КОНКРЕТНОГО сообщения — она приезжает с ним в заголовке. Спросить их
+    // отдельно, после разбора, значило бы разбирать тело второй раз.
+    let (decoded, error) = match decoder.map(|d| d.decode_with_enums(raw)) {
+        Some(Ok((json, enums))) => (Some((json, enums)), None),
+        // Схему не трогаем и топик не закрываем: одно сообщение чужого формата
+        // — обычное дело в топике, который переживал смену контракта.
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
     };
-    Body {
-        value: shown.decoded.unwrap_or_else(|| decode(raw)),
-        binary,
-        decode_error: shown.error,
-        enum_values,
+
+    let binary = decoded.is_none() && !is_text(raw);
+    match decoded {
+        Some((value, enum_values)) => Body {
+            value,
+            binary,
+            decode_error: error,
+            enum_values,
+        },
+        None => Body {
+            value: decode(raw),
+            binary,
+            decode_error: error,
+            // Пусто у неразобранного тела: на самостоятельном JSON или тексте
+            // это был бы список из чужой схемы.
+            enum_values: Vec::new(),
+        },
     }
 }
 
@@ -187,5 +231,59 @@ mod tests {
         assert_eq!(preview(b"", PREVIEW_BYTES), "");
         assert_eq!(decode(b""), "");
         assert!(is_text(b""));
+    }
+
+    // --- Ключ --------------------------------------------------------------
+    //
+    // Ровно тот случай, ради которого у ключа завёлся свой декодер: на
+    // avro-топике ключ тоже закодирован, и байтами перед ним ехала длина
+    // строки — в окне просмотра это выглядело парой нечитаемых знаков.
+
+    fn string_key_decoder() -> crate::schema::Decoder {
+        // Через `parse_with_refs`, а не `parse_files`: схема ключа — примитив,
+        // а `Schema::parse_list` требует именованных типов. Реестр отдаёт её
+        // ровно этим путём, так что проверяется тот же код, что и в жизни.
+        let linked = std::sync::Arc::new(
+            crate::schema::avro::Linked::parse_with_refs("\"string\"", &[]).unwrap(),
+        );
+        crate::schema::Decoder::Avro(crate::schema::avro::AvroDecoder::new(
+            None,
+            Some(linked),
+            None,
+        ))
+    }
+
+    #[test]
+    fn an_avro_string_key_loses_both_its_length_byte_and_its_quotes() {
+        // Голый datum: зигзаг-длина 4, затем сами байты.
+        let raw = b"\x08TCBR";
+        assert_eq!(
+            decode(raw),
+            "\u{8}TCBR",
+            "без схемы длина едет в UI управляющим символом — это и был баг"
+        );
+        assert_eq!(key(Some(&string_key_decoder()), raw), "TCBR");
+    }
+
+    /// Ключ-строка от `StringSerializer` на том же топике: схемы у него нет, и
+    /// разбор обязан молча уступить, а не превратить ключ в ошибку.
+    #[test]
+    fn a_plain_key_survives_a_decoder_that_cannot_read_it() {
+        // Первый байт 'T' = 0x54, как длина это 42 — до конца не хватит байт.
+        assert_eq!(key(Some(&string_key_decoder()), b"TCBR"), "TCBR");
+    }
+
+    #[test]
+    fn without_a_decoder_the_key_is_the_bytes_it_always_was() {
+        assert_eq!(key(None, b"TCBR"), "TCBR");
+        assert_eq!(key(None, b""), "");
+    }
+
+    /// Разворачивается только строка целиком: ключ-запись обязан остаться
+    /// JSON'ом, а не растерять кавычки внутри себя.
+    #[test]
+    fn a_record_key_stays_json() {
+        assert_eq!(unquote(r#"{"id":"a-1"}"#), r#"{"id":"a-1"}"#);
+        assert_eq!(unquote(r#""a-1""#), "a-1");
     }
 }

@@ -96,8 +96,8 @@ fn collect_enum_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::schema;
-    use crate::proto::types::ProtoFile;
+    use crate::schema::proto::linked;
+    use crate::schema::types::SchemaFile;
 
     /// Строит декодер по тексту .proto, разложенному во временный каталог.
     fn decoder_for(name: &str, text: &str, message: &str) -> (std::path::PathBuf, ProtoDecoder) {
@@ -106,11 +106,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t.proto"), text).unwrap();
 
-        let file = ProtoFile {
+        let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
         };
-        let linked = schema::parse(&dir, &[file]).unwrap();
+        let linked = linked::parse(&dir, &[file]).unwrap();
         let md = linked.message(message).unwrap();
         (dir, ProtoDecoder::new(md))
     }
@@ -198,11 +198,11 @@ mod tests {
             "#,
         )
         .unwrap();
-        let file = ProtoFile {
+        let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
         };
-        let linked = schema::parse(&dir, &[file]).unwrap();
+        let linked = linked::parse(&dir, &[file]).unwrap();
         let decoder = ProtoDecoder::new(linked.message("demo.Order").unwrap());
 
         let mut values = decoder.enum_values().to_vec();

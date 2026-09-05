@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kafka::MessageHeader;
-use crate::proto::BodyFormat;
+use crate::schema::BodyFormat;
 
 /// Запись индекса: всё про сохранённое сообщение, кроме его тела.
 ///

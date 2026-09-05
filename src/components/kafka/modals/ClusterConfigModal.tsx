@@ -7,8 +7,9 @@ import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
-import { ClusterConnectPayload, KafkaCluster, newId } from '../types';
+import { ClusterConnectPayload, KafkaCluster, newId, SchemaRegistryConfig } from '../types';
 import * as api from '../api';
+import { describeError } from '../api';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 /** Запасной список на случай, если бэкенд не ответил. GSSAPI сюда не входит:
@@ -53,8 +54,18 @@ export function ClusterConfigModal({
   const [sslCaBundlePath, setSslCaBundlePath] = useState<string>('');
   const [saslMechanism, setSaslMechanism] = useState<string>('PLAIN');
 
+  // Schema Registry. Живёт на кластере, а не на топике: реестр в кластере один.
+  const [registryUrl, setRegistryUrl] = useState<string>('');
+  const [registryUser, setRegistryUser] = useState<string>('');
+  const [registryPassword, setRegistryPassword] = useState<string>('');
+  const [registryCaPath, setRegistryCaPath] = useState<string>('');
+  /** Пароль реестра уже лежит в keychain. Пустое поле тогда означает
+   *  «оставить», а не «стереть», — как и у пароля учётки. */
+  const [registryHasPassword, setRegistryHasPassword] = useState<boolean>(false);
+
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
+  const [isTestingRegistry, setIsTestingRegistry] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [mechanisms, setMechanisms] = useState<string[]>(FALLBACK_MECHANISMS);
 
@@ -95,6 +106,11 @@ export function ClusterConfigModal({
       // Пароль из keychain сюда не тянем: форме он не нужен и незачем гонять
       // его через IPC. Пустое поле означает «оставить как есть».
       setPassword('');
+      setRegistryUrl(cluster.schema_registry?.url ?? '');
+      setRegistryUser(cluster.schema_registry?.username ?? '');
+      setRegistryCaPath(cluster.schema_registry?.ssl_ca_bundle_path ?? '');
+      setRegistryHasPassword(cluster.schema_registry?.has_password ?? false);
+      setRegistryPassword('');
     } else {
       // Reset form for create mode
       setName('');
@@ -105,6 +121,11 @@ export function ClusterConfigModal({
       setPassword('');
       setSslCaBundlePath('');
       setSaslMechanism('PLAIN');
+      setRegistryUrl('');
+      setRegistryUser('');
+      setRegistryPassword('');
+      setRegistryCaPath('');
+      setRegistryHasPassword(false);
     }
   }, [cluster, mode, open]);
 
@@ -173,6 +194,40 @@ export function ClusterConfigModal({
     }
   };
 
+  /** Настройки реестра в том виде, в каком их набрали. */
+  const buildRegistry = (): SchemaRegistryConfig => ({
+    url: registryUrl.trim(),
+    username: registryUser.trim() || null,
+    has_password: registryHasPassword,
+    ssl_ca_bundle_path: registryCaPath || null,
+  });
+
+  /**
+   * Проверяет реестр, ничего не сохраняя.
+   *
+   * Отдельная кнопка рядом с полем, а не часть общей проверки подключения:
+   * реестр — это другой хост, другая авторизация и другой TLS, и «подключение
+   * работает, а схемы не читаются» — совершенно обычный расклад, который надо
+   * уметь отличать.
+   */
+  const handleTestRegistry = async () => {
+    try {
+      setIsTestingRegistry(true);
+      const subjects = await api.testSchemaRegistry(
+        cluster?.id ?? null,
+        buildRegistry(),
+        // Пустое поле — «взять сохранённый», если он есть.
+        registryPassword || undefined,
+      );
+      toast.success(`Schema registry answered: ${subjects} subject${subjects === 1 ? '' : 's'}`);
+    } catch (e) {
+      console.error('Schema registry test failed', e);
+      toast.error(`Schema registry test failed: ${describeError(e)}`);
+    } finally {
+      setIsTestingRegistry(false);
+    }
+  };
+
   const handleSave = async () => {
     try {
       setIsSaving(true);
@@ -194,6 +249,20 @@ export function ClusterConfigModal({
           // заново после каждой опечатки в пароле.
           true,
         );
+      }
+
+      // Реестр — отдельной командой, и только после сохранения кластера: до
+      // него у новой записи ещё нет id, а именно им ключуется пароль в keychain.
+      const url = registryUrl.trim();
+      if (url) {
+        saved = await api.saveSchemaRegistry(
+          saved.id,
+          buildRegistry(),
+          registryPassword ? registryPassword : undefined,
+        );
+      } else if (cluster?.schema_registry) {
+        // Поле очистили — это «убрать реестр», а не «оставить как было».
+        saved = await api.deleteSchemaRegistry(saved.id);
       }
 
       onSaved?.(saved);
@@ -448,6 +517,118 @@ export function ClusterConfigModal({
                 </div>
               </div>
             )}
+
+            {/* Schema Registry.
+                Не в настройках топика, где раньше стояла заглушка: реестр в
+                кластере один, и вводить его для каждого топика заново значило
+                бы переписывать одно и то же по десять раз. Топику остаётся
+                выбор subject. */}
+            <div className="space-y-4 border border-edge rounded-lg p-4">
+              <div className="flex items-center justify-between">
+                <h3 className="font-mono text-brand text-sm">Schema Registry</h3>
+                <span className="font-mono text-xs text-dim">for Avro topics</span>
+              </div>
+
+              <div className="space-y-1">
+                <Label className="font-mono text-sm text-soft">URL</Label>
+                <Input
+                  value={registryUrl}
+                  onChange={(e) => setRegistryUrl(e.target.value)}
+                  placeholder="http://localhost:8081"
+                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                />
+                <p className="font-mono text-xs text-dim">
+                  Leave empty if there is none — Avro topics can also be read from local .avsc
+                  files.
+                </p>
+              </div>
+
+              {registryUrl.trim() !== '' && (
+                <>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-1">
+                      <Label className="font-mono text-sm text-soft">Username</Label>
+                      <Input
+                        value={registryUser}
+                        onChange={(e) => setRegistryUser(e.target.value)}
+                        placeholder="Optional"
+                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="font-mono text-sm text-soft">Password</Label>
+                      <Input
+                        type="password"
+                        value={registryPassword}
+                        onChange={(e) => setRegistryPassword(e.target.value)}
+                        placeholder={registryHasPassword ? 'Saved — leave empty to keep' : 'Optional'}
+                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <Label className="font-mono text-sm text-soft">CA bundle</Label>
+                    <div className="flex items-center gap-3">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                        onClick={async () => {
+                          const selected = await openDialog({
+                            title: 'Select CA bundle for the schema registry',
+                            multiple: false,
+                            filters: [
+                              { name: 'Certificates', extensions: ['crt', 'pem', 'cer'] },
+                              { name: 'All Files', extensions: ['*'] },
+                            ],
+                          });
+                          if (typeof selected === 'string') setRegistryCaPath(selected);
+                        }}
+                      >
+                        {registryCaPath ? 'Choose another file' : 'Choose file'}
+                      </Button>
+                      {registryCaPath && (
+                        <div
+                          className="text-xs text-soft truncate max-w-[260px]"
+                          title={registryCaPath}
+                        >
+                          Selected:{' '}
+                          <span className="text-slate-50">
+                            {(registryCaPath.split('\\').pop() || '').split('/').pop()}
+                          </span>
+                        </div>
+                      )}
+                      {registryCaPath && (
+                        <button
+                          type="button"
+                          onClick={() => setRegistryCaPath('')}
+                          className="font-mono text-xs text-dim hover:text-slate-50 bg-transparent border-none cursor-pointer"
+                        >
+                          clear
+                        </button>
+                      )}
+                    </div>
+                    {/* Без своего файла берётся системное хранилище — туда
+                        корпоративный CA обычно и ставят централизованно. */}
+                    <p className="font-mono text-xs text-dim">
+                      Only needed if the registry is signed by a CA the system does not trust.
+                    </p>
+                  </div>
+
+                  <Button
+                    type="button"
+                    onClick={handleTestRegistry}
+                    variant="outline"
+                    disabled={isTestingRegistry}
+                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50"
+                  >
+                    {isTestingRegistry && <Loader2 className="size-4 animate-spin" />}
+                    {isTestingRegistry ? 'Testing…' : 'Test registry'}
+                  </Button>
+                </>
+              )}
+            </div>
           </div>
         </div>
 

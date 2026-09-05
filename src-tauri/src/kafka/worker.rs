@@ -82,7 +82,7 @@ use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
 use super::types::*;
 use crate::helpers::{base_config, get_cluster_config, producer_config, PRODUCE_TIMEOUT};
-use crate::proto::ProtoDecoder;
+use crate::schema::Decoder;
 
 /// Потолок времени на одно чтение (открытие топика или "загрузить ещё").
 /// Проверяется НА ГРАНИЦЕ РАУНДА: чтение останавливается, не потеряв ни одного
@@ -450,12 +450,21 @@ pub enum Command {
     GetBody(usize, Reply<Result<FullMessage, String>>),
     /// Сообщение сырыми байтами — для архива сохранённых. См. `Worker::raw`.
     GetRaw(usize, Reply<Result<RawBody, String>>),
-    /// Чем декодировать тела открытого топика. `None` — отдавать как есть.
+    /// Чем декодировать тела открытого топика и чем — его ключи. `None` —
+    /// отдавать как есть.
+    ///
+    /// Два декодера, а не один: ключ сериализуется отдельно от тела, и схема у
+    /// него своя (см. `schema::store::key_decoder`). Приезжают вместе, потому
+    /// что относятся к одному топику и разъехаться не должны.
     ///
     /// Отдельная команда, а не поле в `OpenTopic`: выбор message в настройках
     /// топика обязан примениться сразу, а перечитывать ради этого весь топик из
     /// Kafka — значит платить квотой на чтение за смену способа показа.
-    SetDecoder(Option<Arc<ProtoDecoder>>, Reply<()>),
+    SetDecoder {
+        value: Option<Arc<Decoder>>,
+        key: Option<Arc<Decoder>>,
+        reply: Reply<()>,
+    },
     /// Положить сообщение в топик. Тело приезжает уже байтами: кодированием по
     /// схеме заведует `lib.rs`, воркер про схемы не знает.
     Produce(ProduceRecord, Reply<Result<ProduceResult, String>>),
@@ -841,7 +850,10 @@ struct Worker {
     kept_per_offset: Option<f64>,
     /// Чем декодировать тела. Ставится командой `SetDecoder` перед открытием
     /// топика и переживает `load_more`; `close_topic` его снимает.
-    decoder: Option<Arc<ProtoDecoder>>,
+    decoder: Option<Arc<Decoder>>,
+    /// Чем декодировать ключи. Приезжает той же командой и живёт по тем же
+    /// правилам; отдельно от `decoder`, потому что схема у ключа своя.
+    key_decoder: Option<Arc<Decoder>>,
 }
 
 impl Worker {
@@ -869,6 +881,7 @@ impl Worker {
             has_timestamps: false,
             kept_per_offset: None,
             decoder: None,
+            key_decoder: None,
         }
     }
 
@@ -921,8 +934,9 @@ impl Worker {
                 Command::GetRaw(index, reply) => {
                     let _ = reply.send(self.raw(index));
                 }
-                Command::SetDecoder(decoder, reply) => {
-                    self.decoder = decoder;
+                Command::SetDecoder { value, key, reply } => {
+                    self.decoder = value;
+                    self.key_decoder = key;
                     let _ = reply.send(());
                 }
                 Command::Produce(record, reply) => {
@@ -2193,6 +2207,7 @@ impl Worker {
         // Схема принадлежит топику. Оставить её — значит показать следующий
         // топик через чужой контракт, если фронт не успеет прислать свою.
         self.decoder = None;
+        self.key_decoder = None;
         // Освобождаем буфер целиком: держать сотни мегабайт, пока пользователь
         // ничего не смотрит, незачем.
         self.store.release();
@@ -2284,7 +2299,13 @@ impl Worker {
                     partition: meta.partition,
                     offset: meta.offset,
                     timestamp: meta.timestamp,
-                    key: text::preview(self.store.key(i), PREVIEW_BYTES),
+                    // Ключ — своей схемой: у avro-топика он тоже закодирован, и
+                    // сырыми байтами перед ним ехали бы длина строки и признак
+                    // union'а.
+                    key: text::preview(
+                        text::key(self.key_decoder.as_deref(), self.store.key(i)).as_bytes(),
+                        PREVIEW_BYTES,
+                    ),
                     preview: match &shown.decoded {
                         // Обрезаем уже декодированное: строке таблицы нужны
                         // первые пару сотен символов, а не всё тело.
@@ -2321,7 +2342,7 @@ impl Worker {
             partition: meta.partition,
             offset: meta.offset,
             timestamp: meta.timestamp,
-            key: text::decode(self.store.key(store_index)),
+            key: text::key(self.key_decoder.as_deref(), self.store.key(store_index)),
             binary: shown.binary,
             value: shown.value,
             value_size: value.len(),
@@ -2356,7 +2377,11 @@ impl Worker {
             partition: meta.partition,
             offset: meta.offset,
             timestamp: meta.timestamp,
-            key: text::decode(self.store.key(store_index)),
+            // Ключ и здесь через схему: в архив он уезжает уже строкой (см.
+            // `RawBody`), и уехать туда он обязан тем же, чем показан в
+            // таблице, — иначе сохранённое сообщение выглядело бы иначе, чем
+            // то, которое сохраняли.
+            key: text::key(self.key_decoder.as_deref(), self.store.key(store_index)),
             value: self.store.value(store_index).to_vec(),
             headers: self
                 .store
@@ -2407,7 +2432,7 @@ impl PreparedFilter {
         self.key.is_empty() && self.value.is_empty()
     }
 
-    fn matches(&self, key: &[u8], value: &[u8], decoder: Option<&ProtoDecoder>) -> bool {
+    fn matches(&self, key: &[u8], value: &[u8], decoder: Option<&Decoder>) -> bool {
         // Ключ ищем только по сырым байтам: он не protobuf, разбирать нечего.
         if !self.key.matches(key) {
             return false;
@@ -2436,7 +2461,7 @@ impl PreparedFilter {
 fn grow_view(
     store: &MessageStore,
     prepared: &PreparedFilter,
-    decoder: Option<&ProtoDecoder>,
+    decoder: Option<&Decoder>,
     sort: Option<SortSpec>,
     from: usize,
     view: &mut Vec<u32>,
@@ -2467,7 +2492,7 @@ fn grow_view(
 fn append_view(
     store: &MessageStore,
     prepared: &PreparedFilter,
-    decoder: Option<&ProtoDecoder>,
+    decoder: Option<&Decoder>,
     from: usize,
     view: &mut Vec<u32>,
 ) {
@@ -3034,7 +3059,7 @@ mod tests {
     fn view_of(
         store: &MessageStore,
         filter: &MessageFilter,
-        decoder: Option<&ProtoDecoder>,
+        decoder: Option<&Decoder>,
     ) -> Vec<u32> {
         let prepared = PreparedFilter::new(filter, decoder.is_some());
         let mut view = Vec::new();
@@ -3108,20 +3133,20 @@ mod tests {
     }
 
     /// Каталог схемы живёт во временном каталоге и удаляется вызывающим.
-    fn decoder_for(tag: &str) -> (std::path::PathBuf, Arc<ProtoDecoder>) {
+    fn decoder_for(tag: &str) -> (std::path::PathBuf, Arc<Decoder>) {
         let dir = std::env::temp_dir().join(format!("mikui-worker-filter-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("event.proto");
         std::fs::write(&source, FILTER_PROTO).unwrap();
-        crate::proto::store::add_files(
+        crate::schema::store::add_files(
             &dir,
             "cluster",
             "topic",
             &[source.to_string_lossy().into_owned()],
         )
         .unwrap();
-        let decoder = crate::proto::store::decoder(&dir, "cluster", "topic")
+        let decoder = crate::schema::store::decoder(&dir, "cluster", "topic")
             .unwrap()
             .unwrap();
         (dir, decoder)
