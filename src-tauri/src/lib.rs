@@ -536,6 +536,54 @@ async fn save_topic_avro_record(
     .await
 }
 
+// --- JSON-схемы топиков --------------------------------------------------------
+//
+// Тот же набор операций, что у avro, минус выбор записи: у JSON Schema корень
+// один, и выбирать не из чего.
+
+#[tauri::command]
+async fn add_json_files(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    paths: Vec<String>,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || schema::add_json_files(&app, &cluster, &topic, &paths)).await
+}
+
+#[tauri::command]
+async fn refresh_json_files(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    name: Option<String>,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || schema::refresh_json_files(&app, &cluster, &topic, name.as_deref())).await
+}
+
+#[tauri::command]
+async fn remove_json_file(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    name: String,
+) -> Result<Option<TopicSchemaView>, String> {
+    blocking(move || schema::remove_json_file(&app, &cluster, &topic, &name)).await
+}
+
+/// Привязывает топик к subject реестра. `subject` пуст — отвязать.
+#[tauri::command]
+async fn save_topic_json_subject(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    subject: Option<String>,
+    version: Option<i32>,
+) -> Result<TopicSchemaView, String> {
+    let subject = subject.filter(|s| !s.is_empty());
+    blocking(move || schema::set_json_subject(&app, &cluster, &topic, subject, version)).await
+}
+
 // --- Schema Registry ----------------------------------------------------------
 //
 // Настройки реестра живут на КЛАСТЕРЕ, а не на топике: реестр в кластере один,
@@ -679,6 +727,16 @@ fn encode_payload(
                 &request.payload,
             )
         }
+        PayloadFormat::JsonSchema => {
+            let cluster = cluster.ok_or("not connected to a cluster")?;
+            schema::encode_json(
+                app,
+                cluster,
+                &request.topic,
+                request.subject.as_deref(),
+                &request.payload,
+            )
+        }
     }
 }
 
@@ -743,6 +801,17 @@ async fn avro_message_form(
     subject: Option<String>,
 ) -> Result<MessageForm, String> {
     blocking(move || schema::avro_message_form(&app, &cluster, &topic, subject.as_deref())).await
+}
+
+/// И для JSON Schema — на тех же условиях, что и avro.
+#[tauri::command]
+async fn json_message_form(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    subject: Option<String>,
+) -> Result<MessageForm, String> {
+    blocking(move || schema::json_message_form(&app, &cluster, &topic, subject.as_deref())).await
 }
 
 /// Кладёт сообщение в топик.
@@ -886,6 +955,10 @@ pub fn run() {
             remove_avro_file,
             save_topic_avro_subject,
             save_topic_avro_record,
+            add_json_files,
+            refresh_json_files,
+            remove_json_file,
+            save_topic_json_subject,
             save_schema_registry,
             delete_schema_registry,
             test_schema_registry,
@@ -893,6 +966,7 @@ pub fn run() {
             list_subject_versions,
             proto_message_form,
             avro_message_form,
+            json_message_form,
             check_produce_payload,
             produce_message,
             list_favorites,

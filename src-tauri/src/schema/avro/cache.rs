@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::linked::Linked;
-use super::registry::{RegisteredSchema, Registry};
+use crate::schema::registry::{RegisteredSchema, Registry, SchemaKind, SubjectAnswer};
 
 const CACHE_DIR: &str = "avro-cache";
 
@@ -45,11 +45,14 @@ static FAILURES: Mutex<Option<HashMap<Key, String>>> = Mutex::new(None);
 /// Схемы, добытые по subject. Ключ — реестр и `subject@версия`.
 static SUBJECTS: Mutex<Vec<(SubjectKey, Arc<Linked>)>> = Mutex::new(Vec::new());
 
-/// Ответы на вопрос «есть ли в реестре такой subject» — под автоопределение
+/// Ответы на вопрос «что реестр держит для этого subject» — под автоопределение
 /// формата. Ключ тот же, что у схем по subject; значение — ответ и когда он
 /// получен. `None` в ответе — реестр промолчал: это НЕ «нет такого subject», и
 /// путать их нельзя.
-static KNOWN: Mutex<Option<HashMap<SubjectKey, (Instant, Option<bool>)>>> = Mutex::new(None);
+static KNOWN: Mutex<Option<HashMap<SubjectKey, Asked>>> = Mutex::new(None);
+
+/// Когда спросили и что ответили. `None` в ответе — реестр промолчал.
+type Asked = (Instant, Option<SubjectAnswer>);
 
 /// Сколько верить ответу про существование subject.
 ///
@@ -130,7 +133,9 @@ fn build(
         )?));
     }
 
-    let fetched = registry.by_id(id)?;
+    // Проверка формата теперь здесь, а не в клиенте: реестр общий на три
+    // формата, и отбраковать чужой обязан тот, кто знает, какой нужен ему.
+    let fetched = registry.by_id(id)?.expect(SchemaKind::Avro)?;
     let linked = Linked::parse_with_refs(&fetched.schema, &fetched.references)?;
     // Пишем только то, что разобралось: класть на диск текст, который мы сами
     // не смогли прочитать, — это отложить ту же ошибку до следующего запуска,
@@ -189,7 +194,7 @@ pub fn by_subject(
         return Ok(hit);
     }
 
-    let fetched = registry.by_subject(subject, version)?;
+    let fetched = registry.by_subject(subject, version)?.expect(SchemaKind::Avro)?;
     let linked = Arc::new(Linked::parse_with_refs(
         &fetched.schema,
         &fetched.references,
@@ -210,14 +215,14 @@ pub fn by_subject(
 
 // --- Автоопределение формата --------------------------------------------------
 //
-// Вопрос «держит ли реестр схему для этого топика» задаётся на КАЖДОЕ его
-// открытие, а ответ на него меняется раз в жизни контракта. Поэтому две
-// функции, а не одна: `subject_known` отвечает по памяти и не стоит ничего, а
-// `probe_subject` идёт в сеть — и вызывающий сначала спрашивает первую, потому
-// что второй нужен живой клиент, а его построение читает пароль из keychain.
+// Вопрос «что реестр держит для этого топика» задаётся на КАЖДОЕ его открытие, а
+// ответ на него меняется раз в жизни контракта. Поэтому две функции, а не одна:
+// `subject_known` отвечает по памяти и не стоит ничего, а `probe_subject` идёт в
+// сеть — и вызывающий сначала спрашивает первую, потому что второй нужен живой
+// клиент, а его построение читает пароль из keychain.
 
 /// Готовый ответ, если он ещё не протух. `None` — спрашивать заново.
-pub fn subject_known(url: &str, subject: &str) -> Option<Option<bool>> {
+pub fn subject_known(url: &str, subject: &str) -> Option<Option<SubjectAnswer>> {
     let known = KNOWN.lock().ok()?;
     let (asked, answer) = known.as_ref()?.get(&key_of(url, subject))?;
     let ttl = match answer {
@@ -231,15 +236,52 @@ pub fn subject_known(url: &str, subject: &str) -> Option<Option<bool>> {
 ///
 /// `None` — реестр не ответил. Наружу это уезжает как «не знаем», а не как
 /// «нет»: автоопределение обязано молчать там, где оно не уверено, иначе
-/// недоступный на минуту реестр превратил бы avro-топик в текстовый.
-pub fn probe_subject(registry: &Registry, url: &str, subject: &str) -> Option<bool> {
-    let answer = registry.has_subject(subject).ok();
+/// недоступный на минуту реестр превратил бы схемный топик в текстовый.
+///
+/// Спрашивается сразу СХЕМА, а не одно лишь существование subject'а: формат её
+/// виден только в ней. Заодно, если она аврошная и разбирается, она тут же
+/// оседает в кэше — тот же ответ понадобится следом, уже ради декодера, и
+/// второй поход в сеть за ним был бы платой ни за что.
+pub fn probe_subject(
+    root: Option<&Path>,
+    registry: &Registry,
+    url: &str,
+    subject: &str,
+) -> Option<SubjectAnswer> {
+    let answer = match registry.subject_latest(subject) {
+        Ok(Some(fetched)) => {
+            let kind = fetched.kind;
+            if kind == SchemaKind::Avro {
+                keep_probed(root, url, subject, &fetched);
+            }
+            Some(SubjectAnswer::Kind(kind))
+        }
+        Ok(None) => Some(SubjectAnswer::Absent),
+        // Молчание реестра — не ответ. См. `KNOWN`.
+        Err(_) => None,
+    };
     if let Ok(mut known) = KNOWN.lock() {
         known
             .get_or_insert_with(HashMap::new)
             .insert(key_of(url, subject), (Instant::now(), answer));
     }
     answer
+}
+
+/// Кладёт в кэш схему, добытую автоопределением.
+///
+/// Молча: неразбираемая схема — это причина не показать топик авро, а не повод
+/// завалить само автоопределение. О ней скажет декодер, когда за ней придут
+/// по-настоящему.
+fn keep_probed(root: Option<&Path>, url: &str, subject: &str, fetched: &RegisteredSchema) {
+    let Ok(linked) = Linked::parse_with_refs(&fetched.schema, &fetched.references) else {
+        return;
+    };
+    let linked = Arc::new(linked);
+    // Под тем же ключом, что и `by_subject` без версии, — за схемой придут
+    // именно так: закреплённой версии у автоопределённого subject'а нет.
+    memorize_subject(url, format!("{subject}@latest"), Arc::clone(&linked));
+    remember_fetched(root, url, fetched, linked);
 }
 
 fn key_of(url: &str, subject: &str) -> SubjectKey {
@@ -420,6 +462,7 @@ mod tests {
         RegisteredSchema {
             id,
             schema: SCHEMA.to_string(),
+            kind: SchemaKind::Avro,
             references: Vec::new(),
         }
     }
@@ -455,6 +498,7 @@ mod tests {
         let with_refs = RegisteredSchema {
             id: 3,
             schema: order.to_string(),
+            kind: SchemaKind::Avro,
             references: vec![money.to_string()],
         };
         write_disk(&dir.0, "http://sr:8081", 3, &with_refs);

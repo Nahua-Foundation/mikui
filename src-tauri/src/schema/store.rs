@@ -10,11 +10,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::avro::{self, AvroDecoder, Linked, Registry};
+use super::avro::{self, AvroDecoder, Linked};
 use super::decoder::Decoder;
 use super::files::{Pending, Staged};
+use super::json::{self, Compiled, JsonDecoder};
 use super::proto::{imports, linked, ProtoDecoder};
-use super::types::{AvroBinding, AvroView, BodyFormat, SchemaFile, TopicSchema, TopicSchemaView};
+use super::registry::{Registry, SchemaKind, SubjectAnswer};
+use super::types::{
+    AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, SchemaFile, TopicSchema,
+    TopicSchemaView,
+};
 use crate::config;
 use crate::config::SchemaRegistry;
 
@@ -74,6 +79,7 @@ fn is_trivial(schema: &TopicSchema) -> bool {
         && schema.message.is_none()
         && schema.format.is_none()
         && schema.avro.as_ref().is_none_or(AvroBinding::is_empty)
+        && schema.json.as_ref().is_none_or(JsonBinding::is_empty)
 }
 
 /// Запись «ничего не назначено».
@@ -91,7 +97,20 @@ fn blank(cluster: &str, topic: &str) -> TopicSchema {
         message: None,
         dir: new_dir_name(cluster, topic),
         avro: None,
+        json: None,
     }
+}
+
+/// Что реестр знает про топик сам, без единого клика пользователя.
+///
+/// Не просто subject: формат схемы виден только в ней самой, а реестр держит
+/// все три. Пока сюда ехало одно лишь имя, JSON-Schema-топик автоопределялся
+/// как avro и показывался мусором — тела к аврошному декодеру отношения не
+/// имеют.
+#[derive(Debug, Clone)]
+struct Detected {
+    subject: String,
+    kind: SchemaKind,
 }
 
 /// Формат, которым топик показывается на самом деле.
@@ -99,11 +118,18 @@ fn blank(cluster: &str, topic: &str) -> TopicSchema {
 /// Выбор пользователя сильнее автоопределения всегда, включая выбор json:
 /// «показывай как есть» — это тоже ответ, и переспрашивать реестр вопреки ему
 /// значило бы не слушать.
-fn effective_format(schema: &TopicSchema, detected: bool) -> BodyFormat {
+fn effective_format(schema: &TopicSchema, detected: Option<SchemaKind>) -> BodyFormat {
     match (schema.format, detected) {
         (Some(chosen), _) => chosen,
-        (None, true) => BodyFormat::Avro,
-        (None, false) => BodyFormat::default(),
+        (None, Some(SchemaKind::Avro)) => BodyFormat::Avro,
+        (None, Some(SchemaKind::Json)) => BodyFormat::JsonSchema,
+        // PROTOBUF формат НЕ переключает. Схему protobuf из реестра мы пока не
+        // тянем — только из локальных .proto, — и топик оказался бы переведён в
+        // формат, для которого декодера не собрать: `TopicSchema::decodes`
+        // ответит `false`, тела поедут текстом, а пользователь останется гадать,
+        // почему выбранный за него формат ничего не показывает. Честнее оставить
+        // как есть и сказать в форме настроек, что реестр держит protobuf.
+        (None, Some(SchemaKind::Protobuf)) | (None, None) => BodyFormat::default(),
     }
 }
 
@@ -135,18 +161,30 @@ pub fn view(
 
 fn describe(root: &Path, schema: &TopicSchema) -> Result<TopicSchemaView, String> {
     let detected = detected_subject(root, schema);
-    let format = effective_format(schema, detected.is_some());
-    let avro = avro_view(root, schema, detected);
+    let format = effective_format(schema, detected.as_ref().map(|d| d.kind));
+    let avro = avro_view(root, schema, detected.as_ref());
+    let json = json_view(root, schema, detected.as_ref());
+    // Формат схемы, которую реестр держит для топика САМ, — какой бы он ни был.
+    // Половинам он приезжает уже отфильтрованным по своему типу, а форме нужен
+    // сырой: только по нему она может сказать «реестр держит protobuf, загрузите
+    // .proto» — единственный случай, когда автоопределение ничего не переключает
+    // и объяснить это больше нечем.
+    let detected_kind = detected.as_ref().map(|d| d.kind.as_str().to_string());
 
     if schema.files.is_empty() {
-        return Ok(TopicSchemaView::new(schema, format, Vec::new(), None).with_avro(avro));
+        return Ok(TopicSchemaView::new(schema, format, Vec::new(), None)
+            .with_avro(avro)
+            .with_json(json)
+            .with_detected_kind(detected_kind));
     }
     let dir = dir_of(root, schema);
     Ok(match linked::linked(&dir, &schema.files) {
         Ok(linked) => TopicSchemaView::new(schema, format, linked.messages.clone(), None),
         Err(e) => TopicSchemaView::new(schema, format, Vec::new(), Some(e)),
     }
-    .with_avro(avro))
+    .with_avro(avro)
+    .with_json(json)
+    .with_detected_kind(detected_kind))
 }
 
 /// Декодер для топика, если он настроен и схема разбирается.
@@ -162,7 +200,7 @@ pub fn decoder(
     let schema = stored.unwrap_or_else(|| blank(cluster, topic));
 
     let detected = detected_subject(root, &schema);
-    let format = effective_format(&schema, detected.is_some());
+    let format = effective_format(&schema, detected.as_ref().map(|d| d.kind));
     if !schema.decodes(format) {
         return Ok(None);
     }
@@ -179,7 +217,8 @@ pub fn decoder(
         }
         BodyFormat::Avro => {
             let registry = registry_of(root, cluster);
-            let pinned = avro_linked(root, &schema, registry.as_ref(), detected.as_deref())?;
+            let detected = detected_of_kind(&detected, SchemaKind::Avro);
+            let pinned = avro_linked(root, &schema, registry.as_ref(), detected)?;
             // Ни своей схемы, ни реестра — декодировать нечем, и это не ошибка:
             // формат выбрали, а схему ещё не назначили. Тела поедут текстом.
             if pinned.is_none() && registry.is_none() {
@@ -191,8 +230,24 @@ pub fn decoder(
                 registry,
             )))))
         }
+        // Ни схемы, ни реестра этому декодеру не нужно вовсе: за
+        // confluent-заголовком лежит обычный JSON, и вся его работа — снять
+        // пять байт. Ровно из-за них такой топик и выглядел мусором. Схема у
+        // формата стоит только на пути отправки, см. `json_for_produce`.
+        BodyFormat::JsonSchema => Ok(Some(Arc::new(Decoder::Json(JsonDecoder::new())))),
         _ => Ok(None),
     }
+}
+
+/// Найденный subject, если он того формата, о котором спрашивают.
+///
+/// Реестр общий на три формата, и подсовывать аврошному декодеру subject с JSON
+/// Schema (или наоборот) значит показать правдоподобный мусор.
+fn detected_of_kind(detected: &Option<Detected>, kind: SchemaKind) -> Option<&str> {
+    detected
+        .as_ref()
+        .filter(|d| d.kind == kind)
+        .map(|d| d.subject.as_str())
 }
 
 /// Декодер КЛЮЧА топика.
@@ -219,7 +274,7 @@ pub fn key_decoder(
     let schema = stored.unwrap_or_else(|| blank(cluster, topic));
 
     let detected = detected_subject(root, &schema);
-    if effective_format(&schema, detected.is_some()) != BodyFormat::Avro {
+    if effective_format(&schema, detected.as_ref().map(|d| d.kind)) != BodyFormat::Avro {
         return Ok(None);
     }
     let Some((url, client)) = registry_of(root, cluster) else {
@@ -231,10 +286,13 @@ pub fn key_decoder(
     // где ключ и правда avro-шный. Ключ-строка от `StringSerializer` своего
     // subject'а не заводит, и декодер для него не соберётся: показывать его
     // надо как раньше, байтами.
+    // Тип проверяется и здесь: у топика с аврошным телом ключ вполне может быть
+    // зарегистрирован JSON-схемой, и разобрать его аврошным декодером значило бы
+    // поставить перед ключом пару нечитаемых знаков — ровно то, ради чего эта
+    // ветка и заводилась.
     let pinned = subject_in_registry(root, cluster, &subject_of_key(topic))
-        .and_then(|subject| {
-            avro::cache::by_subject(Some(root), &client, &url, &subject, None).ok()
-        });
+        .filter(|d| d.kind == SchemaKind::Avro)
+        .and_then(|d| avro::cache::by_subject(Some(root), &client, &url, &d.subject, None).ok());
     // Ни своей схемы, ни confluent-заголовка ждать неоткуда — собирать декодер,
     // который на каждом ключе будет отвечать «нечем», незачем. Реестр при этом
     // оставляем: ключ вполне может приехать с id в заголовке даже там, где
@@ -466,6 +524,10 @@ pub fn forget_cluster(root: &Path, cluster: &str) -> Result<(), String> {
     if let Some(url) = registry_url(root, cluster) {
         avro::cache::forget(root, &url);
     }
+    // У JSON-схем кэш только в памяти и без разбивки по реестрам: он мал,
+    // живёт до первой правки настроек и стоит копейки — заводить в нём ключ
+    // ради точечной чистки было бы дороже, чем сбросить его целиком.
+    json::cache::forget();
 
     let mut schemas = list(root)?;
     let doomed: Vec<TopicSchema> = schemas
@@ -482,6 +544,7 @@ pub fn forget_cluster(root: &Path, cluster: &str) -> Result<(), String> {
         linked::invalidate(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(avro_dir_of(root, victim));
+        let _ = std::fs::remove_dir_all(json_dir_of(root, victim));
     }
     schemas.retain(|s| s.cluster != cluster);
     save(root, &schemas)
@@ -541,31 +604,45 @@ fn subject_of_key(topic: &str) -> String {
 /// потом живой клиент: его построение читает пароль из keychain, а macOS на
 /// это может показать диалог. Топик, которому формат назначен руками, сюда не
 /// доходит вовсе — за него отвечает `effective_format`.
-fn subject_in_registry(root: &Path, cluster: &str, subject: &str) -> Option<String> {
+fn subject_in_registry(root: &Path, cluster: &str, subject: &str) -> Option<Detected> {
     let url = registry_url(root, cluster)?;
 
     let answer = match avro::cache::subject_known(&url, subject) {
         Some(answer) => answer,
         None => {
             let (_, client) = registry_of(root, cluster)?;
-            avro::cache::probe_subject(&client, &url, subject)
+            avro::cache::probe_subject(Some(root), &client, &url, subject)
         }
     };
-    // `None` — реестр промолчал. Это не «нет»: недоступный на минуту реестр не
-    // повод показать avro-топик текстом и тем более не повод запомнить это.
-    answer.unwrap_or(false).then(|| subject.to_string())
+    // Молчание реестра (`None`) и «нет такого subject» (`Absent`) ведут сюда
+    // одинаково, но по разным причинам: первое — потому что недоступный на
+    // минуту реестр не повод показать схемный топик текстом и тем более не
+    // повод это запомнить; второе — потому что схемы и правда нет.
+    match answer? {
+        SubjectAnswer::Kind(kind) => Some(Detected {
+            subject: subject.to_string(),
+            kind,
+        }),
+        SubjectAnswer::Absent => None,
+    }
 }
 
 /// То же самое, но только там, где ответ на что-то влияет.
 ///
-/// А влияет он, пока формат не выбран (он-то и решается) и у avro-топика:
-/// найденным subject'ом разбирается голый datum и строится заготовка для
-/// отправки. Топику, показанному json'ом, текстом или протобафом, реестр не
-/// нужен — и ходить в него ради никому не нужного ответа тоже. Отправка мимо
-/// этой развилки: там формат выбирают прямо в форме, и показ топика ей не указ
-/// (см. `avro_for_produce`).
-fn detected_subject(root: &Path, schema: &TopicSchema) -> Option<String> {
-    if matches!(schema.format, Some(chosen) if chosen != BodyFormat::Avro) {
+/// А влияет он, пока формат не выбран (он-то и решается) и у двух форматов,
+/// которые схему берут в реестре: найденным subject'ом разбирается голый datum
+/// и строится заготовка для отправки. Топику, показанному json'ом, текстом или
+/// протобафом, реестр не нужен — и ходить в него ради никому не нужного ответа
+/// тоже. Отправка мимо этой развилки: там формат выбирают прямо в форме, и показ
+/// топика ей не указ (см. `avro_for_produce`).
+fn detected_subject(root: &Path, schema: &TopicSchema) -> Option<Detected> {
+    let asks_registry = match schema.format {
+        // Формат не выбран — он-то автоопределением и решается.
+        None => true,
+        Some(BodyFormat::Avro) | Some(BodyFormat::JsonSchema) => true,
+        Some(_) => false,
+    };
+    if !asks_registry {
         return None;
     }
     subject_in_registry(root, &schema.cluster, &subject_of(&schema.topic))
@@ -703,7 +780,11 @@ pub fn avro_for_produce(
         // `subject_in_registry`, а не `detected_subject`: формат отправки выбран
         // прямо в форме, и то, чем топик ПОКАЗЫВАЮТ, к нему отношения не имеет
         // — положить avro в топик, который смотрят текстом, никто не запрещал.
-        (None, false) => subject_in_registry(root, cluster, &subject_of(topic)),
+        // Тип при этом обязан совпасть: догадка «в реестре есть схема» без
+        // оговорки про формат закодировала бы тело avro по JSON-схеме.
+        (None, false) => subject_in_registry(root, cluster, &subject_of(topic))
+            .filter(|d| d.kind == SchemaKind::Avro)
+            .map(|d| d.subject),
     };
 
     if let Some(subject) = subject {
@@ -712,7 +793,10 @@ pub fn avro_for_produce(
         let version = binding
             .and_then(|a| a.version.filter(|_| a.subject.as_deref() == Some(&subject)));
 
-        let fetched = client.by_subject(&subject, version)?;
+        // Выбранный руками subject тоже проверяется: пользователь мог назвать
+        // тот, что зарегистрирован protobuf'ом, и молча закодировать по нему
+        // значило бы положить в топик заведомый мусор.
+        let fetched = client.by_subject(&subject, version)?.expect(SchemaKind::Avro)?;
         let linked = Arc::new(Linked::parse_with_refs(
             &fetched.schema,
             &fetched.references,
@@ -752,7 +836,13 @@ fn avro_texts(dir: &Path, files: &[SchemaFile]) -> Result<Vec<String>, String> {
 /// такому топику есть чем декодировать (схема приедет в заголовке сообщения) и
 /// есть чем кодировать отправляемое. `None` остаётся ровно за случаем «avro тут
 /// вообще не при чём» — ни привязки, ни реестра.
-fn avro_view(root: &Path, schema: &TopicSchema, detected: Option<String>) -> Option<AvroView> {
+fn avro_view(root: &Path, schema: &TopicSchema, detected: Option<&Detected>) -> Option<AvroView> {
+    // Найденный subject показываем, только если он и правда аврошный. Реестр
+    // общий на три формата, и «нашли схему» без оговорки про её тип означало бы
+    // в аврошной форме предложить декодировать avro то, что записано JSON'ом.
+    let detected = detected
+        .filter(|d| d.kind == SchemaKind::Avro)
+        .map(|d| d.subject.clone());
     let registry = registry_url(root, &schema.cluster).is_some();
     let binding = schema.avro();
     if binding.is_none() && !registry {
@@ -1108,6 +1198,348 @@ fn base_name(source: &str) -> String {
         .unwrap_or_else(|| "schema.avsc".to_string())
 }
 
+// --- JSON Schema --------------------------------------------------------------
+//
+// Той же записью и тем же `proto.json`, что и две другие половины. Копии файлов
+// — в третьем соседнем каталоге под тем же именем `dir`.
+//
+// Половина заметно короче аврошной, и вот чего в ней нет. Выбора корневой записи
+// — у JSON Schema корень один, сама схема им и является. Разбора при загрузке
+// файла «чтобы узнать имена» — узнавать нечего. И главное: схема здесь вообще не
+// нужна для ПОКАЗА, только для отправки, поэтому её не приходится собирать при
+// каждом открытии топика.
+
+const JSON_SCHEMAS_DIR: &str = "jsonschema";
+
+fn json_dir_of(root: &Path, schema: &TopicSchema) -> PathBuf {
+    root.join(JSON_SCHEMAS_DIR).join(&schema.dir)
+}
+
+/// Тексты локальных схем из копий в каталоге.
+fn json_texts(dir: &Path, files: &[SchemaFile]) -> Result<Vec<String>, String> {
+    files
+        .iter()
+        .map(|file| {
+            let bytes = read_copy(dir, file)?;
+            String::from_utf8(bytes).map_err(|e| format!("{} is not valid UTF-8: {e}", file.name))
+        })
+        .collect()
+}
+
+/// JSON-Schema-половина того, что видит форма настроек топика.
+///
+/// Появляется на тех же условиях, что и аврошная: либо у топика есть привязка,
+/// либо у кластера настроен реестр — тогда топику есть чем проверять
+/// отправляемое, даже если руками ему не назначали ничего.
+fn json_view(root: &Path, schema: &TopicSchema, detected: Option<&Detected>) -> Option<JsonView> {
+    let registry = registry_url(root, &schema.cluster).is_some();
+    let binding = schema.json();
+    if binding.is_none() && !registry {
+        return None;
+    }
+    let files = binding.map(|b| b.files.as_slice()).unwrap_or_default();
+
+    // Схема разбирается только чтобы сказать, разбирается ли она: показывать из
+    // неё в форме нечего — ни имён записей, ни выбора корня у формата нет.
+    let error = match files.is_empty() {
+        true => None,
+        false => json_texts(&json_dir_of(root, schema), files)
+            .and_then(|texts| json_compile(&texts).map(|_| ()))
+            .err(),
+    };
+
+    Some(JsonView {
+        files: files.to_vec(),
+        subject: binding.and_then(|b| b.subject.clone()),
+        version: binding.and_then(|b| b.version),
+        registry,
+        detected: detected
+            .filter(|d| d.kind == SchemaKind::Json)
+            .map(|d| d.subject.clone()),
+        error,
+    })
+}
+
+/// Компилирует набор локальных файлов.
+///
+/// Первый файл — основная схема, остальные идут в ссылки. Порядок, а не выбор
+/// корня: у JSON Schema корневой тип один, и «какой из файлов главный» — это
+/// вопрос не к схеме, а к тому, в каком порядке их загрузили.
+fn json_compile(texts: &[String]) -> Result<Arc<Compiled>, String> {
+    let (first, rest) = texts
+        .split_first()
+        .ok_or("no JSON schema files loaded for this topic")?;
+    Compiled::parse(first, rest).map(Arc::new)
+}
+
+/// Добавляет файлы JSON-схемы к топику.
+pub fn add_json_files(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    sources: &[String],
+) -> Result<TopicSchemaView, String> {
+    if sources.is_empty() {
+        return Err("no JSON schema files selected".to_string());
+    }
+
+    let mut schemas = list(root)?;
+    let index = ensure_record(&mut schemas, cluster, topic);
+    let dir = json_dir_of(root, &schemas[index]);
+    let binding = schemas[index].json.clone().unwrap_or_default();
+
+    let mut pending = keep_existing(&dir, &binding.files)?;
+    for source in sources {
+        let bytes = std::fs::read(source).map_err(|e| format!("can't read {source}: {e}"))?;
+        let name = base_name(source);
+        // Тот же файл, добавленный повторно, — это «перечитать», а не дубликат.
+        pending.retain(|p| p.name != name);
+        pending.push(Pending {
+            name,
+            source: source.clone(),
+            bytes,
+        });
+    }
+
+    let files = commit_json(&dir, &pending)?;
+    let mut updated = binding;
+    updated.files = files;
+    // Файлы и subject — два ответа на один вопрос, как и у Avro.
+    updated.subject = None;
+    updated.version = None;
+
+    schemas[index].json = Some(updated);
+    // Успех переводит топик в JSON-SCHEMA-формат: ради этого файл и грузили.
+    schemas[index].format = Some(BodyFormat::JsonSchema);
+
+    json::cache::forget();
+    let view = describe(root, &schemas[index])?;
+    save(root, &schemas)?;
+    Ok(view)
+}
+
+/// Перечитывает файлы JSON-схемы с диска — по одному имени или все сразу.
+pub fn refresh_json_files(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    name: Option<&str>,
+) -> Result<TopicSchemaView, String> {
+    let mut schemas = list(root)?;
+    let index =
+        position(&schemas, cluster, topic).ok_or_else(|| format!("no schema for topic {topic}"))?;
+    let dir = json_dir_of(root, &schemas[index]);
+    let mut binding = schemas[index]
+        .json
+        .clone()
+        .ok_or_else(|| format!("no JSON schema files loaded for topic {topic}"))?;
+
+    if let Some(name) = name {
+        if !binding.files.iter().any(|f| f.name == name) {
+            return Err(format!("{name} is not part of this schema"));
+        }
+    }
+
+    let mut pending = Vec::with_capacity(binding.files.len());
+    for file in &binding.files {
+        let stale = name.is_none_or(|wanted| wanted == file.name);
+        let bytes = if stale {
+            std::fs::read(&file.source)
+                .map_err(|e| format!("can't re-read {}: {e}", file.source))?
+        } else {
+            read_copy(&dir, file)?
+        };
+        pending.push(Pending {
+            name: file.name.clone(),
+            source: file.source.clone(),
+            bytes,
+        });
+    }
+
+    binding.files = commit_json(&dir, &pending)?;
+    schemas[index].json = Some(binding);
+
+    json::cache::forget();
+    let view = describe(root, &schemas[index])?;
+    save(root, &schemas)?;
+    Ok(view)
+}
+
+/// Убирает один файл JSON-схемы. Оставшееся обязано по-прежнему компилироваться.
+pub fn remove_json_file(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    name: &str,
+) -> Result<Option<TopicSchemaView>, String> {
+    let mut schemas = list(root)?;
+    let Some(index) = position(&schemas, cluster, topic) else {
+        return Ok(None);
+    };
+    let dir = json_dir_of(root, &schemas[index]);
+    let Some(mut binding) = schemas[index].json.clone() else {
+        return Ok(None);
+    };
+
+    let kept: Vec<SchemaFile> = binding
+        .files
+        .iter()
+        .filter(|f| f.name != name)
+        .cloned()
+        .collect();
+    if kept.len() == binding.files.len() {
+        return Err(format!("{name} is not part of this schema"));
+    }
+
+    if kept.is_empty() {
+        // Последний файл ушёл — вместе с ним уходит каталог. Формат при этом
+        // остаётся: реестр вполне мог быть настроен, и топик продолжит
+        // читаться, а отправка — проверяться по subject.
+        let _ = std::fs::remove_dir_all(&dir);
+        binding.files.clear();
+    } else {
+        let pending = keep_existing(&dir, &kept)?;
+        binding.files = commit_json(&dir, &pending)?;
+    }
+
+    schemas[index].json = Some(binding).filter(|b| !b.is_empty());
+    if schemas[index].json.is_none() && schemas[index].format == Some(BodyFormat::JsonSchema) {
+        // Своей схемы больше нет — и выбор формата вместе с ней: то же правило,
+        // что у последнего удалённого .proto и .avsc.
+        schemas[index].format = None;
+    }
+
+    json::cache::forget();
+    let view = describe(root, &schemas[index])?;
+    if is_trivial(&schemas[index]) {
+        schemas.remove(index);
+    }
+    save(root, &schemas)?;
+    Ok(Some(view))
+}
+
+/// Привязывает топик к subject реестра. `subject: None` — отвязать.
+pub fn set_json_subject(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    subject: Option<String>,
+    version: Option<i32>,
+) -> Result<TopicSchemaView, String> {
+    let mut schemas = list(root)?;
+    let index = ensure_record(&mut schemas, cluster, topic);
+    let mut binding = schemas[index].json.clone().unwrap_or_default();
+
+    if subject.is_some() && !binding.files.is_empty() {
+        // Взаимоисключающи: выбрали реестр — локальные копии больше не при чём.
+        let _ = std::fs::remove_dir_all(json_dir_of(root, &schemas[index]));
+        binding.files.clear();
+    }
+    binding.subject = subject;
+    binding.version = version;
+
+    schemas[index].json = Some(binding).filter(|b| !b.is_empty());
+    json::cache::forget();
+
+    let view = describe(root, &schemas[index])?;
+    if is_trivial(&schemas[index]) {
+        schemas.remove(index);
+    }
+    save(root, &schemas)?;
+    Ok(view)
+}
+
+/// Складывает набор файлов, проверяет компиляцией и ставит каталог на место.
+fn commit_json(dir: &Path, pending: &[Pending]) -> Result<Vec<SchemaFile>, String> {
+    let staged = Staged::write(dir.to_path_buf(), pending)?;
+
+    let texts: Vec<String> = pending
+        .iter()
+        .map(|p| {
+            String::from_utf8(p.bytes.clone())
+                .map_err(|e| format!("{} is not valid UTF-8: {e}", p.name))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Проверка ещё во временном каталоге: неудача не должна оставить следа.
+    json_compile(&texts)?;
+
+    staged.commit()?;
+    Ok(pending
+        .iter()
+        .map(|p| SchemaFile {
+            name: p.name.clone(),
+            source: p.source.clone(),
+        })
+        .collect())
+}
+
+/// Схема для ОТПРАВКИ и id, который надо поставить в заголовок.
+///
+/// Всё то же самое, что у `avro_for_produce`, включая порядок старшинства
+/// «выбранное в форме > настройки топика > автоопределение». Отличие одно:
+/// схема нужна не чтобы закодировать тело — тело и так JSON, — а чтобы
+/// проверить его и построить заготовку.
+pub struct JsonProduceSchema {
+    pub compiled: Arc<Compiled>,
+    /// id для confluent-заголовка. `None` — схема локальная, и тело поедет без
+    /// заголовка, как его пишет обычный `JsonSerializer`.
+    pub id: Option<u32>,
+    pub subject: Option<String>,
+}
+
+pub fn json_for_produce(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    subject: Option<&str>,
+) -> Result<JsonProduceSchema, String> {
+    let schemas = list(root)?;
+    let stored = position(&schemas, cluster, topic).map(|i| schemas[i].clone());
+    let schema = stored.unwrap_or_else(|| blank(cluster, topic));
+    let binding = schema.json();
+
+    let chosen = subject
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| binding.and_then(|b| b.subject.clone()));
+    let has_files = binding.is_some_and(|b| !b.files.is_empty());
+    let subject = match (chosen, has_files) {
+        (Some(chosen), _) => Some(chosen),
+        (None, true) => None,
+        // Тип обязан совпасть: догадка «в реестре есть схема» без оговорки про
+        // формат проверяла бы JSON по avro-контракту.
+        (None, false) => subject_in_registry(root, cluster, &subject_of(topic))
+            .filter(|d| d.kind == SchemaKind::Json)
+            .map(|d| d.subject),
+    };
+
+    if let Some(subject) = subject {
+        let (url, client) =
+            registry_of(root, cluster).ok_or("no schema registry is configured for this cluster")?;
+        let version = binding.and_then(|b| b.version.filter(|_| b.subject.as_deref() == Some(&subject)));
+
+        // id приезжает вместе со схемой: спрашивать его вторым запросом значило
+        // бы ходить в реестр дважды на каждое нажатие клавиши в форме отправки.
+        let found = json::cache::by_subject(&client, &url, &subject, version)?;
+        return Ok(JsonProduceSchema {
+            compiled: found.compiled,
+            id: Some(found.id),
+            subject: Some(subject),
+        });
+    }
+
+    let files = binding.map(|b| b.files.as_slice()).unwrap_or_default();
+    let texts = json_texts(&json_dir_of(root, &schema), files)?;
+    let compiled = json_compile(&texts)
+        .map_err(|_| "pick a subject or load a JSON schema file for this topic first".to_string())?;
+    Ok(JsonProduceSchema {
+        compiled,
+        id: None,
+        subject: None,
+    })
+}
+
 // --- Общая механика ---------------------------------------------------------
 
 fn ensure_record(schemas: &mut Vec<TopicSchema>, cluster: &str, topic: &str) -> usize {
@@ -1214,6 +1646,7 @@ mod tests {
             message: message.map(str::to_string),
             dir: "d".into(),
             avro: None,
+            json: None,
         }
     }
 
@@ -1266,11 +1699,61 @@ mod tests {
     fn a_chosen_format_wins_over_detection() {
         let mut schema = schema_with(None);
         schema.format = None;
-        assert_eq!(effective_format(&schema, true), BodyFormat::Avro);
-        assert_eq!(effective_format(&schema, false), BodyFormat::Json);
+        assert_eq!(
+            effective_format(&schema, Some(SchemaKind::Avro)),
+            BodyFormat::Avro
+        );
+        assert_eq!(effective_format(&schema, None), BodyFormat::Json);
 
         schema.format = Some(BodyFormat::Json);
-        assert_eq!(effective_format(&schema, true), BodyFormat::Json);
+        assert_eq!(
+            effective_format(&schema, Some(SchemaKind::Avro)),
+            BodyFormat::Json
+        );
+    }
+
+    /// Формат схемы в реестре решает, каким форматом показывать топик. Ровно
+    /// этого различия и не было, пока автоопределение отвечало «да/нет»:
+    /// JSON-Schema-топик становился avro и показывался мусором.
+    #[test]
+    fn the_registry_kind_picks_the_format() {
+        let mut schema = schema_with(None);
+        schema.format = None;
+        assert_eq!(
+            effective_format(&schema, Some(SchemaKind::Json)),
+            BodyFormat::JsonSchema
+        );
+    }
+
+    /// PROTOBUF в реестре формат НЕ переключает: схему оттуда мы пока не тянем,
+    /// и топик оказался бы в формате, для которого нечем декодировать.
+    #[test]
+    fn a_protobuf_subject_does_not_switch_the_format_on_its_own() {
+        let mut schema = schema_with(None);
+        schema.format = None;
+        assert_eq!(
+            effective_format(&schema, Some(SchemaKind::Protobuf)),
+            BodyFormat::Json
+        );
+    }
+
+    /// Запись с одной лишь JSON-привязкой хранить надо: иначе выбранный subject
+    /// не пережил бы перезапуск.
+    #[test]
+    fn a_json_binding_alone_is_worth_storing() {
+        let mut schema = schema_with(None);
+        schema.format = None;
+        assert!(is_trivial(&schema));
+
+        schema.json = Some(JsonBinding {
+            subject: Some("orders-value".to_string()),
+            ..JsonBinding::default()
+        });
+        assert!(!is_trivial(&schema));
+
+        // Пустая привязка — это отсутствие привязки.
+        schema.json = Some(JsonBinding::default());
+        assert!(is_trivial(&schema));
     }
 
     /// Имя subject по умолчанию у любого штатного сериализатора Kafka.

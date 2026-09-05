@@ -1,18 +1,21 @@
 //! Чем превращают тело сообщения в то, что можно показать.
 //!
-//! Один тип на оба формата со схемой. Всё, что стоит по пути тела наружу —
+//! Один тип на все форматы со схемой. Всё, что стоит по пути тела наружу —
 //! `kafka::text`, буфер воркера, архив сохранённых, — держит именно его и про
-//! protobuf с Avro не знает ничего: разница между ними кончается здесь.
+//! protobuf, Avro и JSON Schema не знает ничего: разница между ними кончается
+//! здесь.
 //!
-//! Enum, а не `dyn`: вариантов два, оба известны в крейте, и виртуальный вызов
+//! Enum, а не `dyn`: вариантов три, все известны в крейте, и виртуальный вызов
 //! на каждое тело в таблице не окупается ничем.
 
 use super::avro::AvroDecoder;
+use super::json::JsonDecoder;
 use super::proto::ProtoDecoder;
 
 pub enum Decoder {
     Proto(ProtoDecoder),
     Avro(AvroDecoder),
+    Json(JsonDecoder),
 }
 
 impl Decoder {
@@ -25,6 +28,7 @@ impl Decoder {
         match self {
             Decoder::Proto(d) => d.decode(payload),
             Decoder::Avro(d) => d.decode(payload),
+            Decoder::Json(d) => d.decode(payload),
         }
     }
 
@@ -35,10 +39,16 @@ impl Decoder {
     /// сообщения, поэтому список приходится отдавать вместе с телом. Отдельным
     /// методом, а не всегда: `Vec<String>` на каждую строку таблицы не нужен
     /// никому, а зовут это только для сообщения, которое открыли.
+    ///
+    /// У JSON Schema список пуст, и это не заглушка. `enum` там — перечень
+    /// допустимых литералов (`["RUB", 1, null]`), а не именованные символы, как
+    /// в двух других форматах; красить их отдельным цветом значило бы красить
+    /// обычные строки, которым просто повезло попасть в белый список.
     pub fn decode_with_enums(&self, payload: &[u8]) -> Result<(String, Vec<String>), String> {
         match self {
             Decoder::Proto(d) => d.decode(payload).map(|json| (json, d.enum_values().to_vec())),
             Decoder::Avro(d) => d.decode_with_enums(payload),
+            Decoder::Json(d) => d.decode(payload).map(|json| (json, Vec::new())),
         }
     }
 }

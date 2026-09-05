@@ -399,8 +399,13 @@ export function newId(): string {
  *
  * `json` — исходное поведение: тело едет текстом, а форматирует его фронт.
  * `proto` и `avro` включают декодирование по схеме ещё в Rust.
+ *
+ * `jsonschema` отличается от `json` не разбором тела — тело там такой же JSON,
+ * — а тем, что перед ним стоит confluent-заголовок (Rust его снимает; раньше
+ * пять его байт ехали в UI мусором перед `{`) и что у топика есть контракт в
+ * реестре, по которому проверяется отправляемое.
  */
-export type BodyFormat = 'json' | 'text' | 'proto' | 'avro';
+export type BodyFormat = 'json' | 'text' | 'proto' | 'avro' | 'jsonschema';
 
 /** Один файл схемы, привязанный к топику: .proto или .avsc. */
 export interface SchemaFile {
@@ -450,6 +455,27 @@ export interface AvroView {
   error: string | null;
 }
 
+/**
+ * JSON-Schema-половина схемы топика.
+ *
+ * Как `AvroView` минус список записей: у JSON Schema корень один, сама схема им
+ * и является, и выбирать не из чего.
+ */
+export interface JsonView {
+  files: SchemaFile[];
+  /** Subject реестра. */
+  subject: string | null;
+  /** Версия subject. null — последняя. */
+  version: number | null;
+  /** Настроен ли у кластера реестр. */
+  registry: boolean;
+  /** Subject, который реестр держит для топика сам И который при этом
+   *  действительно JSON-схема. См. `AvroView.detected`. */
+  detected: string | null;
+  /** Схема есть, но не компилируется или не добывается. */
+  error: string | null;
+}
+
 /** Схема топика вместе с результатом её разбора. */
 export interface TopicSchema {
   cluster: string;
@@ -465,6 +491,17 @@ export interface TopicSchema {
   error: string | null;
   /** Avro-половина. null — топика она не касается. */
   avro: AvroView | null;
+  /** JSON-Schema-половина. null — топика она не касается. */
+  json: JsonView | null;
+  /**
+   * Каким форматом реестр называет схему, которую держит для топика САМ:
+   * `AVRO` / `PROTOBUF` / `JSON`. null — не держит или реестра нет.
+   *
+   * Нужно ровно ради PROTOBUF. Схему protobuf из реестра приложение пока не
+   * тянет, поэтому автоопределение на таком топике ничего не переключает — и
+   * сказать, что контракт всё-таки есть и надо загрузить .proto, больше нечем.
+   */
+  detected_kind: string | null;
 }
 
 /** Настройки Schema Registry кластера. Пароль здесь, как и у учёток, только
@@ -500,7 +537,7 @@ export function clusterKey(clusterId: string | null, clusterName: string | null)
  * отправке hex единственный способ положить в топик байты, которых не выражает
  * ни текст, ни схема.
  */
-export type PayloadFormat = 'text' | 'json' | 'proto' | 'avro' | 'hex';
+export type PayloadFormat = 'text' | 'json' | 'proto' | 'avro' | 'jsonschema' | 'hex';
 
 /** Форма отправки в том виде, в каком её заполнили. Тело — строкой: в байты
  *  его превращает Rust, потому что для proto нужна схема топика. */

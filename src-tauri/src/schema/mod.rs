@@ -14,8 +14,16 @@
 pub mod avro;
 mod decoder;
 mod files;
+pub mod json;
 pub mod proto;
+/// Клиент Schema Registry. Реестр в Confluent один на все три формата схем, и
+/// аврошного в HTTP-запросах к нему нет ничего — поэтому модуль общий, а не
+/// внутри `avro`, где он жил, пока формат со схемой в реестре был один.
+pub mod registry;
 mod types;
+/// Обёртки тела: confluent-заголовок и всё, что отличает один способ положить
+/// схему рядом с сообщением от другого. Общий на avro, protobuf и JSON Schema.
+pub mod wire;
 
 // Видно всему крейту ради `crate::favorites`: сохранённое сообщение
 // показывается той же схемой, что и открытый топик, а весь тот модуль — как и
@@ -140,6 +148,46 @@ pub fn set_avro_subject(
 /// Забывает кэш схем реестра. Зовётся, когда реестр отвязывают от кластера.
 pub fn forget_registry_cache(root: &std::path::Path, url: &str) {
     avro::cache::forget(root, url);
+    json::cache::forget();
+}
+
+// --- JSON Schema --------------------------------------------------------------
+
+pub fn add_json_files(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    sources: &[String],
+) -> Result<TopicSchemaView, String> {
+    store::add_json_files(&config::config_dir(app)?, cluster, topic, sources)
+}
+
+pub fn refresh_json_files(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    name: Option<&str>,
+) -> Result<TopicSchemaView, String> {
+    store::refresh_json_files(&config::config_dir(app)?, cluster, topic, name)
+}
+
+pub fn remove_json_file(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    name: &str,
+) -> Result<Option<TopicSchemaView>, String> {
+    store::remove_json_file(&config::config_dir(app)?, cluster, topic, name)
+}
+
+pub fn set_json_subject(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    subject: Option<String>,
+    version: Option<i32>,
+) -> Result<TopicSchemaView, String> {
+    store::set_json_subject(&config::config_dir(app)?, cluster, topic, subject, version)
 }
 
 pub fn set_avro_record(
@@ -153,7 +201,10 @@ pub fn set_avro_record(
 
 /// Клиент реестра кластера. `None` — реестр не настроен либо подключение не
 /// сохранено (у формы негде хранить настройки).
-fn registry(app: &AppHandle, cluster: &str) -> Result<(String, std::sync::Arc<avro::Registry>), String> {
+fn registry(
+    app: &AppHandle,
+    cluster: &str,
+) -> Result<(String, std::sync::Arc<registry::Registry>), String> {
     let root = config::config_dir(app)?;
     store::registry_of(&root, cluster)
         .ok_or_else(|| "no schema registry is configured for this cluster".to_string())
@@ -195,7 +246,7 @@ pub fn test_registry(
         .map(str::to_string)
         .or(stored);
 
-    let client = avro::Registry::new(
+    let client = registry::Registry::new(
         &settings.url,
         settings.username.as_deref(),
         password.as_deref(),
@@ -250,6 +301,59 @@ pub fn avro_message_form(
     })
 }
 
+/// Заготовка тела для JSON Schema.
+///
+/// `enum_values` пуст, и это не заглушка: `enum` в JSON Schema — перечень
+/// допустимых литералов, а не именованные символы, и красить их отдельным
+/// цветом значило бы красить обычные строки (см. `Decoder::decode_with_enums`).
+pub fn json_message_form(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    subject: Option<&str>,
+) -> Result<MessageForm, String> {
+    let root = config::config_dir(app)?;
+    let found = store::json_for_produce(&root, cluster, topic, subject)?;
+    Ok(MessageForm {
+        template: json::template::skeleton(found.compiled.schema()),
+        enum_values: Vec::new(),
+        subject: found.subject,
+    })
+}
+
+/// Проверяет введённое тело по JSON-схеме топика и одевает его в
+/// confluent-обёртку.
+///
+/// Отличие от двух других форматов принципиальное: кодировать тут нечего — тело
+/// уже JSON, и в топик уезжает ровно то, что набрали. Схема нужна только чтобы
+/// не дать положить в топик сообщение, которое его потребитель не прочитает; в
+/// avro и protobuf ту же роль играет сам факт успешного кодирования.
+///
+/// Заголовок ставится только у схемы из реестра. Локальная схема id не имеет, и
+/// тело уедет голым — ровно так, как его пишет обычный `JsonSerializer`.
+pub fn encode_json(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    subject: Option<&str>,
+    json: &str,
+) -> Result<Vec<u8>, String> {
+    let root = config::config_dir(app)?;
+    let found = store::json_for_produce(&root, cluster, topic, subject)?;
+
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("the body is not valid JSON: {e}"))?;
+    found.compiled.validate(&value)?;
+
+    // Отправляем НАБРАННОЕ, а не перепечатанное из `value`: пробелы и порядок
+    // ключей — это тоже тело, и менять его за пользователя незачем.
+    let body = json.as_bytes();
+    Ok(match found.id {
+        Some(id) => wire::frame(id, body),
+        None => body.to_vec(),
+    })
+}
+
 /// Кодирует введённый JSON в Avro.
 ///
 /// Схема из реестра даёт confluent-обёртку: маркер и id впереди тела — ровно
@@ -271,14 +375,10 @@ pub fn encode_avro(
         serde_json::from_str(json).map_err(|e| format!("the body is not valid JSON: {e}"))?;
     let datum = found.linked.encode(value)?;
 
-    let Some(id) = found.id else {
-        return Ok(datum);
-    };
-    let mut framed = Vec::with_capacity(datum.len() + 5);
-    framed.push(0x00);
-    framed.extend_from_slice(&id.to_be_bytes());
-    framed.extend_from_slice(&datum);
-    Ok(framed)
+    Ok(match found.id {
+        Some(id) => wire::frame(id, &datum),
+        None => datum,
+    })
 }
 
 /// Кодирует введённый JSON в protobuf по выбранному message.

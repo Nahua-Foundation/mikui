@@ -457,8 +457,13 @@ pub enum PayloadFormat {
     Text,
     Json,
     Proto,
-    /// Схем-реестра в приложении пока нет: тело уезжает текстом, как `Text`.
     Avro,
+    /// Тело — тот же JSON, что и у `Json`. Разница в двух вещах, и обе видны не
+    /// нам, а потребителю топика: тело проверяется по схеме subject'а и уезжает
+    /// в confluent-обёртке, которой штатный `KafkaJsonSchemaDeserializer` от
+    /// него и ждёт.
+    #[serde(rename = "jsonschema")]
+    JsonSchema,
     Hex,
 }
 

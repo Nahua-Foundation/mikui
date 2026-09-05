@@ -1,4 +1,4 @@
-import { Braces, ChevronDown, FileText, Settings2, Shapes, Type } from 'lucide-react';
+import { Braces, ChevronDown, FileJson, FileText, Settings2, Shapes, Type } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -12,14 +12,20 @@ const FORMATS: { value: BodyFormat; label: string; icon: typeof Braces }[] = [
   { value: 'text', label: 'text', icon: Type },
   { value: 'proto', label: 'proto', icon: FileText },
   { value: 'avro', label: 'avro', icon: Shapes },
+  { value: 'jsonschema', label: 'json schema', icon: FileJson },
 ];
 
 /**
  * Формат, которому нужна схема, — а значит и дверь в её настройки рядом с
  * селектором. Ни json, ни text ничего к себе не требуют: их видно как есть.
+ *
+ * `jsonschema` здесь тоже, хотя ПОКАЗУ схема ему не нужна: тело за
+ * confluent-заголовком читается и без неё. Дверь ему нужна ради отправки — там
+ * схема единственное, что отличает валидное сообщение от текста, который
+ * потребитель топика не прочитает.
  */
 export function needsSchema(format: BodyFormat): boolean {
-  return format === 'proto' || format === 'avro';
+  return format === 'proto' || format === 'avro' || format === 'jsonschema';
 }
 
 interface FormatSelectProps {
@@ -48,7 +54,12 @@ export function FormatSelect({ format, onChange, onOpenSchema }: FormatSelectPro
         <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
           <div className="flex flex-col items-start leading-tight">
             <span className="text-dim">format</span>
-            <span className="text-soft">{format}</span>
+            {/* Подпись из того же списка, что и пункты меню: у `jsonschema`
+                значение и подпись расходятся, и печатать здесь сырое значение
+                значило бы показывать в шапке не то, что выбрано в списке. */}
+            <span className="text-soft">
+              {FORMATS.find((f) => f.value === format)?.label ?? format}
+            </span>
           </div>
           <ChevronDown className="size-3.5 mt-0.5" />
         </DropdownMenuTrigger>

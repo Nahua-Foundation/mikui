@@ -43,14 +43,87 @@ pub struct Registry {
     agent: ureq::Agent,
 }
 
+/// Каким форматом реестр называет схему.
+///
+/// Их ровно три, и это закрытый список самого Confluent: поле `schemaType` в
+/// ответе принимает `AVRO`, `PROTOBUF` или `JSON`, причём у Avro оно
+/// отсутствует — это значение по умолчанию.
+///
+/// Различать их обязательно: разобрать JSON Schema как Avro — гарантированный
+/// мусор. Раньше клиент на не-AVRO просто возвращал ошибку; теперь тип едет
+/// наружу, и по нему же работает автоопределение формата топика.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaKind {
+    Avro,
+    Protobuf,
+    Json,
+}
+
+impl SchemaKind {
+    /// Разбирает значение `schemaType`. `None` — реестр назвал формат, которого
+    /// мы не знаем: молчаливо считать его аврошным нельзя.
+    fn parse(kind: Option<&str>) -> Option<Self> {
+        match kind {
+            // Отсутствует — Avro. Так устроен протокол, а не наша догадка.
+            None => Some(Self::Avro),
+            Some(k) if k.eq_ignore_ascii_case("AVRO") => Some(Self::Avro),
+            Some(k) if k.eq_ignore_ascii_case("PROTOBUF") => Some(Self::Protobuf),
+            Some(k) if k.eq_ignore_ascii_case("JSON") => Some(Self::Json),
+            Some(_) => None,
+        }
+    }
+
+    /// Как формат называет сам реестр — для текстов ошибок.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Avro => "AVRO",
+            Self::Protobuf => "PROTOBUF",
+            Self::Json => "JSON",
+        }
+    }
+}
+
+/// Что реестр ответил про subject — сырьё для автоопределения формата топика.
+///
+/// Отдельно от `Option<SchemaKind>` затем, что различать надо ТРИ исхода, а не
+/// два: «держит схему такого формата», «такого subject нет» и «реестр промолчал».
+/// Последний — не ответ, и запоминать его как «нет» нельзя: недоступный на
+/// минуту реестр иначе превратил бы схемный топик в текстовый до перезапуска.
+/// Молчание выражается внешним `Option`, а эти два — вариантами.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectAnswer {
+    Kind(SchemaKind),
+    Absent,
+}
+
 /// Схема, как её отдал реестр, вместе со всем, на что она ссылается.
 #[derive(Debug, Clone)]
 pub struct RegisteredSchema {
     /// Тот самый id, что едет в заголовке сообщения.
     pub id: u32,
     pub schema: String,
+    /// Каким форматом реестр её называет. Проверяет это уже вызывающий: клиент
+    /// не знает, какой формат сейчас нужен, и отбраковывать за него не должен.
+    pub kind: SchemaKind,
     /// Тексты схем, на которые ссылается эта, уже разрешённые рекурсивно.
     pub references: Vec<String>,
+}
+
+impl RegisteredSchema {
+    /// Отдаёт схему, только если она нужного формата.
+    ///
+    /// Ошибка называет оба формата: пользователь, назначивший топику avro на
+    /// реестре с JSON Schema, иначе видел бы лишь то, что «не разобралось».
+    pub fn expect(self, wanted: SchemaKind) -> Result<Self, String> {
+        if self.kind == wanted {
+            return Ok(self);
+        }
+        Err(format!(
+            "the registry says this schema is {}, not {}",
+            self.kind.as_str(),
+            wanted.as_str()
+        ))
+    }
 }
 
 impl Registry {
@@ -99,20 +172,31 @@ impl Registry {
         serde_json::from_str(&body).map_err(|e| format!("unexpected /subjects response: {e}"))
     }
 
-    /// Есть ли в реестре такой subject.
+    /// Последняя версия subject, если он вообще есть.
     ///
     /// Точечный вопрос, а не поиск по `/subjects`: спрашивают его ради
     /// автоопределения формата, то есть на каждое открытие топика, а список
     /// subject'ов корпоративного реестра — это тысячи имён в одном ответе.
     ///
-    /// `Ok(false)` — реестр ответил «нет такого», и это ответ; `Err` — не
-    /// ответил вовсе, и делать из молчания вывод «топик не avro-шный» нельзя.
-    pub fn has_subject(&self, subject: &str) -> Result<bool, String> {
-        let path = format!("/subjects/{}/versions", escape(subject));
+    /// Отдаётся схема целиком, а не одно лишь «есть/нет», потому что
+    /// автоопределению нужен ЕЁ ФОРМАТ: реестр держит и protobuf, и JSON
+    /// Schema, и решать по факту существования subject'а, что топик аврошный, —
+    /// это ровно та ошибка, из-за которой JSON-топики показывались сломанными.
+    /// Лишним запросом это не оборачивается: тот же ответ всё равно
+    /// запрашивался следом, ради самой схемы.
+    ///
+    /// `Ok(None)` — реестр ответил «нет такого», и это ответ; `Err` — не
+    /// ответил вовсе, и делать из молчания вывод о формате топика нельзя.
+    pub fn subject_latest(&self, subject: &str) -> Result<Option<RegisteredSchema>, String> {
+        let path = format!("/subjects/{}/versions/latest", escape(subject));
         let (status, body) = self.get(&path)?;
         match status {
-            200..=299 => Ok(true),
-            404 => Ok(false),
+            200..=299 => {
+                let parsed = parse_schema(&body)
+                    .map_err(|e| format!("unexpected response for subject {subject}: {e}"))?;
+                self.assemble(parsed, 0).map(Some)
+            }
+            404 => Ok(None),
             _ => Err(match registry_error(&body) {
                 Some(message) => format!("schema registry says: {message} (HTTP {status})"),
                 None => format!("schema registry answered HTTP {status} to {path}"),
@@ -160,16 +244,16 @@ impl Registry {
     /// Порядок не важен: `Schema::parse_list` разрешает перекрёстные ссылки
     /// сам, ему нужен весь набор, а не его топологическая сортировка.
     fn assemble(&self, parsed: ParsedSchema, depth: usize) -> Result<RegisteredSchema, String> {
-        if let Some(kind) = parsed.schema_type.as_deref() {
-            // Реестр общий на все форматы: в нём вполне может лежать protobuf
-            // или JSON Schema. Разбирать такое как Avro — гарантированный
-            // мусор, поэтому лучше сказать прямо.
-            if !kind.eq_ignore_ascii_case("AVRO") {
-                return Err(format!(
-                    "the registry says this schema is {kind}, not AVRO"
-                ));
-            }
-        }
+        // Реестр общий на все форматы: в нём вполне может лежать protobuf или
+        // JSON Schema. Здесь тип только запоминается — отбраковывает чужой
+        // формат вызывающий (`RegisteredSchema::expect`), потому что клиент не
+        // знает, какой формат сейчас нужен.
+        let kind = SchemaKind::parse(parsed.schema_type.as_deref()).ok_or_else(|| {
+            format!(
+                "the registry calls this schema {}, and we don't know that format",
+                parsed.schema_type.as_deref().unwrap_or("?")
+            )
+        })?;
 
         let mut references = Vec::new();
         let mut seen = HashSet::new();
@@ -178,6 +262,7 @@ impl Registry {
         Ok(RegisteredSchema {
             id: parsed.id.unwrap_or_default(),
             schema: parsed.schema,
+            kind,
             references,
         })
     }

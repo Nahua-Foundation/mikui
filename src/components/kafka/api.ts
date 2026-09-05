@@ -262,6 +262,28 @@ export const saveTopicAvroSubject = (
 export const saveTopicAvroRecord = (cluster: string, topic: string, record: string | null) =>
   invoke<TopicSchema>('save_topic_avro_record', { cluster, topic, record });
 
+// --- JSON-схемы топиков ---------------------------------------------------------
+//
+// Тот же набор, что у avro, минус выбор записи: у JSON Schema корень один.
+
+/** Добавляет файлы схемы. Набор, который не компилируется, не сохраняется. */
+export const addJsonFiles = (cluster: string, topic: string, paths: string[]) =>
+  invoke<TopicSchema>('add_json_files', { cluster, topic, paths });
+
+export const refreshJsonFiles = (cluster: string, topic: string, name?: string) =>
+  invoke<TopicSchema>('refresh_json_files', { cluster, topic, name: name ?? null });
+
+export const removeJsonFile = (cluster: string, topic: string, name: string) =>
+  invoke<TopicSchema | null>('remove_json_file', { cluster, topic, name });
+
+/** Привязывает топик к subject реестра. `null` — отвязать. */
+export const saveTopicJsonSubject = (
+  cluster: string,
+  topic: string,
+  subject: string | null,
+  version: number | null,
+) => invoke<TopicSchema>('save_topic_json_subject', { cluster, topic, subject, version });
+
 // --- Schema Registry ------------------------------------------------------------
 //
 // Настройки живут на КЛАСТЕРЕ. Пароль ведёт себя как пароли учёток: непустая
@@ -298,6 +320,10 @@ export const protoMessageForm = (cluster: string, topic: string, message: string
 /** То же для Avro. `subject` пуст — взять тот, что назначен топику. */
 export const avroMessageForm = (cluster: string, topic: string, subject: string | null) =>
   invoke<MessageForm>('avro_message_form', { cluster, topic, subject });
+
+/** И для JSON Schema — на тех же условиях. `enum_values` там всегда пуст. */
+export const jsonMessageForm = (cluster: string, topic: string, subject: string | null) =>
+  invoke<MessageForm>('json_message_form', { cluster, topic, subject });
 
 /**
  * Что показать под полем ввода тела, пока его набирают.

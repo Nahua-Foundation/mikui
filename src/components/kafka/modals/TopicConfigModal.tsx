@@ -8,6 +8,7 @@ import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Label } from '../../ui/label';
 import { AvroSchema } from '../components/AvroSchema';
+import { JsonSchemaSettings } from '../components/JsonSchemaSettings';
 import * as api from '../api';
 import { describeError } from '../api';
 import { BodyFormat, Topic, TopicSchema } from '../types';
@@ -328,6 +329,30 @@ export function TopicConfigModal({
               busy={busy}
               onApply={(action, success) => void applySchema(action, success)}
             />
+          )}
+
+          {/* JSON Schema specific fields */}
+          {format === 'jsonschema' && cluster && topicName && (
+            <JsonSchemaSettings
+              cluster={cluster}
+              topic={topicName}
+              json={schema?.json ?? null}
+              busy={busy}
+              onApply={(action, success) => void applySchema(action, success)}
+            />
+          )}
+
+          {/* Реестр держит для топика protobuf-схему, а тянуть её оттуда
+              приложение пока не умеет — только из локальных .proto. Промолчать
+              значило бы оставить пользователя гадать, почему топик со схемой
+              показывается текстом. */}
+          {schema?.detected_kind === 'PROTOBUF' && format !== 'proto' && (
+            <div className="rounded border border-edge bg-sunken p-3 font-mono text-xs text-dim">
+              The registry holds a <span className="text-soft">PROTOBUF</span> schema for this
+              topic. Loading schemas of that format from the registry is not supported yet —
+              switch the format to <span className="text-soft">proto</span> and load the .proto
+              file to decode these bodies.
+            </div>
           )}
 
           {/* Action Buttons */}

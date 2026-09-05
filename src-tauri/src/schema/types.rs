@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 /// `Json` — исходное поведение приложения: тело едет как текст, а фронт сам
 /// решает, красиво ли его печатать. `Proto` и `Avro` включают декодирование по
 /// схеме ещё в Rust, до пересечения границы IPC.
+///
+/// `JsonSchema` стоит особняком и по причине, которую стоит назвать: от `Json`
+/// он отличается НЕ разбором тела — тело там такой же JSON, — а тем, что перед
+/// ним стоит confluent-заголовок, и тем, что у топика есть контракт в реестре.
+/// Первое чинит показ (пять байт заголовка ехали в UI мусором перед `{`),
+/// второе даёт проверку при отправке. Свести их в один формат было бы нельзя:
+/// голому JSON-топику заголовок снимать не с чего, а `Json` — это ещё и
+/// осознанный выбор «показывай как есть», который обязан отменять
+/// автоопределение.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BodyFormat {
@@ -13,6 +22,8 @@ pub enum BodyFormat {
     Text,
     Proto,
     Avro,
+    #[serde(rename = "jsonschema")]
+    JsonSchema,
 }
 
 /// Откуда брать Avro-схему топика.
@@ -46,6 +57,37 @@ pub struct AvroBinding {
 }
 
 impl AvroBinding {
+    /// Пустая привязка — это отсутствие привязки, и хранить её незачем.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.subject.is_none()
+    }
+}
+
+/// Откуда брать JSON-схему топика.
+///
+/// Устроено как `AvroBinding`, и по тем же причинам: источника два, они
+/// взаимоисключающи, а пустая привязка при настроенном реестре — рабочее
+/// состояние, потому что id схемы едет в заголовке каждого сообщения.
+///
+/// Чего здесь нет по сравнению с Avro — выбора корневой записи: у JSON Schema
+/// корень один, сама схема им и является, и выбирать не из чего.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct JsonBinding {
+    /// Локальные файлы схем. Лежат в `<config>/jsonschema/<dir>` — тот же
+    /// `dir`, что у .proto и .avsc, только каталог третий.
+    #[serde(default)]
+    pub files: Vec<SchemaFile>,
+    /// Subject в реестре кластера.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// Версия subject. `None` — последняя; перечитывается при каждом обращении,
+    /// так что топик сам подхватывает новый контракт.
+    #[serde(default)]
+    pub version: Option<i32>,
+}
+
+impl JsonBinding {
     /// Пустая привязка — это отсутствие привязки, и хранить её незачем.
     pub fn is_empty(&self) -> bool {
         self.files.is_empty() && self.subject.is_none()
@@ -101,6 +143,11 @@ pub struct TopicSchema {
     /// без миграции.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avro: Option<AvroBinding>,
+    /// JSON-Schema-половина. Ровно на тех же условиях, что и `avro`: ключа нет
+    /// — топика она не касается, и `proto.json`, написанный прошлыми версиями,
+    /// читается без миграции.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<JsonBinding>,
 }
 
 impl TopicSchema {
@@ -119,12 +166,19 @@ impl TopicSchema {
         match format {
             BodyFormat::Proto => self.message.is_some() && !self.files.is_empty(),
             BodyFormat::Avro => true,
+            // JSON Schema не требует вообще ничего: снять confluent-заголовок
+            // декодер умеет и без схемы, а больше для показа ничего и не надо.
+            BodyFormat::JsonSchema => true,
             _ => false,
         }
     }
 
     pub fn avro(&self) -> Option<&AvroBinding> {
         self.avro.as_ref()
+    }
+
+    pub fn json(&self) -> Option<&JsonBinding> {
+        self.json.as_ref()
     }
 }
 
@@ -147,6 +201,36 @@ pub struct TopicSchemaView {
     pub error: Option<String>,
     /// Avro-половина. `None` — топика она не касается.
     pub avro: Option<AvroView>,
+    /// JSON-Schema-половина. `None` — топика она не касается.
+    pub json: Option<JsonView>,
+    /// Каким форматом реестр называет схему, которую держит для этого топика
+    /// САМ (`AVRO` / `PROTOBUF` / `JSON`). `None` — не держит или реестра нет.
+    ///
+    /// Отдельно от `detected` в половинах: тем приезжает уже отфильтрованное по
+    /// своему типу, а форме нужен сырой ответ. Нужен он ровно ради одного
+    /// случая — PROTOBUF. Схему protobuf из реестра приложение пока не тянет,
+    /// поэтому автоопределение на нём НИЧЕГО не переключает, и объяснить, что
+    /// контракт у топика всё-таки есть и надо загрузить .proto, больше нечем.
+    pub detected_kind: Option<String>,
+}
+
+/// JSON-Schema-половина того, что видит форма настроек топика.
+///
+/// Устроена как `AvroView` минус то, чего у формата нет: списка записей, потому
+/// что корень у схемы один.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct JsonView {
+    pub files: Vec<SchemaFile>,
+    pub subject: Option<String>,
+    pub version: Option<i32>,
+    /// Настроен ли у кластера реестр.
+    pub registry: bool,
+    /// Subject, который реестр держит для этого топика сам и который при этом
+    /// и правда JSON-схема. См. `AvroView::detected`.
+    pub detected: Option<String>,
+    /// Схема есть, но не разбирается или не добывается.
+    pub error: Option<String>,
 }
 
 /// Avro-половина того, что видит форма настроек топика.
@@ -219,6 +303,8 @@ impl TopicSchemaView {
             messages,
             error,
             avro: None,
+            json: None,
+            detected_kind: None,
         }
     }
 
@@ -227,6 +313,17 @@ impl TopicSchemaView {
     /// оттуда, где кластера под рукой нет.
     pub fn with_avro(mut self, avro: Option<AvroView>) -> Self {
         self.avro = avro;
+        self
+    }
+
+    /// То же для JSON-Schema-половины и по той же причине.
+    pub fn with_json(mut self, json: Option<JsonView>) -> Self {
+        self.json = json;
+        self
+    }
+
+    pub fn with_detected_kind(mut self, kind: Option<String>) -> Self {
+        self.detected_kind = kind;
         self
     }
 }

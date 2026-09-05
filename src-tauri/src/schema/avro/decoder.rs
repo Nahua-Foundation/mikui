@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use super::cache;
 use super::linked::Linked;
-use super::registry::Registry;
-use super::wire::{framing, Framing};
+use crate::schema::registry::Registry;
+use crate::schema::wire::{framing, Framing};
 
 pub struct AvroDecoder {
     /// Каталог настроек — под дисковый кэш схем. `None` там, где кэшу негде
