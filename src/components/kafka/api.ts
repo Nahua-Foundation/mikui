@@ -17,6 +17,7 @@ import {
   MessageFilter,
   OpenTopicProgress,
   OpenTopicResult,
+  LensSetting,
   PayloadIssue,
   ProduceRequest,
   ProduceResult,
@@ -261,6 +262,17 @@ export const saveTopicAvroSubject = (
 /** Выбирает запись из загруженных .avsc. */
 export const saveTopicAvroRecord = (cluster: string, topic: string, record: string | null) =>
   invoke<TopicSchema>('save_topic_avro_record', { cluster, topic, record });
+
+/**
+ * Сохраняет выбор линзы. `null` — вернуть распознаванию право решать.
+ *
+ * Отдельно от `saveTopicSchema`, хотя лежат они в одной записи: формат меняют
+ * в модалке и применяют кнопкой, а линзу — селектором в шапке, и она обязана
+ * примениться сразу. Воркеру о ней говорит `applyTopicSchema`, который надо
+ * позвать следом.
+ */
+export const saveTopicLens = (cluster: string, topic: string, lens: LensSetting | null) =>
+  invoke<TopicSchema>('save_topic_lens', { cluster, topic, lens });
 
 // --- JSON-схемы топиков ---------------------------------------------------------
 //

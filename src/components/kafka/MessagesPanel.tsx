@@ -1,7 +1,24 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RowPreview, SortColumn, SortDirection, SortSpec } from './types';
 import { formatTimestamp } from './format';
+import { OP_LABELS } from './lens';
 import { Virtuoso } from 'react-virtuoso';
+
+/**
+ * Цвет метки операции CDC.
+ *
+ * Не украшение: в потоке изменений глаз ищет удаления, и одинаково серые метки
+ * заставляли бы читать каждую. Вставка и удаление — по краям смысла, обновление
+ * и снапшот-чтение нейтральны.
+ */
+const OP_COLORS: Record<string, string> = {
+  c: 'text-syntax-string',
+  u: 'text-brand',
+  d: 'text-danger',
+  r: 'text-dim',
+  t: 'text-danger',
+  m: 'text-dim',
+};
 
 const COLUMNS = ['partition', 'offset', 'key', 'message', 'timestamp'] as const;
 const DEFAULT_WIDTHS = ['80px', '100px', '120px', '1fr', '190px'];
@@ -38,6 +55,18 @@ const MessageRow = memo(function MessageRow({ row, onSelect }: MessageRowProps) 
       <div className="font-mono text-soft">{row.offset}</div>
       <div className="font-mono text-soft truncate">{row.key}</div>
       <div className="font-mono text-soft truncate">
+        {/* Операция CDC. Тем же приёмом, что и метки ниже, а не отдельной
+            колонкой: колонки и их растягивание трогать ради этого не за чем, а
+            рядом с телом метке и место — она объясняет, ЧТО именно за тело
+            дальше (у удаления это прежняя строка, а не новая). */}
+        {row.lens_tag && (
+          <span
+            className={`mr-2 ${OP_COLORS[row.lens_tag] ?? 'text-soft'}`}
+            title={`Debezium: ${OP_LABELS[row.lens_tag] ?? row.lens_tag}`}
+          >
+            [{row.lens_tag}]
+          </span>
+        )}
         {/* Схема есть, но это сообщение по ней не разобралось. Метка нужна
             затем, что дальше идёт обычный текст, и без неё строка выглядела бы
             так, будто схема к топику вовсе не загружена. */}

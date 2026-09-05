@@ -1,6 +1,9 @@
 mod filter;
 mod hex;
 mod quota;
+// Видно всему крейту по той же причине, что и `text`: сохранённое сообщение
+// показывается тем же способом, что и прочитанное.
+pub(crate) mod lens;
 mod raw_consumer;
 mod store;
 mod types;

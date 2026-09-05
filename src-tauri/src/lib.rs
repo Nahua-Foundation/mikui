@@ -9,7 +9,7 @@ mod schema;
 use config::{ClusterConfig, ClusterUser, SchemaRegistry, Settings};
 use favorites::{FavoritesView, SaveFavoriteRequest, SaveFavoriteResult, SavedMessage};
 use kafka::*;
-use schema::{BodyFormat, MessageForm, TopicSchemaView};
+use schema::{BodyFormat, LensSetting, MessageForm, TopicSchemaView};
 
 /// Уводит блокирующую работу с исполнителя Tauri.
 ///
@@ -447,7 +447,7 @@ async fn apply_topic_schema(
     // схемой закреплённого subject. Оба декодера — одним заходом: у ключа
     // схема своя, но реестр и кэш общие, и второй поход обошёлся бы дороже
     // самой работы.
-    let (built, key) = {
+    let (built, key, lens) = {
         let (app, cluster, topic) = (app.clone(), cluster.clone(), topic.clone());
         blocking(move || {
             let value = schema::decoder(&app, &cluster, &topic);
@@ -455,7 +455,11 @@ async fn apply_topic_schema(
             // как ездил всегда. Ошибка тела — новость (её показывают в
             // настройках топика), ошибка ключа — нет.
             let key = schema::key_decoder(&app, &cluster, &topic).ok().flatten();
-            Ok((value, key))
+            // Линза от схемы не зависит совсем, но приезжает тем же заходом:
+            // относится она к тому же топику и разъехаться с декодерами во
+            // времени не должна.
+            let lens = schema::lens_of(&app, &cluster, &topic);
+            Ok((value, key, lens))
         })
         .await?
     };
@@ -466,6 +470,7 @@ async fn apply_topic_schema(
         .call(|reply| Command::SetDecoder {
             value: decoder,
             key,
+            lens: lens.into(),
             reply,
         })
         .await?;
@@ -534,6 +539,22 @@ async fn save_topic_avro_record(
         schema::set_avro_record(&app, &cluster, &topic, record.filter(|r| !r.is_empty()))
     })
     .await
+}
+
+/// Сохраняет выбор линзы. `lens` пуст — вернуть распознаванию право решать.
+///
+/// Отдельно от `save_topic_schema`, хотя лежат они в одной записи: формат
+/// меняют в модалке настроек и применяют кнопкой, а линзу — селектором в шапке,
+/// и она обязана примениться сразу. Воркеру о ней говорит `apply_topic_schema`,
+/// который фронт зовёт следом.
+#[tauri::command]
+async fn save_topic_lens(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    lens: Option<LensSetting>,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || schema::set_lens(&app, &cluster, &topic, lens)).await
 }
 
 // --- JSON-схемы топиков --------------------------------------------------------
@@ -949,6 +970,7 @@ pub fn run() {
             refresh_proto_files,
             remove_proto_file,
             save_topic_schema,
+            save_topic_lens,
             apply_topic_schema,
             add_avro_files,
             refresh_avro_files,

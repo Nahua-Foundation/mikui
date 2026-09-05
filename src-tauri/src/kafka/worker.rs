@@ -76,6 +76,7 @@ use rdkafka::types::RDKafkaRespErr;
 use tokio::sync::oneshot;
 
 use super::filter::Needle;
+use super::lens::{self, LensMode};
 use super::quota::{QuotaEstimate, QuotaMeter};
 use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
 use super::store::MessageStore;
@@ -463,6 +464,11 @@ pub enum Command {
     SetDecoder {
         value: Option<Arc<Decoder>>,
         key: Option<Arc<Decoder>>,
+        /// Что делать с конвертом Debezium/Connect. Приезжает вместе с
+        /// декодерами по той же причине, что и они друг с другом: линза
+        /// работает ПОВЕРХ разобранного тела, и разъехаться с тем, чем его
+        /// разбирают, не должна.
+        lens: LensMode,
         reply: Reply<()>,
     },
     /// Положить сообщение в топик. Тело приезжает уже байтами: кодированием по
@@ -854,6 +860,9 @@ struct Worker {
     /// Чем декодировать ключи. Приезжает той же командой и живёт по тем же
     /// правилам; отдельно от `decoder`, потому что схема у ключа своя.
     key_decoder: Option<Arc<Decoder>>,
+    /// Что делать с конвертом Debezium/Connect в строке таблицы. Приезжает той
+    /// же командой и живёт по тем же правилам.
+    lens: LensMode,
 }
 
 impl Worker {
@@ -882,6 +891,7 @@ impl Worker {
             kept_per_offset: None,
             decoder: None,
             key_decoder: None,
+            lens: LensMode::default(),
         }
     }
 
@@ -934,9 +944,15 @@ impl Worker {
                 Command::GetRaw(index, reply) => {
                     let _ = reply.send(self.raw(index));
                 }
-                Command::SetDecoder { value, key, reply } => {
+                Command::SetDecoder {
+                    value,
+                    key,
+                    lens,
+                    reply,
+                } => {
                     self.decoder = value;
                     self.key_decoder = key;
+                    self.lens = lens;
                     let _ = reply.send(());
                 }
                 Command::Produce(record, reply) => {
@@ -2208,6 +2224,8 @@ impl Worker {
         // топик через чужой контракт, если фронт не успеет прислать свою.
         self.decoder = None;
         self.key_decoder = None;
+        // Линза принадлежит топику ровно так же, как схема.
+        self.lens = LensMode::default();
         // Освобождаем буфер целиком: держать сотни мегабайт, пока пользователь
         // ничего не смотрит, незачем.
         self.store.release();
@@ -2294,6 +2312,14 @@ impl Worker {
                     .expect("view index out of sync with store");
                 let value = self.store.value(i);
                 let shown = text::render(self.decoder.as_deref(), value);
+                // Линза работает по УЖЕ разобранному телу: Debezium с
+                // Avro-сериализатором — обычное дело, и смотреть в сырые байты
+                // там было бы не на что.
+                let body: &[u8] = match &shown.decoded {
+                    Some(json) => json.as_bytes(),
+                    None => value,
+                };
+                let lensed = lens::apply(self.lens, body);
                 RowPreview {
                     index: start + offset_in_window,
                     partition: meta.partition,
@@ -2306,15 +2332,17 @@ impl Worker {
                         text::key(self.key_decoder.as_deref(), self.store.key(i)).as_bytes(),
                         PREVIEW_BYTES,
                     ),
-                    preview: match &shown.decoded {
-                        // Обрезаем уже декодированное: строке таблицы нужны
-                        // первые пару сотен символов, а не всё тело.
-                        Some(json) => text::preview(json.as_bytes(), PREVIEW_BYTES),
-                        None => text::preview(value, PREVIEW_BYTES),
+                    // Обрезаем уже разобранное и, если линза сработала,
+                    // снятое с конверта: строке таблицы нужны первые пару
+                    // сотен символов, а не всё тело.
+                    preview: match &lensed.preview {
+                        Some(inner) => text::preview(inner.as_bytes(), PREVIEW_BYTES),
+                        None => text::preview(body, PREVIEW_BYTES),
                     },
                     value_size: value.len(),
                     binary: shown.binary(value),
                     decode_error: shown.error,
+                    lens_tag: lensed.tag,
                 }
             })
             .collect()

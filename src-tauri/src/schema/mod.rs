@@ -35,7 +35,7 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 pub use decoder::Decoder;
-pub use types::{BodyFormat, MessageForm, TopicSchemaView};
+pub use types::{BodyFormat, LensSetting, MessageForm, TopicSchemaView};
 
 use crate::config;
 use crate::config::SchemaRegistry;
@@ -104,6 +104,21 @@ pub fn set_options(
 
 pub fn forget_cluster(app: &AppHandle, cluster: &str) -> Result<(), String> {
     store::forget_cluster(&config::config_dir(app)?, cluster)
+}
+
+/// Выбор линзы, назначенный топику. `None` — не выбирали.
+pub fn lens_of(app: &AppHandle, cluster: &str, topic: &str) -> Option<LensSetting> {
+    store::lens_of(&config::config_dir(app).ok()?, cluster, topic)
+}
+
+/// Сохраняет выбор линзы. `None` — вернуть распознаванию право решать.
+pub fn set_lens(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    lens: Option<LensSetting>,
+) -> Result<TopicSchemaView, String> {
+    store::set_lens(&config::config_dir(app)?, cluster, topic, lens)
 }
 
 // --- Avro --------------------------------------------------------------------

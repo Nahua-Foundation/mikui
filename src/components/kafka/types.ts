@@ -102,6 +102,9 @@ export interface RowPreview {
    *  В `preview` тогда обычный текст: одно битое сообщение не повод
    *  перестать показывать топик. */
   decode_error: string | null;
+  /** Метка операции CDC: `c`, `u`, `d`, `r`, `t`, `m`. Заполнена только там,
+   *  где сработала линза Debezium; у Connect-конверта операции нет. */
+  lens_tag: string | null;
 }
 
 export interface MessageHeader {
@@ -407,6 +410,18 @@ export function newId(): string {
  */
 export type BodyFormat = 'json' | 'text' | 'proto' | 'avro' | 'jsonschema';
 
+/**
+ * Что делать с конвертом Debezium / Kafka Connect.
+ *
+ * Настройка независимая от `BodyFormat`: тот отвечает на вопрос «как превратить
+ * байты в JSON», линза — «что из этого JSON показать». Debezium с
+ * Avro-сериализатором обычное дело, и линза работает поверх любого формата.
+ *
+ * `null` в схеме топика — «не выбирали»: конверт распознаётся по самому телу.
+ * `off` — это ОТВЕТ пользователя, и распознавание его не отменяет.
+ */
+export type LensSetting = 'off' | 'connect' | 'debezium';
+
 /** Один файл схемы, привязанный к топику: .proto или .avsc. */
 export interface SchemaFile {
   /** Путь внутри каталога схемы — он же имя, под которым файл виден в
@@ -493,6 +508,8 @@ export interface TopicSchema {
   avro: AvroView | null;
   /** JSON-Schema-половина. null — топика она не касается. */
   json: JsonView | null;
+  /** Выбранная линза. null — не выбирали: конверт распознаётся по телу. */
+  lens: LensSetting | null;
   /**
    * Каким форматом реестр называет схему, которую держит для топика САМ:
    * `AVRO` / `PROTOBUF` / `JSON`. null — не держит или реестра нет.

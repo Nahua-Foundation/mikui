@@ -13,6 +13,7 @@ import { Label } from '../ui/label';
 import { Checkbox } from '../ui/checkbox';
 import {
   BodyFormat,
+  LensSetting,
   Topic,
   ClusterUser,
   KafkaCluster,
@@ -26,6 +27,7 @@ import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
 import { IconAction } from './components/IconAction';
 import { FormatSelect, needsSchema } from './components/FormatSelect';
+import { LensSelect } from './components/LensSelect';
 import { ReadOrder } from './components/ReadOrder';
 
 /** Со скольки выбранных партиций перечисление перестаёт помещаться в шапку. */
@@ -59,6 +61,9 @@ interface HeaderDesktopProps {
   /** Чем показывать тела открытого топика. */
   format: BodyFormat;
   onFormatChange: (format: BodyFormat) => void;
+  /** Что делать с конвертом Debezium/Connect. null — распознавать по телу. */
+  lens: LensSetting | null;
+  onLensChange: (lens: LensSetting | null) => void;
   /** Открыть настройки схемы текущего топика. */
   onOpenSchema: () => void;
   onRefresh: () => void;
@@ -117,6 +122,8 @@ export function HeaderDesktop({
   onFiltersChange,
   format,
   onFormatChange,
+  lens,
+  onLensChange,
   onOpenSchema,
   onRefresh,
   onOpenFavorites,
@@ -356,6 +363,18 @@ export function HeaderDesktop({
                 onChange={onFormatChange}
                 onOpenSchema={onOpenSchema}
               />
+            </div>
+          </MenuItem>
+        )}
+
+        {/* Конверт. Отдельным селектором рядом с форматом, а не пунктом внутри
+            него: настройки независимые — формат решает, как превратить байты в
+            JSON, линза — что из этого JSON показать. Debezium с
+            Avro-сериализатором обычное дело, и их сочетание должно выражаться. */}
+        {topic && (
+          <MenuItem>
+            <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
+              <LensSelect lens={lens} onChange={onLensChange} />
             </div>
           </MenuItem>
         )}

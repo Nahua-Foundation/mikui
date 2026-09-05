@@ -17,7 +17,7 @@ use super::json::{self, Compiled, JsonDecoder};
 use super::proto::{imports, linked, ProtoDecoder};
 use super::registry::{Registry, SchemaKind, SubjectAnswer};
 use super::types::{
-    AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, SchemaFile, TopicSchema,
+    AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, LensSetting, SchemaFile, TopicSchema,
     TopicSchemaView,
 };
 use crate::config;
@@ -80,6 +80,9 @@ fn is_trivial(schema: &TopicSchema) -> bool {
         && schema.format.is_none()
         && schema.avro.as_ref().is_none_or(AvroBinding::is_empty)
         && schema.json.as_ref().is_none_or(JsonBinding::is_empty)
+        // Выбор линзы — тоже настройка, в том числе выбор `off`: он отменяет
+        // распознавание, а отменять его нечему, если запись не сохранить.
+        && schema.lens.is_none()
 }
 
 /// Запись «ничего не назначено».
@@ -98,6 +101,7 @@ fn blank(cluster: &str, topic: &str) -> TopicSchema {
         dir: new_dir_name(cluster, topic),
         avro: None,
         json: None,
+        lens: None,
     }
 }
 
@@ -302,6 +306,37 @@ pub fn key_decoder(
         pinned,
         Some((url, client)),
     )))))
+}
+
+/// Выбор линзы, назначенный топику. `None` — не выбирали.
+///
+/// Отдельно от `decoder`, а не полем в нём: линза работает ПОВЕРХ разобранного
+/// тела и от того, чем его разбирают, не зависит совсем. Читается тем же
+/// заходом, что и декодеры (см. `apply_topic_schema`), чтобы не разъехаться с
+/// ними во времени.
+pub fn lens_of(root: &Path, cluster: &str, topic: &str) -> Option<LensSetting> {
+    let schemas = list(root).ok()?;
+    let index = position(&schemas, cluster, topic)?;
+    schemas[index].lens
+}
+
+/// Сохраняет выбор линзы. `None` — вернуть распознаванию право решать.
+pub fn set_lens(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    lens: Option<LensSetting>,
+) -> Result<TopicSchemaView, String> {
+    let mut schemas = list(root)?;
+    let index = ensure_record(&mut schemas, cluster, topic);
+    schemas[index].lens = lens;
+
+    let view = describe(root, &schemas[index])?;
+    if is_trivial(&schemas[index]) {
+        schemas.remove(index);
+    }
+    save(root, &schemas)?;
+    Ok(view)
 }
 
 /// Descriptor одного message схемы — по имени, а не по тому, что выбрано в
@@ -1647,6 +1682,7 @@ mod tests {
             dir: "d".into(),
             avro: None,
             json: None,
+            lens: None,
         }
     }
 
@@ -1754,6 +1790,21 @@ mod tests {
         // Пустая привязка — это отсутствие привязки.
         schema.json = Some(JsonBinding::default());
         assert!(is_trivial(&schema));
+    }
+
+    /// Выбор линзы хранить надо, включая `off`: он отменяет распознавание, а
+    /// отменять его нечему, если запись не сохранить.
+    #[test]
+    fn a_lens_choice_alone_is_worth_storing() {
+        let mut schema = schema_with(None);
+        schema.format = None;
+        assert!(is_trivial(&schema));
+
+        schema.lens = Some(LensSetting::Off);
+        assert!(!is_trivial(&schema), "выбор off — тоже настройка");
+
+        schema.lens = Some(LensSetting::Debezium);
+        assert!(!is_trivial(&schema));
     }
 
     /// Имя subject по умолчанию у любого штатного сериализатора Kafka.

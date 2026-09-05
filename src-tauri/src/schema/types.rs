@@ -26,6 +26,26 @@ pub enum BodyFormat {
     JsonSchema,
 }
 
+/// Что делать с конвертом Debezium / Kafka Connect в строке таблицы.
+///
+/// Живёт рядом с `BodyFormat` и хранится там же — в записи топика, — потому что
+/// это ровно такая же настройка ПОКАЗА. Но настройка независимая: формат
+/// отвечает на вопрос «как превратить байты в JSON», линза — «что из этого JSON
+/// показать». Debezium с Avro-сериализатором обычное дело, и линза обязана
+/// работать поверх любого формата.
+///
+/// `None` в записи — «не выбирали», и тогда конверт распознаётся по самому телу
+/// (`kafka::lens`). Ровно то же правило, что у `format` с автоопределением по
+/// реестру, включая то, что `Off` — это ОТВЕТ пользователя, а не отсутствие
+/// ответа: распознавание его отменять не должно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LensSetting {
+    Off,
+    Connect,
+    Debezium,
+}
+
 /// Откуда брать Avro-схему топика.
 ///
 /// Источника два, и они взаимоисключающи: два ответа на вопрос «чем
@@ -148,6 +168,9 @@ pub struct TopicSchema {
     /// читается без миграции.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json: Option<JsonBinding>,
+    /// Выбор линзы. `None` — не выбирали, решает распознавание по телу.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens: Option<LensSetting>,
 }
 
 impl TopicSchema {
@@ -203,6 +226,8 @@ pub struct TopicSchemaView {
     pub avro: Option<AvroView>,
     /// JSON-Schema-половина. `None` — топика она не касается.
     pub json: Option<JsonView>,
+    /// Выбранная линза. `None` — не выбирали: конверт распознаётся по телу.
+    pub lens: Option<LensSetting>,
     /// Каким форматом реестр называет схему, которую держит для этого топика
     /// САМ (`AVRO` / `PROTOBUF` / `JSON`). `None` — не держит или реестра нет.
     ///
@@ -304,6 +329,7 @@ impl TopicSchemaView {
             error,
             avro: None,
             json: None,
+            lens: schema.lens,
             detected_kind: None,
         }
     }

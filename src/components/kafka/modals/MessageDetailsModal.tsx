@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useRef, useState } from 'react';
+import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '../../ui/button';
 import { Copy, Star, StarOff } from 'lucide-react';
 import { toast } from 'sonner';
@@ -6,11 +6,24 @@ import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/d
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { BodyFormat, FullMessage, MessageHeader } from '../types';
 import { formatTimestamp } from '../format';
+import { detectEnvelope } from '../lens';
+import { EnvelopeView } from '../components/EnvelopeView';
 import { highlightLine } from '../syntax';
 
 /** Потолок отрисовки. Тело на 10 МБ иначе положило бы вкладку на лопатки
  *  ещё до того, как пользователь что-то увидит. */
 const MAX_RENDERED_LINES = 2000;
+
+/** Вкладки окна. `envelope` появляется только у тела в конверте CDC/Connect. */
+type Tab = 'payload' | 'envelope' | 'headers';
+
+/** Соседняя вкладка по кругу. Список приходит аргументом: его состав зависит
+ *  от сообщения. */
+function step(current: Tab, delta: 1 | -1, tabs: Tab[]): Tab {
+  const index = tabs.indexOf(current);
+  if (index === -1) return tabs[0];
+  return tabs[(index + delta + tabs.length) % tabs.length];
+}
 
 interface MessageDetailsModalProps {
   message: FullMessage | null;
@@ -56,7 +69,36 @@ export function MessageDetailsModal({
   onNavigate,
   format = 'json',
 }: MessageDetailsModalProps) {
-  const [activeTab, setActiveTab] = useState<'payload' | 'headers'>('payload');
+  const [activeTab, setActiveTab] = useState<Tab>('payload');
+
+  /**
+   * Конверт Debezium/Connect, если тело в него завёрнуто.
+   *
+   * Разбирается только у ОТКРЫТОГО сообщения — одно тело на модалку, а не
+   * двести на окно таблицы, — поэтому здесь можно позволить себе полный разбор
+   * без всяких потолков, в отличие от превью строки (см. `kafka::lens`).
+   *
+   * `text` в счёт не идёт: у него пользователь прямо попросил показывать тело
+   * как есть, и разбирать его вопреки этому значило бы не слушать.
+   */
+  const envelope = useMemo(
+    () => (message && format !== 'text' ? detectEnvelope(message.value) : null),
+    [message, format],
+  );
+
+  /** Вкладки, которые сейчас есть. Порядок — тот же, в каком они нарисованы. */
+  const tabs: Tab[] = envelope ? ['payload', 'envelope', 'headers'] : ['payload', 'headers'];
+
+  // Вкладка принадлежит сообщению: у соседнего конверта может не быть, и
+  // остаться на исчезнувшей вкладке значило бы показать пустоту.
+  useEffect(() => {
+    if (!envelope && activeTab === 'envelope') setActiveTab('payload');
+  }, [envelope, activeTab]);
+
+  // Через ref: обработчик стрелок висит на window и пересоздаётся только при
+  // открытии модалки, а состав вкладок меняется с каждым сообщением.
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
 
   // Стрелки: вверх/вниз — соседнее сообщение, влево/вправо — вкладка.
   //
@@ -80,11 +122,13 @@ export function MessageDetailsModal({
           if (!onNavigate) return;
           onNavigate(1);
           break;
+        // По кругу, а не «влево — первая, вправо — последняя»: вкладок стало
+        // три, и средняя иначе была бы недостижима с клавиатуры.
         case 'ArrowLeft':
-          setActiveTab('payload');
+          setActiveTab((current) => step(current, -1, tabsRef.current));
           break;
         case 'ArrowRight':
-          setActiveTab('headers');
+          setActiveTab((current) => step(current, 1, tabsRef.current));
           break;
         default:
           return;
@@ -135,10 +179,13 @@ export function MessageDetailsModal({
   };
 
   const handleCopy = () => {
-    if (activeTab === 'payload') {
-      copyToClipboard(message!.value);
-    } else {
+    // С вкладки конверта копируется ПОЛНОЕ тело, а не диф: копируют, чтобы
+    // переслать или воспроизвести, а диф — представление, которого в топике
+    // никогда не было.
+    if (activeTab === 'headers') {
       copyHeadersToClipboard(message!.headers);
+    } else {
+      copyToClipboard(message!.value);
     }
   };
 
@@ -185,30 +232,28 @@ export function MessageDetailsModal({
           <div>
             <div className="flex items-center justify-between mb-4">
               <div className="flex gap-1">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className={`font-mono px-3 py-1 h-auto ${
-                    activeTab === 'payload' 
-                      ? 'bg-brand text-surface hover:bg-brand-hover' 
-                      : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
-                  }`}
-                  onClick={() => setActiveTab('payload')}
-                >
-                  payload
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className={`font-mono px-3 py-1 h-auto ${
-                    activeTab === 'headers' 
-                      ? 'bg-brand text-surface hover:bg-brand-hover' 
-                      : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
-                  }`}
-                  onClick={() => setActiveTab('headers')}
-                >
-                  headers
-                </Button>
+                {tabs.map((tab) => (
+                  <Button
+                    key={tab}
+                    variant="ghost"
+                    size="sm"
+                    title={
+                      tab === 'envelope'
+                        ? envelope?.kind === 'debezium'
+                          ? 'What this change did to the row'
+                          : 'The payload without the schema that precedes it'
+                        : undefined
+                    }
+                    className={`font-mono px-3 py-1 h-auto ${
+                      activeTab === tab
+                        ? 'bg-brand text-surface hover:bg-brand-hover'
+                        : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
+                    }`}
+                    onClick={() => setActiveTab(tab)}
+                  >
+                    {tab === 'envelope' && envelope?.kind === 'debezium' ? 'change' : tab}
+                  </Button>
+                ))}
               </div>
               <div className="flex gap-2">
                 {/* Одна кнопка на два состояния, а не «Save» рядом с
@@ -293,6 +338,8 @@ export function MessageDetailsModal({
                     )}
                   </div>
                 </div>
+              ) : activeTab === 'envelope' && envelope ? (
+                <EnvelopeView envelope={envelope} />
               ) : (
                 <div>
                   {message.headers.length > 0 ? (

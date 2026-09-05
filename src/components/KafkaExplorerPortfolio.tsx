@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   BodyFormat,
+  LensSetting,
   Topic,
   ClusterConnectPayload,
   ClusterUser,
@@ -528,6 +529,30 @@ export function KafkaExplorerPortfolio() {
     [schemaCluster, openSchema, handleSchemaChanged],
   );
 
+  /**
+   * Переключение линзы прямо из шапки.
+   *
+   * Хранится там же, где формат, и по той же причине: это свойство пары
+   * кластер-топик, уже переживающее перезапуск. Применяется тем же способом —
+   * `applyTopicSchema` переставляет линзу в воркере и обесценивает кэш окон, —
+   * то есть без единого байта по сети: буфер держит сырые байты, а конверт
+   * снимается на выдаче окна.
+   */
+  const handleLensChange = useCallback(
+    (lens: LensSetting | null) => {
+      const topic = topicRef.current;
+      if (!schemaCluster || !topic || lens === (openSchema?.lens ?? null)) return;
+      api
+        .saveTopicLens(schemaCluster, topic, lens)
+        .then((saved) => handleSchemaChanged(topic, saved))
+        .catch((e) => {
+          console.error('Failed to save the envelope lens', e);
+          toast.error(`Can't switch the envelope: ${describeError(e)}`);
+        });
+    },
+    [schemaCluster, openSchema, handleSchemaChanged],
+  );
+
   /** Настройки схемы того топика, который открыт, — из шапки. */
   const handleOpenSchemaSettings = useCallback(() => {
     if (selectedTopic) handleConfigClick(selectedTopic);
@@ -908,6 +933,8 @@ export function KafkaExplorerPortfolio() {
         onFiltersChange={setFilters}
         format={openSchema?.format ?? 'json'}
         onFormatChange={handleFormatChange}
+        lens={openSchema?.lens ?? null}
+        onLensChange={handleLensChange}
         onOpenSchema={handleOpenSchemaSettings}
         onRefresh={handleRefresh}
         onOpenFavorites={handleOpenFavorites}
