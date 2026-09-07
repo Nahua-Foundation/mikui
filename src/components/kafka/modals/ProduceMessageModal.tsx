@@ -34,9 +34,9 @@ const AUTO_PARTITION = 'auto';
 const FORMATS: { value: PayloadFormat; label: string }[] = [
   { value: 'text', label: 'text' },
   { value: 'json', label: 'json' },
+  { value: 'jsonschema', label: 'json schema' },
   { value: 'proto', label: 'proto' },
   { value: 'avro', label: 'avro' },
-  { value: 'jsonschema', label: 'json schema' },
   { value: 'hex', label: 'hex' },
 ];
 

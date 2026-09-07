@@ -8,11 +8,11 @@ import {
 import { BodyFormat } from '../types';
 
 const FORMATS: { value: BodyFormat; label: string; icon: typeof Braces }[] = [
-  { value: 'json', label: 'json', icon: Braces },
   { value: 'text', label: 'text', icon: Type },
+  { value: 'json', label: 'json', icon: Braces },
+  { value: 'jsonschema', label: 'json schema', icon: FileJson },
   { value: 'proto', label: 'proto', icon: FileText },
   { value: 'avro', label: 'avro', icon: Shapes },
-  { value: 'jsonschema', label: 'json schema', icon: FileJson },
 ];
 
 /**
