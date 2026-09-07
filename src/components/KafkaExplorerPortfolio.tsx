@@ -983,6 +983,15 @@ export function KafkaExplorerPortfolio() {
           openMessageSavedId ? () => removeFavorite(openMessageSavedId) : undefined
         }
         onNavigate={handleNavigateMessage}
+        // Топик — единственное, чего в окне не видно нигде: партиция, офсет и
+        // ключ у сообщения свои, а имя топика осталось в шапке под модалкой.
+        description={
+          selectedTopic ? (
+            <>
+              In topic <span className="text-brand">{selectedTopic.name}</span>
+            </>
+          ) : undefined
+        }
         format={openSchema?.format}
       />
 

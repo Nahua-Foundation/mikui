@@ -1,5 +1,7 @@
 //! Заготовка сообщения: JSON, в котором уже перечислены все поля выбранного
-//! message, а значения — нулевые.
+//! message, а значения — нулевые. Два исключения — поля, у которых нулевое
+//! значение заведомо бесполезно: идентификаторы (`*_id`) получают случайный
+//! UUID, enum — имя своего нулевого значения, а не пустую строку.
 //!
 //! Нужна затем, что отправить protobuf, глядя только на пустое поле ввода,
 //! нельзя: контракт живёт в .proto, а не в голове у того, кто отлаживает
@@ -106,11 +108,35 @@ fn write_value(
         // знает только отправляющий, а лишний элемент пришлось бы удалять.
         RuntimeFieldType::Repeated(_) => out.push_str("[]"),
         RuntimeFieldType::Map(_, _) => out.push_str("{}"),
-        RuntimeFieldType::Singular(t) => write_zero(&t, depth, stack, out),
+        // Имя поля идёт вниз вместе с типом: у строк от него зависит значение
+        // (см. `looks_like_id`), а по типу идентификатор от прочих строк не
+        // отличается никак.
+        RuntimeFieldType::Singular(t) => write_zero(&t, field.name(), depth, stack, out),
     }
 }
 
-fn write_zero(t: &RuntimeType, depth: usize, stack: &mut Vec<String>, out: &mut String) {
+/// Похоже ли имя поля на идентификатор, которому нулевое значение не подходит.
+///
+/// По имени, а не по типу: в схеме идентификатор — обычная строка, и ничем
+/// другим он от строки не отличается. Кроме суффиксов сюда попадают и сами
+/// `id`/`uid`/`uuid`: поле, названное так целиком, — тот же случай.
+///
+/// Регистр не учитывается: имена полей в .proto по стилю строчные, но
+/// `SCREAMING_CASE` в схемах встречается, и заготовка не должна зависеть от
+/// того, чей стиль победил в конкретном файле.
+fn looks_like_id(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(), "id" | "uid" | "uuid")
+        || ["_id", "_uid", "_uuid"].iter().any(|s| name.ends_with(s))
+}
+
+fn write_zero(
+    t: &RuntimeType,
+    name: &str,
+    depth: usize,
+    stack: &mut Vec<String>,
+    out: &mut String,
+) {
     match t {
         RuntimeType::I32 | RuntimeType::U32 => out.push('0'),
         // 64-битные целые канонический protobuf-JSON печатает СТРОКОЙ: в
@@ -120,7 +146,20 @@ fn write_zero(t: &RuntimeType, depth: usize, stack: &mut Vec<String>, out: &mut 
         RuntimeType::I64 | RuntimeType::U64 => out.push_str("\"0\""),
         RuntimeType::F32 | RuntimeType::F64 => out.push_str("0.0"),
         RuntimeType::Bool => out.push_str("false"),
+        // Идентификатор — единственное поле, для которого «значение по
+        // умолчанию» заведомо не годится: пустой `order_id` не отправляют
+        // никогда, а придумывать его руками — работа, которой видно, что она
+        // машинная. Свежий UUID здесь ещё и полезнее готового: два сообщения,
+        // отправленных подряд, не склеятся по ключу идемпотентности.
+        RuntimeType::String if looks_like_id(name) => {
+            out.push('"');
+            out.push_str(&uuid::Uuid::new_v4().to_string());
+            out.push('"');
+        }
         // bytes в JSON — base64, и пустым байтам соответствует пустая строка.
+        // Правило про идентификаторы сюда не распространяется намеренно: UUID
+        // в текстовом виде — не base64, и такую заготовку приложение отвергло
+        // бы само.
         RuntimeType::String | RuntimeType::VecU8 => out.push_str("\"\""),
         RuntimeType::Enum(e) => {
             out.push('"');
@@ -135,7 +174,7 @@ fn write_zero(t: &RuntimeType, depth: usize, stack: &mut Vec<String>, out: &mut 
             // смыслу («поля нет»), но парсер protobuf-json-mapping на месте
             // сообщения его не принимает — а заготовка, которую приложение
             // само же отвергает, бесполезна.
-            if stack.iter().any(|name| name == m.full_name()) {
+            if stack.iter().any(|seen| seen == m.full_name()) {
                 out.push_str("{}");
             } else {
                 write_message(m, depth, stack, out);
@@ -147,11 +186,14 @@ fn write_zero(t: &RuntimeType, depth: usize, stack: &mut Vec<String>, out: &mut 
 /// Имя значения, которое enum принимает по умолчанию.
 ///
 /// В proto3 это всегда значение с номером 0, но в proto2 нумерация вольная —
-/// поэтому если нуля нет, берём первое объявленное. Пустой enum синтаксис
-/// запрещает, так что запасной вариант нужен только чтобы не паниковать.
+/// поэтому если нуля нет, берём НАИМЕНЬШИЙ номер, а не первый объявленный:
+/// порядок объявления в .proto ни к чему не обязывает, а младший номер — это
+/// то, что в таком enum ближе всего по смыслу к «не указано». Пустой enum
+/// синтаксис запрещает, так что запасной вариант нужен только чтобы не
+/// паниковать.
 fn zero_value_name(e: &EnumDescriptor) -> String {
     e.value_by_number(0)
-        .or_else(|| e.values().next())
+        .or_else(|| e.values().min_by_key(|v| v.value()))
         .map(|v| v.name().to_string())
         .unwrap_or_default()
 }
@@ -248,21 +290,23 @@ mod tests {
         );
 
         let text = skeleton(&md);
-        // Заполняем одно поле, как это сделал бы пользователь: заготовка со
-        // всеми нулями доехала бы обратно ПУСТОЙ (proto3 не печатает значения
-        // по умолчанию), и такой круг ничего бы не доказал.
-        let filled = text.replace(r#""event_id": """#, r#""event_id": "a1""#);
-        assert_ne!(filled, text, "поле для заполнения не найдено:\n{text}");
+        // Круг проверяется по `event_id`: остальные поля заготовки нулевые, а
+        // proto3 значения по умолчанию не печатает — они вернулись бы пустыми,
+        // и такой круг ничего бы не доказал. Идентификатор же заполнен сам, и
+        // ровно поэтому заготовку больше не нужно править руками.
+        let ahead: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let sent = ahead["event_id"].as_str().unwrap().to_string();
+        assert!(!sent.is_empty(), "идентификатор не заполнен:\n{text}");
 
-        let parsed = protobuf_json_mapping::parse_dyn_from_str(&md, &filled)
-            .unwrap_or_else(|e| panic!("заготовка не разбирается: {e}\n{filled}"));
+        let parsed = protobuf_json_mapping::parse_dyn_from_str(&md, &text)
+            .unwrap_or_else(|e| panic!("заготовка не разбирается: {e}\n{text}"));
         let bytes = parsed.write_to_bytes_dyn().unwrap();
         let decoded = crate::schema::proto::ProtoDecoder::new(md.clone())
             .decode(&bytes)
             .unwrap();
         // Круг замкнулся: то, что уедет в топик, вернётся оттуда тем же.
         let back: serde_json::Value = serde_json::from_str(&decoded).unwrap();
-        assert_eq!(back["event_id"], "a1", "{decoded}");
+        assert_eq!(back["event_id"], sent.as_str(), "{decoded}");
 
         // Вложенное сообщение раскрыто, повторяющееся — нет.
         assert!(text.contains("\"point\": {"), "{text}");
@@ -311,6 +355,102 @@ mod tests {
         assert!(text.contains("\"text\""), "{text}");
         assert!(!text.contains("\"blob\""), "{text}");
         assert!(!text.contains("\"code\""), "{text}");
+        protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Идентификаторы узнаются по имени и заполняются каждый своим UUID.
+    #[test]
+    fn identifier_fields_get_a_fresh_uuid_each() {
+        let (dir, md) = message_of(
+            "ids",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Order {
+                    string id = 1;
+                    string order_id = 2;
+                    string client_uid = 3;
+                    string request_uuid = 4;
+                    string ID = 5;
+                    // Не идентификаторы: имя не подходит, тип не подходит,
+                    // поле повторяющееся.
+                    string identity = 6;
+                    string valid = 7;
+                    int64 sequence_id = 8;
+                    bytes trace_id = 9;
+                    repeated string tag_id = 10;
+                }
+            "#,
+            "demo.Order",
+        );
+
+        let text = skeleton(&md);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let ids = ["id", "order_id", "client_uid", "request_uuid", "ID"];
+        let mut seen = std::collections::HashSet::new();
+        for field in ids {
+            let got = value[field].as_str().unwrap();
+            uuid::Uuid::parse_str(got)
+                .unwrap_or_else(|e| panic!("{field} — не UUID: {got} ({e})"));
+            // Один UUID на все поля значил бы, что сообщение ссылается само на
+            // себя пятью разными полями, — а это почти наверняка не то, что
+            // отправляют.
+            assert!(seen.insert(got.to_string()), "{field} повторяет чужой UUID");
+        }
+
+        assert_eq!(value["identity"], "", "{text}");
+        assert_eq!(value["valid"], "", "{text}");
+        // Тип важнее имени: у 64-битного целого нулевое значение — строка
+        // `"0"`, у bytes — пустой base64, и UUID не лёг бы ни туда, ни туда.
+        assert_eq!(value["sequence_id"], "0", "{text}");
+        assert_eq!(value["trace_id"], "", "{text}");
+        assert_eq!(value["tag_id"], serde_json::json!([]), "{text}");
+
+        // Заготовка обязана оставаться отправляемой.
+        protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Заготовка одного и того же типа каждый раз новая — иначе «свежий UUID»
+    /// был бы просто константой, зашитой в первый вызов.
+    #[test]
+    fn two_skeletons_of_one_type_differ_by_their_identifiers() {
+        let (dir, md) = message_of(
+            "ids-vary",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Ref { string ref_id = 1; }
+            "#,
+            "demo.Ref",
+        );
+        assert_ne!(skeleton(&md), skeleton(&md));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Порядок объявления в .proto ни к чему не обязывает — «по умолчанию» у
+    /// enum задаёт номер.
+    #[test]
+    fn an_enum_without_a_zero_falls_back_to_its_smallest_number() {
+        let (dir, md) = message_of(
+            "enum-min",
+            r#"
+                syntax = "proto2";
+                package demo;
+                enum Direction {
+                    DIRECTION_SELL = 7;
+                    DIRECTION_UNSPECIFIED = 2;
+                    DIRECTION_BUY = 4;
+                }
+                message Trade { optional Direction direction = 1; }
+            "#,
+            "demo.Trade",
+        );
+
+        let text = skeleton(&md);
+        assert!(text.contains("\"direction\": \"DIRECTION_UNSPECIFIED\""), "{text}");
         protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }

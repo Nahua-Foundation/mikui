@@ -42,6 +42,13 @@ tokio = { version = "1", features = ["sync", "rt"] }
 keyring = { version = "4.1.6", features = ["apple-native-keyring-store"] }
 chrono = { version = "0.4.45", features = ["clock"] }
 
+# Случайные UUID для заготовок protobuf (см. `schema::proto::template`).
+#
+# Фича одна — `v4`, генератор случайных: разбирать и печатать чужие UUID нам
+# незачем, мы их только выдумываем. В графе зависимостей крейт уже был (его
+# тянет tauri), так что своих сборочных издержек эта строка не добавляет.
+uuid = { version = "1", features = ["v4"] }
+
 # Protobuf-схемы топиков.
 #
 # protobuf-parse разбирает .proto ЧИСТЫМ РУСТОМ (`Parser::pure`) — внешний

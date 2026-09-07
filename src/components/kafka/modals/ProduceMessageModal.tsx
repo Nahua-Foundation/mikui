@@ -182,8 +182,12 @@ export function ProduceMessageModal({
    * возвращал бы заготовку сразу же после того, как пользователь очистил поле
    * руками. Сбрасывается при открытии модалки: на второй заход заготовка
    * предлагается снова.
+   *
+   * Состояние, а не ref: от него зависит не только эффект, но и то, что
+   * нарисовано, — расхождение с выбранным типом видно пользователю (см.
+   * `staleTemplate`).
    */
-  const offeredFor = useRef<string | null>(null);
+  const [offeredFor, setOfferedFor] = useState<string | null>(null);
 
   // Схема через ref, а не напрямую в зависимостях сброса ниже: она приезжает
   // из состояния приложения и меняет идентичность при каждом перечитывании
@@ -205,7 +209,7 @@ export function ProduceMessageModal({
     setBusy(false);
     setMoreHeaders(false);
     setSchemaForm(null);
-    offeredFor.current = null;
+    setOfferedFor(null);
     // Тип по умолчанию — тот, которым топик читают: раз им смотрят, им скорее
     // всего и отправляют.
     setProtoMessage(current?.message ?? null);
@@ -314,7 +318,7 @@ export function ProduceMessageModal({
   /** Ставит заготовку в поле. */
   const applyTemplate = useCallback(() => {
     if (!currentForm || offerKey === null) return;
-    offeredFor.current = offerKey;
+    setOfferedFor(offerKey);
     setPayload(currentForm.template);
   }, [currentForm, offerKey]);
 
@@ -324,11 +328,26 @@ export function ProduceMessageModal({
   // подмену отвечает кнопка рядом с селектором.
   useEffect(() => {
     if (!currentForm || offerKey === null) return;
-    if (offeredFor.current === offerKey) return;
+    if (offeredFor === offerKey) return;
     if (payload !== '') return;
-    offeredFor.current = offerKey;
+    setOfferedFor(offerKey);
     setPayload(currentForm.template);
-  }, [currentForm, offerKey, payload]);
+  }, [currentForm, offerKey, offeredFor, payload]);
+
+  /**
+   * В поле лежит заготовка ДРУГОГО типа, чем выбран сейчас.
+   *
+   * Смена типа тело не трогает намеренно (см. выше), и без этой отметки
+   * получалось непонятное: пользователь выбрал другой тип, ничего не набирал,
+   * а поле сразу краснеет — ошибка честная, но причина её не в том, что он
+   * только что сделал, а в том, чего ещё не сделал. Отметка нужна, чтобы
+   * назвать причину и предложить кнопку.
+   *
+   * `currentForm` в условии: пока описание типа не приехало, заменить
+   * заготовку всё равно нечем, а предлагать неработающую ссылку нельзя.
+   */
+  const staleTemplate =
+    !!currentForm && offeredFor !== null && offerKey !== null && offeredFor !== offerKey;
 
   // Проверка тела. Талон отсекает опоздавшие ответы: печатают быстрее, чем
   // они приходят, и без него под полем оставалась бы ошибка от текста,
@@ -701,8 +720,33 @@ export function ProduceMessageModal({
                     onValueChange={setProtoMessage}
                     disabled={messages.length === 0}
                   >
-                    <SelectTrigger className="w-72 bg-surface border-edge text-slate-50 font-mono text-xs">
-                      <SelectValue placeholder="Choose a message" />
+                    {/* Три правки, и все три обязательны — имя message это
+                        одно слово с точками, переносить его негде, и без любой
+                        из них оно снова распирает вёрстку:
+
+                        `min-w-0` НА ТРИГГЕРЕ — главное. Триггер стоит
+                        flex-элементом в строке с кнопками форматов, и его
+                        автоминимум по умолчанию равен `w-72`: строка целиком
+                        в окно не влезает, сжаться триггеру нечем, и он
+                        выезжает из неё вправе вместе со стрелкой и рамкой.
+
+                        `block` на значении — вместо `flex` из shadcn.
+                        В блочной раскладке ширина обрезаемого span равна
+                        ширине значения без всяких переговоров о сжатии; во
+                        flex она зависела бы ещё и от `flex-shrink`.
+
+                        `min-w-0` на значении — оно само тоже flex-элемент,
+                        теперь уже внутри триггера, и та же история. */}
+                    <SelectTrigger
+                      className="w-72 min-w-0 bg-surface border-edge text-slate-50 font-mono text-xs *:data-[slot=select-value]:block *:data-[slot=select-value]:min-w-0"
+                      title={protoMessage ?? undefined}
+                    >
+                      <SelectValue placeholder="Choose a message">
+                        {/* Своим span-ом, а не текстом от Radix: многоточие
+                            ставится элементу, а не текстовому узлу. Полное имя
+                            остаётся доступным подсказкой на триггере. */}
+                        <span className="block truncate">{protoMessage}</span>
+                      </SelectValue>
                     </SelectTrigger>
                     <SelectContent className="bg-surface border-edge max-h-80">
                       {messages.map((name) => (
@@ -802,10 +846,33 @@ export function ProduceMessageModal({
               </div>
             )}
 
+            {/* Причина ошибки — не в теле, а в том, что оно от прежнего типа.
+                Со ссылкой, а не одним текстом: сказать «обновите заготовку» и
+                оставить искать, чем именно, значит сделать полработы — ссылка
+                делает то же самое, что кнопка `template` над полем. */}
+            {issue && staleTemplate && (
+              <div className="font-mono text-xs text-dim">
+                Just changed the template? Don't forget to{' '}
+                <button
+                  type="button"
+                  onClick={applyTemplate}
+                  title="Replace the body with a fresh template for the type you picked"
+                  className="bg-transparent border-none p-0 font-mono text-xs text-brand underline cursor-pointer"
+                >
+                  refresh
+                </button>{' '}
+                it
+              </div>
+            )}
+
             {/* Выход из тупика. Заблокировав отправку, приложение обязано
                 сказать, что делать дальше: тело, которое не ложится на схему,
-                отправить всё-таки можно — своими байтами. */}
-            {blocked && format === 'proto' && (
+                отправить всё-таки можно — своими байтами.
+
+                Пока заготовка от прежнего типа, этого совета здесь нет: он
+                предлагает смириться с телом, которое пользователь, скорее
+                всего, просто не успел обновить. */}
+            {blocked && format === 'proto' && !staleTemplate && (
               <div className="font-mono text-xs text-dim">
                 Need to send exactly this? Encode it yourself and paste the bytes as{' '}
                 <button
