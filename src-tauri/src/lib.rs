@@ -4,6 +4,7 @@ mod config;
 mod favorites;
 mod helpers;
 mod kafka;
+mod link;
 mod schema;
 
 use config::{ClusterConfig, ClusterUser, SchemaRegistry, Settings};
@@ -61,10 +62,17 @@ async fn cluster_connect(
         .call(|reply| Command::Connect(payload, reply))
         .await??;
 
+    // Чем кластер представился. Спрашиваем сразу после подключения, потому что
+    // это единственный момент, когда его можно узнать: сохранённая запись
+    // своего `cluster.id` не содержит, пока к кластеру хоть раз не подключились
+    // (см. `crate::link`), и именно из-за этого ссылка на сообщение может не
+    // открыться при полностью настроенном подключении.
+    let cluster_id = worker.call(Command::ClusterId).await?;
+
     // Подключение удалось — отмечаем кластер как недавно использованный и
     // запоминаем учётку. Не критично, поэтому ошибку записи не поднимаем наверх.
     if let Some(id) = id {
-        if let Err(e) = touch_cluster(&app, &id, user_id.as_deref()) {
+        if let Err(e) = touch_cluster(&app, &id, user_id.as_deref(), cluster_id) {
             eprintln!("can't update last_used for cluster {id}: {e}");
         }
     }
@@ -73,16 +81,26 @@ async fn cluster_connect(
 
 /// Отмечает кластер использованным и запоминает, под кем подключились: иначе
 /// выбор пользователя не пережил бы перезапуск приложения.
+///
+/// Заодно записывает `cluster.id`, которым кластер представился. Место то же по
+/// той же причине: и то, и другое известно только после успешного подключения и
+/// должно пережить перезапуск.
 fn touch_cluster(
     app: &tauri::AppHandle,
     id: &str,
     user_id: Option<&str>,
+    kafka_cluster_id: Option<String>,
 ) -> Result<(), String> {
     let mut clusters = config::load_clusters(app)?;
     let Some(cluster) = clusters.iter_mut().find(|c| c.id == id) else {
         return Ok(());
     };
     cluster.last_used = Some(chrono::Utc::now().to_rfc3339());
+    // Только если кластер его назвал: молчание — это «спросить не удалось», а
+    // не «идентификатора нет», и затирать им уже записанный нельзя.
+    if kafka_cluster_id.is_some() {
+        cluster.kafka_cluster_id = kafka_cluster_id;
+    }
     // Подключиться могли и из формы, руками введя логин, которого в списке нет
     // — такой выбор запоминать нечем и незачем.
     if let Some(user_id) = user_id.filter(|id| cluster.user(id).is_some()) {
@@ -358,9 +376,123 @@ async fn get_message_body(
     worker.call(|reply| Command::GetBody(index, reply)).await?
 }
 
+/// Где в таблице стоит сообщение с такими координатами. `None` — его нет в
+/// буфере. Нужно переходу по ссылке: она называет партицию и офсет, а таблица
+/// и тело работают по индексу строки.
+#[tauri::command]
+async fn find_message(
+    worker: tauri::State<'_, WorkerHandle>,
+    partition: i32,
+    offset: i64,
+) -> Result<Option<usize>, String> {
+    worker
+        .call(|reply| Command::FindMessage {
+            partition,
+            offset,
+            reply,
+        })
+        .await?
+}
+
 #[tauri::command]
 async fn close_topic(worker: tauri::State<'_, WorkerHandle>) -> Result<(), String> {
     worker.call(Command::CloseTopic).await
+}
+
+// --- Ссылка на сообщение ------------------------------------------------------
+//
+// Формат ссылки и её разбор живут в `crate::link` и ничего не знают ни про
+// Tauri, ни про Kafka. Здесь то, чего они знать не могут: чем мы подключены
+// прямо сейчас и какие подключения сохранены на этой машине.
+
+/// Ссылка на сообщение — то, что кладётся в буфер обмена.
+///
+/// `cluster` — ключ схем (идентификатор сохранённого подключения либо имя
+/// подключения из формы), нужен только ради подсказки о формате тела. Сам
+/// кластер в ссылке назван не им, а идентификатором, который выдал брокер:
+/// локальный ключ на чужой машине не значит ничего.
+#[tauri::command]
+async fn build_message_link(
+    app: tauri::AppHandle,
+    worker: tauri::State<'_, WorkerHandle>,
+    request: link::ShareRequest,
+) -> Result<String, String> {
+    let link::ShareRequest {
+        cluster,
+        cluster_name,
+        topic,
+        partition,
+        offset,
+        timestamp,
+    } = request;
+
+    let cluster_id = worker.call(Command::ClusterId).await?.ok_or_else(|| {
+        "this cluster does not report a cluster id, so there is nothing a link could point at"
+            .to_string()
+    })?;
+
+    // Чем отправитель читает этот топик. Схема по ссылке не едет — локальные
+    // .proto лежат у отправителя на диске, — но сказать, чего получателю не
+    // хватает, стоит ровно ничего.
+    //
+    // Сломанная или недоступная схема здесь не ошибка: не поделиться ссылкой
+    // из-за того, что реестр не отвечает, было бы куда обиднее, чем поделиться
+    // ею без подсказки.
+    let hint = match cluster {
+        Some(cluster) => {
+            let topic = topic.clone();
+            blocking(move || Ok(schema::view(&app, &cluster, &topic).ok().flatten())).await?
+        }
+        None => None,
+    };
+    let (format, type_name) = hint.map(schema_hint).unwrap_or_default();
+
+    Ok(link::MessageLink {
+        cluster_id,
+        cluster_name: cluster_name.filter(|n| !n.is_empty()),
+        topic,
+        partition,
+        offset,
+        // Отрицательное время означает, что его не выставил ни продюсер, ни
+        // брокер. Врать им в ссылке незачем — подсказки просто не будет.
+        timestamp: (timestamp > 0).then_some(timestamp),
+        format,
+        type_name,
+    }
+    .to_url())
+}
+
+/// Формат тела и имя типа внутри схемы — то, что уезжает в ссылку подсказкой.
+///
+/// Имя берётся оттуда, где оно у формата живёт: у protobuf это выбранный
+/// message, у avro — subject реестра либо запись из .avsc, у JSON Schema —
+/// subject. У `json` и `text` имени нет и быть не может: там нет схемы.
+fn schema_hint(view: TopicSchemaView) -> (Option<String>, Option<String>) {
+    let format = view.format;
+    let type_name = match format {
+        BodyFormat::Proto => view.message,
+        BodyFormat::Avro => view.avro.and_then(|a| a.subject.or(a.record)),
+        BodyFormat::JsonSchema => view.json.and_then(|j| j.subject),
+        BodyFormat::Json | BodyFormat::Text => None,
+    };
+    (Some(format.as_str().to_string()), type_name)
+}
+
+/// Куда ведёт ссылка на этой машине. Ошибка отсюда показывается человеку как
+/// есть — см. `link::no_such_connection`.
+#[tauri::command]
+async fn resolve_message_link(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<link::Target, String> {
+    blocking(move || link::resolve(&url, &config::load_clusters(&app)?)).await
+}
+
+/// Ссылка, с которой приложение запустили или которую ему передала система,
+/// пока оно уже работало. Забирается ровно один раз — см. `PendingLink`.
+#[tauri::command]
+fn take_pending_link(pending: tauri::State<'_, PendingLink>) -> Option<String> {
+    pending.take()
 }
 
 // --- Protobuf-схемы топиков --------------------------------------------------
@@ -938,11 +1070,114 @@ async fn get_favorite(app: tauri::AppHandle, id: String) -> Result<SavedMessage,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Ссылка, которую система принесла приложению.
+///
+/// Слот, а не событие, из-за холодного старта: когда по ссылке приложение
+/// ЗАПУСКАЮТ, URL приезжает раньше, чем появляется webview, — событие уходить
+/// тогда некому. Поэтому URL всегда кладётся сюда, а фронт забирает его сам:
+/// один раз при старте и потом на каждый звонок в дверь (`LINK_EVENT`).
+///
+/// Забирается ровно один раз («take»), и это важнее, чем кажется: у ссылки
+/// должен быть единственный потребитель, иначе один и тот же переход выполнялся
+/// бы дважды — событием и опросом.
+#[derive(Default)]
+struct PendingLink(std::sync::Mutex<Option<String>>);
+
+impl PendingLink {
+    fn put(&self, url: String) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(url);
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+/// Звонок в дверь: «система принесла ссылку, забери её».
+///
+/// Самого URL в событии нет намеренно — см. `PendingLink`.
+const LINK_EVENT: &str = "mikui://link";
+
+/// Показывает окно и забирает фокус.
+///
+/// Нужно на каждый переход по ссылке. Открывая `mikui://…`, система запускает
+/// приложение, но НЕ выводит его вперёд, если оно уже работало: браузер (или
+/// что там было) остаётся активным, а mikui показывает диалог перехода где-то
+/// позади, и человек ищет его сам. Приложение обязано выйти вперёд само.
+///
+/// Три шага, а не один: `set_focus` на macOS ничего не делает у свёрнутого или
+/// спрятанного окна (см. `tao`), поэтому сначала развернуть и показать.
+fn bring_to_front(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // Единственный экземпляр — и он обязан подключаться ПЕРВЫМ плагином, иначе
+    // вторая копия успеет подняться до проверки. macOS этого не требует: там
+    // система сама доставляет `mikui://…` уже запущенному приложению.
+    #[cfg(any(windows, target_os = "linux"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        // Ссылку из аргументов второй копии передаст плагину ссылок сам
+        // single-instance (фича `deep-link`), и она приедет в тот же
+        // `on_open_url`, что и на macOS, — вместе с выходом окна вперёд.
+        // Здесь то же самое ради запуска второй копии БЕЗ ссылки: человек
+        // кликнул по иконке, а мы должны показать уже работающее окно.
+        bring_to_front(app);
+    }));
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(WorkerHandle::spawn())
+        .manage(PendingLink::default())
+        .setup(|app| {
+            use tauri::{Emitter, Manager};
+            use tauri_plugin_deep_link::DeepLinkExt;
+
+            // Схему регистрирует система, а не приложение: на macOS — по
+            // Info.plist собранного бандла, на Windows и Linux — установщик.
+            // В отладочной сборке ни того, ни другого нет, поэтому под
+            // Windows и Linux регистрируем схему на себя сами. На macOS так
+            // нельзя, и проверять ссылки там приходится либо собранным
+            // бандлом, либо через «Open link…» в самом приложении.
+            #[cfg(all(debug_assertions, any(windows, target_os = "linux")))]
+            if let Err(e) = app.deep_link().register_all() {
+                eprintln!("can't register the mikui:// scheme: {e}");
+            }
+
+            // Приложение ЗАПУСТИЛИ ссылкой: URL уже здесь, и события по нему
+            // не будет.
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                if let Some(url) = urls.into_iter().next() {
+                    app.state::<PendingLink>().put(url.to_string());
+                }
+            }
+
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                // Ссылок в событии может быть несколько (так бывает, когда
+                // система отдаёт пачку). Открыть можно только одну — берём
+                // первую, а не молча делаем вид, что их не было.
+                let Some(url) = event.urls().into_iter().next() else {
+                    return;
+                };
+                handle.state::<PendingLink>().put(url.to_string());
+                let _ = handle.emit(LINK_EVENT, ());
+                bring_to_front(&handle);
+            });
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             cluster_connect,
             cluster_disconnect,
@@ -964,7 +1199,11 @@ pub fn run() {
             set_sort,
             get_window,
             get_message_body,
+            find_message,
             close_topic,
+            build_message_link,
+            resolve_message_link,
+            take_pending_link,
             get_topic_schema,
             add_proto_files,
             refresh_proto_files,

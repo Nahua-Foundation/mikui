@@ -188,6 +188,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// аутентификации: она приезжает колбэком между попытками.
 const CONNECT_PROBE_STEP: Duration = Duration::from_millis(300);
 
+/// Сколько ждать `cluster.id`. Короткий и без последствий: метаданные к этому
+/// моменту уже пришли (`wait_until_ready`), так что ответ лежит в кэше
+/// librdkafka, а неудача стоит ровно одного — ссылкой на сообщение из этого
+/// сеанса не поделиться. Задерживать ради этого подключение нельзя.
+const CLUSTER_ID_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Как часто librdkafka отдаёт статистику. Из неё измеритель квоты берёт
 /// принятые байты и наложенные брокером задержки — см. `kafka::quota`.
 const STATS_INTERVAL_MS: &str = "1000";
@@ -289,6 +295,61 @@ fn describe_bounds(cursors: &HashMap<i32, PartitionCursor>) -> String {
         .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Означает ли конец лога, что в этой партиции читать больше нечего.
+///
+/// Не всегда, и это стоило внятного бага. Читатель бежит ВПЕРЕДИ окна: он
+/// открыт один раз на всё чтение и тянет предвыборку сколько разрешает
+/// `queued.min.messages`, а окно ограничивает только то, что мы у него берём.
+/// На небольшом топике предвыборка добирается до конца лога ещё в первом же
+/// окне — и `PARTITION_EOF` приезжает тогда, когда прочитана едва двадцатая
+/// часть запрошенного диапазона.
+///
+/// Раньше EOF в режиме `oldest` объявлял партицию дочитанной безусловно.
+/// Выглядело это так: топик открывается, показывает первое окно и говорит, что
+/// это всё; сообщение по ссылке на офсет 50 «не найдено», хотя оно в топике
+/// есть. Правильный признак — где именно кончился лог: если не дальше правой
+/// границы окна, то читать и правда больше нечего.
+///
+/// В `newest` EOF не значит вообще ничего: там окна идут назад от конца, и
+/// первое же из них упирается в конец лога по построению.
+fn eof_exhausts(newest_first: bool, end_of_log: i64, window_end: i64) -> bool {
+    !newest_first && end_of_log <= window_end
+}
+
+/// Почему запрошенных офсетов в топике нет.
+///
+/// Три ответа вместо одного, и разница между ними не косметическая. «Офсета
+/// больше нет» — это retention или compaction, то есть данные были и уехали;
+/// «офсета ещё нет» — это чужой или опечатанный номер. Особенно заметно на
+/// ссылке из переписки, где пользователь номер не набирал и подсказать ему
+/// «проверьте, что ввели» бессмысленно: он ничего не вводил.
+fn describe_missing_offsets(range: &ReadRange, cursors: &HashMap<i32, PartitionCursor>) -> String {
+    let what = match (range.from_offset, range.to_offset) {
+        (Some(from), Some(to)) if from == to => format!("offset {from}"),
+        (Some(from), Some(to)) => format!("offsets {from}..{to}"),
+        (Some(from), None) => format!("offsets from {from}"),
+        (None, Some(to)) => format!("offsets up to {to}"),
+        (None, None) => "the selected offset range".to_string(),
+    };
+    let bounds = describe_bounds(cursors);
+
+    // Верхней границей проверяем «уже съели»: если даже она старше начала
+    // партиции, то и всё, что ниже, тем более.
+    let top = range.to_offset.or(range.from_offset);
+    if top.is_some_and(|top| cursors.values().all(|c| top < c.low)) {
+        return format!(
+            "{what} is no longer in the topic — retention or compaction dropped it ({bounds})"
+        );
+    }
+    // И симметрично нижней: она за концом партиции — значит таких записей ещё
+    // не существует.
+    let bottom = range.from_offset.or(range.to_offset);
+    if bottom.is_some_and(|bottom| cursors.values().all(|c| bottom >= c.high)) {
+        return format!("{what} is not in the topic yet ({bounds})");
+    }
+    format!("{what} is outside the topic ({bounds})")
 }
 
 /// Ждёт, пока кластер либо ответит метаданными, либо откажет так, что ждать
@@ -428,6 +489,15 @@ pub enum Command {
     Connect(ClusterConnectPayload, Reply<Result<(), String>>),
     Test(ClusterConnectPayload, Reply<Result<(), String>>),
     Disconnect(Reply<()>),
+    /// Чем кластер представился при подключении (`cluster.id` из метаданных).
+    /// `None` — не подключены либо кластер идентификатора не назвал.
+    ///
+    /// Отдельной командой, а не полем в ответе `Connect`: спрашивают его в
+    /// момент, когда делятся ссылкой, то есть спустя произвольное время после
+    /// подключения, и хранить его на фронте значило бы завести второй ответ на
+    /// вопрос «к чему мы подключены» — расходящийся с первым при каждой смене
+    /// учётки.
+    ClusterId(Reply<Option<String>>),
     ListTopics(Reply<Result<Vec<TopicInfo>, String>>),
     /// Устройство и настройки одного топика. Спрашивается по клику в списке и
     /// к чтению отношения не имеет — открытый топик от неё не меняется.
@@ -449,6 +519,18 @@ pub enum Command {
         reply: Reply<Result<Vec<RowPreview>, String>>,
     },
     GetBody(usize, Reply<Result<FullMessage, String>>),
+    /// Где в таблице стоит сообщение с такими координатами. `None` — в буфере
+    /// его нет: не вычитали, либо отфильтровали.
+    ///
+    /// Нужна ссылке на сообщение: она называет партицию и офсет, а тело
+    /// отдаётся по индексу строки — как и всё остальное, что показывает
+    /// таблица. Считать этот индекс на фронте нечем, там нет ни буфера, ни
+    /// текущего фильтра.
+    FindMessage {
+        partition: i32,
+        offset: i64,
+        reply: Reply<Result<Option<usize>, String>>,
+    },
     /// Сообщение сырыми байтами — для архива сохранённых. См. `Worker::raw`.
     GetRaw(usize, Reply<Result<RawBody, String>>),
     /// Чем декодировать тела открытого топика и чем — его ключи. `None` —
@@ -583,8 +665,12 @@ impl PartitionCursor {
     /// сюда попадать не должно — см. `Worker::abort_round`.
     fn advance(&mut self, newest_first: bool, window: &RoundPartition) {
         self.absorbed += window.absorbed;
-        // Окно вычитано целиком, значит читатель доехал до его правой границы.
-        self.read_position = Some(window.end);
+        // `read_position` здесь намеренно НЕ трогается: где стоит читатель —
+        // это наблюдение, а не следствие того, что окно закрыто. Ставить его
+        // на правую границу окна было ошибкой: чтобы окно закрылось, из
+        // очереди приходится ЗАБРАТЬ сообщение за этой границей, а вместе с
+        // ним библиотека отдаёт и всю предвыборку за ним. Читатель после
+        // закрытого окна стоит дальше его края — иногда на весь топик дальше.
         self.barren_rounds = if window.absorbed == 0 {
             self.barren_rounds + 1
         } else {
@@ -597,6 +683,18 @@ impl PartitionCursor {
             self.next = window.end;
             self.exhausted |= window.end >= self.high;
         }
+    }
+
+    /// Где стоит читатель: следующее сообщение он отдаст с этого офсета.
+    ///
+    /// Пишется на КАЖДОЕ изъятое из очереди событие, в том числе на выброшенное
+    /// за краем окна и на сам конец лога: изъятое библиотека второй раз не
+    /// отдаст, и притворяться, что читатель остался на месте, нельзя — иначе
+    /// следующее окно решит, что оно уже на своей позиции, не сделает `seek` и
+    /// продолжит с того места, куда убежала предвыборка. В `oldest` это дырка
+    /// в таблице ровно на всё, что успело приехать сверх окна.
+    fn note_read_position(&mut self, offset: i64) {
+        self.read_position = Some(offset);
     }
 
     /// Обновляет отметку, за которую эта партиция уже точно ничего не выдаст.
@@ -801,6 +899,10 @@ struct Worker {
     /// пароль сохранённой учётки подставляется из keychain один раз, при
     /// подключении, и ходить за ним второй раз ради отправки незачем.
     connection: Option<ClientConfig>,
+    /// Чем кластер представился (`cluster.id`). Снимается один раз при
+    /// подключении: значение постоянное, а спрашивают его на каждое «поделиться
+    /// ссылкой» — то есть посреди работы, когда ходить за ним в сеть незачем.
+    cluster_id: Option<String>,
     /// Продьюсер поднимается ЛЕНИВО, на первой отправке.
     ///
     /// Приложение прежде всего просмотрщик: за сеанс, в котором никто ничего не
@@ -872,6 +974,7 @@ impl Worker {
             consumer: None,
             admin: None,
             connection: None,
+            cluster_id: None,
             producer: None,
             delivery: Arc::new(Mutex::new(None)),
             partition_counts: HashMap::new(),
@@ -909,6 +1012,9 @@ impl Worker {
                     self.disconnect();
                     let _ = reply.send(());
                 }
+                Command::ClusterId(reply) => {
+                    let _ = reply.send(self.cluster_id.clone());
+                }
                 Command::ListTopics(reply) => {
                     let _ = reply.send(self.list_topics());
                 }
@@ -940,6 +1046,13 @@ impl Worker {
                 }
                 Command::GetBody(index, reply) => {
                     let _ = reply.send(self.body(index));
+                }
+                Command::FindMessage {
+                    partition,
+                    offset,
+                    reply,
+                } => {
+                    let _ = reply.send(self.find_message(partition, offset));
                 }
                 Command::GetRaw(index, reply) => {
                     let _ = reply.send(self.raw(index));
@@ -1006,6 +1119,13 @@ impl Worker {
         // десять, когда истекал таймаут следующего же запроса метаданных.
         wait_until_ready(&consumer, &fatal)?;
 
+        // Чем кластер себя называет. Спрашиваем здесь, а не по требованию:
+        // метаданные только что пришли, ответ лежит в кэше librdkafka и не
+        // стоит ни round-trip'а, ни ожидания. `None` — кластер идентификатора
+        // не назвал (так ведут себя эмуляции Kafka-протокола); тогда ссылкой
+        // из этого сеанса просто не поделиться, всё остальное работает.
+        let cluster_id = consumer.client().fetch_cluster_id(CLUSTER_ID_TIMEOUT);
+
         // Другой кластер (или другая учётка) — другая квота. Сбрасываем только
         // здесь: провалившееся подключение не должно стирать измерение
         // работающего, которое после ошибки остаётся в силе.
@@ -1033,6 +1153,7 @@ impl Worker {
         // Следующая отправка поднимет нового — из `connection` ниже.
         drop(self.producer.take());
         self.connection = Some(base_config(&payload));
+        self.cluster_id = cluster_id;
         self.partition_counts.clear();
         Ok(())
     }
@@ -1060,6 +1181,7 @@ impl Worker {
         drop(self.admin.take());
         drop(self.producer.take());
         self.connection = None;
+        self.cluster_id = None;
         self.partition_counts.clear();
     }
 
@@ -1349,7 +1471,16 @@ impl Worker {
         let partition_count = match self.partition_counts.get(&params.topic).copied() {
             Some(c) => c,
             None => {
-                let _ = reply.send(Err("unknown topic; refresh the topic list first".into()));
+                // Обе причины названы намеренно, и различить их нельзя не по
+                // лени: Kafka НЕ показывает в метаданных топики, на которые у
+                // учётки нет права `Describe`, — неавторизованный топик
+                // выглядит ровно как несуществующий. Написать одно «unknown
+                // topic» значило бы отправить человека искать опечатку в имени,
+                // когда на самом деле ему нужна другая учётка.
+                let _ = reply.send(Err(format!(
+                    "topic '{}' is not on this cluster, or the current Kafka user has no access to it",
+                    params.topic
+                )));
                 return;
             }
         };
@@ -1723,10 +1854,7 @@ impl Worker {
                     describe_bounds(&self.cursors)
                 )
             } else {
-                format!(
-                    "the selected offset range is outside the topic ({})",
-                    describe_bounds(&self.cursors)
-                )
+                describe_missing_offsets(&range, &self.cursors)
             });
         }
 
@@ -1861,7 +1989,17 @@ impl Worker {
                 }
                 opened
             } else if position == Some(rp.start) {
-                // Окна идут встык (режим `oldest`) — читатель уже там.
+                // Читатель уже ровно здесь — переставлять нечего.
+                //
+                // Так бывает в режиме `oldest`, где окна идут встык, но ТОЛЬКО
+                // если прошлое окно закрылось, не забрав из очереди ничего
+                // лишнего. Обычно забирает: чтобы понять, что окно кончилось,
+                // приходится взять сообщение за его краем, а с ним приезжает и
+                // предвыборка. Поэтому условие проверяется по наблюдённой
+                // позиции (`note_read_position`), а не выводится из того, что
+                // окна соседние: раньше выводилось, и всё, что librdkafka
+                // успела прислать сверх окна, пропадало из таблицы вместе с
+                // куском топика за ним.
                 Ok(())
             } else {
                 pending.topic.seek(p, rp.start)
@@ -1891,6 +2029,14 @@ impl Worker {
         let _ = self.tx.send(Command::ContinueRead);
     }
 
+    /// Отмечает позицию читателя партиции. Свободной функцией по полю, а не
+    /// методом воркера: зовётся из цикла, где `pending` уже заимствован.
+    fn note_position(cursors: &mut HashMap<i32, PartitionCursor>, p: i32, offset: i64) {
+        if let Some(c) = cursors.get_mut(&p) {
+            c.note_read_position(offset);
+        }
+    }
+
     /// Один `consume_batch` в рамках текущего раунда.
     fn step_reading(&mut self, mut pending: PendingRead) {
         let batch = raw_consumer::consume_batch(&pending.queue, POLL_TICK_MS, BATCH_SIZE);
@@ -1908,6 +2054,10 @@ impl Worker {
             let p = msg.partition();
             match msg.err() {
                 RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR => {
+                    // Читатель сдвинулся — независимо от того, возьмём мы это
+                    // сообщение или выбросим. Из очереди оно уже изъято, и
+                    // второй раз библиотека его не отдаст.
+                    Self::note_position(&mut self.cursors, p, msg.offset() + 1);
                     let Some(rp) = round.get_mut(&p) else {
                         continue;
                     };
@@ -1958,14 +2108,16 @@ impl Worker {
                     }
                 }
                 RDKafkaRespErr::RD_KAFKA_RESP_ERR__PARTITION_EOF => {
-                    // Конец лога. В `oldest` это настоящее дно партиции;
-                    // в `newest` — просто верхняя граница первого окна.
+                    // Конец лога. Офсет события — позиция, на которой лог
+                    // кончился, то есть ровно то место, где стоит читатель.
+                    let end_of_log = msg.offset();
+                    Self::note_position(&mut self.cursors, p, end_of_log);
                     if let Some(rp) = round.get_mut(&p) {
                         rp.done = true;
-                    }
-                    if !newest_first {
-                        if let Some(c) = self.cursors.get_mut(&p) {
-                            c.exhausted = true;
+                        if eof_exhausts(newest_first, end_of_log, rp.end) {
+                            if let Some(c) = self.cursors.get_mut(&p) {
+                                c.exhausted = true;
+                            }
                         }
                     }
                 }
@@ -2356,6 +2508,28 @@ impl Worker {
             .ok_or_else(|| "message index out of range".to_string())
     }
 
+    /// Где в таблице стоит сообщение с такими координатами.
+    ///
+    /// Проход по `view`, а не по всему буферу: индекс нужен именно тот, которым
+    /// пользуется таблица, — то есть уже с учётом фильтра и сортировки. Ищем
+    /// линейно и не заводим карту: `view` — плотный массив четырёхбайтовых
+    /// индексов, сотня тысяч записей просматривается быстрее, чем строится
+    /// хэш-таблица, а зовут это ровно один раз на переход по ссылке.
+    ///
+    /// `None` — сообщения в буфере нет. Причин две, и различить их отсюда
+    /// нельзя (обе выглядят одинаково): либо его не вычитали, либо его
+    /// выбросил фильтр. Объясняет это вызывающий, который знает, чем открывал.
+    fn find_message(&self, partition: i32, offset: i64) -> Result<Option<usize>, String> {
+        if self.open_topic.is_none() {
+            return Err("no topic is open".into());
+        }
+        Ok(self.view.iter().position(|&i| {
+            self.store
+                .get(i as usize)
+                .is_some_and(|m| m.partition == partition && m.offset == offset)
+        }))
+    }
+
     /// Полное тело — только когда пользователь открыл конкретное сообщение.
     fn body(&self, view_index: usize) -> Result<FullMessage, String> {
         let store_index = self.store_index(view_index)?;
@@ -2601,6 +2775,53 @@ mod tests {
             assert!(windows.len() < 1000, "раунды не сходятся");
         }
         windows
+    }
+
+    /// Регрессия. Читатель бежит впереди окна, и на топике в несколько десятков
+    /// сообщений предвыборка добирается до конца лога ещё в первом окне. EOF,
+    /// объявлявший партицию дочитанной безусловно, обрывал чтение на первом же
+    /// окне: топик из 60 сообщений показывал 10 и говорил, что это всё.
+    ///
+    /// Найдено на ссылке в `fireg.cryptocurrencies`: офсет 50 «не найден»,
+    /// хотя в топике он есть, а вычитано было ровно окно [0, 20).
+    #[test]
+    fn eof_beyond_the_window_does_not_finish_the_partition() {
+        // Конец лога на 60, окно кончается на 20 — читать ещё есть что.
+        assert!(!eof_exhausts(OLDEST, 60, 20));
+        // Конец лога внутри окна — вот теперь действительно всё.
+        assert!(eof_exhausts(OLDEST, 60, 60));
+        assert!(eof_exhausts(OLDEST, 55, 60));
+        // В `newest` EOF не значит ничего: первое же окно упирается в конец
+        // лога по построению.
+        assert!(!eof_exhausts(NEWEST, 60, 60));
+    }
+
+    /// Регрессия к тому же случаю. Закрытое окно НЕ означает, что читатель
+    /// стоит на его правой границе: чтобы окно закрылось, из очереди берётся
+    /// сообщение за краем, а с ним и вся предвыборка. Пока `advance` это
+    /// утверждал, следующее окно в `oldest` считало себя уже позиционированным,
+    /// не делало `seek` — и всё, что librdkafka успела прислать сверх окна,
+    /// пропадало вместе с куском топика за ним.
+    #[test]
+    fn a_closed_window_does_not_claim_where_the_reader_stands() {
+        let mut c = cursor(0, 1000, OLDEST, 1000);
+        c.note_read_position(137); // читатель убежал за край окна
+        c.advance(
+            OLDEST,
+            &RoundPartition {
+                start: 0,
+                end: 20,
+                absorbed: 20,
+                done: true,
+            },
+        );
+
+        assert_eq!(c.next, 20, "курсор двигается по окнам, а не по читателю");
+        assert_eq!(
+            c.read_position,
+            Some(137),
+            "позиция читателя — наблюдение, и закрытие окна её не выдумывает"
+        );
     }
 
     #[test]

@@ -28,6 +28,16 @@ serde = { version = "1", features = ["derive"] }
 # порядке появления, а не по алфавиту.
 serde_json = { version = "1", features = ["preserve_order"] }
 tauri-plugin-dialog = "2"
+# Ссылки на сообщение (`mikui://message/v1?…`): регистрация схемы в системе и
+# доставка ссылки уже запущенному приложению.
+tauri-plugin-deep-link = "2"
+# Разбор и сборка тех же ссылок.
+#
+# Крейт уже в графе зависимостей — его тянет сама tauri, — поэтому прямая
+# зависимость не добавляет к сборке ничего. Своего разбора здесь быть не должно
+# принципиально: единственное место, где ссылка может разъехаться с собой, —
+# это два способа её прочитать.
+url = "2"
 # SIMD-поиск подстроки по сырым байтам: фильтрация идёт до UTF-8 декода
 # и без аллокаций на сообщение.
 memchr = "2"
@@ -126,6 +136,18 @@ rdkafka = { version = "0.36", default-features = false, features = ["libz", "zst
 # Требует установленный cmake на машине сборки.
 [target.'cfg(windows)'.dependencies]
 rdkafka = { version = "0.36", default-features = false, features = ["libz", "zstd", "ssl-vendored", "cmake-build"] }
+
+# Один экземпляр приложения на систему — только там, где это нужно ссылкам.
+#
+# macOS доставляет `mikui://…` уже запущенному приложению сама (Apple Events),
+# а Windows и Linux просто запускают ещё одну копию с URL в аргументах. Вторая
+# копия — это второй Kafka-воркер и второе окно поверх первого; фича «открой
+# сообщение» превратилась бы в «открой ещё один mikui».
+#
+# Фича `deep-link` у плагина передаёт перехваченный URL плагину ссылок первого
+# экземпляра, то есть ровно в тот же обработчик, что и на macOS.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [features]
 default = []

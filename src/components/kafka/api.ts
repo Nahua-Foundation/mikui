@@ -15,6 +15,7 @@ import {
   KafkaCluster,
   LoadMoreParams,
   MessageFilter,
+  MessageLinkTarget,
   OpenTopicProgress,
   OpenTopicResult,
   LensSetting,
@@ -28,6 +29,7 @@ import {
   SchemaRegistryConfig,
   SaveFavoriteResult,
   Settings,
+  ShareRequest,
   StartFrom,
   Topic,
   TopicDetails,
@@ -155,7 +157,39 @@ export const getWindow = (start: number, count: number) =>
 export const getMessageBody = (index: number) =>
   invoke<FullMessage>('get_message_body', { index });
 
+/**
+ * Где в таблице стоит сообщение с такими координатами. `null` — его нет в
+ * загруженном буфере (не вычитали либо отфильтровали).
+ *
+ * Нужно переходу по ссылке: она называет партицию и офсет, а таблица и тело
+ * работают по индексу строки, и посчитать его на фронте нечем — ни буфера, ни
+ * текущего фильтра здесь нет.
+ */
+export const findMessage = (partition: number, offset: number) =>
+  invoke<number | null>('find_message', { partition, offset });
+
 export const closeTopic = () => invoke<void>('close_topic');
+
+// --- Ссылка на сообщение --------------------------------------------------------
+
+/** Ссылка на сообщение открытого топика — та, что кладётся в буфер обмена. */
+export const buildMessageLink = (request: ShareRequest) =>
+  invoke<string>('build_message_link', { request });
+
+/** Куда ссылка ведёт на этой машине. Ошибку показываем как есть: она объясняет
+ *  и почему подключение не нашлось. */
+export const resolveMessageLink = (url: string) =>
+  invoke<MessageLinkTarget>('resolve_message_link', { url });
+
+/**
+ * Ссылка, которую система принесла приложению: с ней его запустили либо
+ * передали уже работающему.
+ *
+ * Забирается один раз — второй вызов вернёт `null`. Так и задумано: у ссылки
+ * должен быть единственный потребитель, иначе один и тот же переход выполнялся
+ * бы дважды (см. `PendingLink` в lib.rs).
+ */
+export const takePendingLink = () => invoke<string | null>('take_pending_link');
 
 // --- Сохранённые сообщения ----------------------------------------------------
 //

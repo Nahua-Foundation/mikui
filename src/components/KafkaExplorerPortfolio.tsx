@@ -10,6 +10,7 @@ import {
   FavoritesView,
   FullMessage,
   MessageFilter,
+  MessageLinkTarget,
   KafkaCluster,
   OpenTopicResult,
   ReadMode,
@@ -35,9 +36,12 @@ import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
 import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
 import { FavoritesModal } from './kafka';
 import { SavedMessageModal } from './kafka';
+import { ShareLinkModal } from './kafka';
+import { OpenLinkModal } from './kafka';
 import { ProduceMessageModal } from './kafka/modals/ProduceMessageModal';
 import { useMessageWindow } from './kafka/useMessageWindow';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 type ClusterConfigMode = 'create' | 'edit';
 
@@ -55,6 +59,20 @@ const READ_SUPERSEDED = 'read superseded';
 /** Не чаще одного тоста об ошибке декодирования за это время. Сообщения чужого
  *  формата идут полосой, и без паузы каждое окно выдачи заливало бы экран. */
 const DECODE_ERROR_TOAST_MS = 5000;
+
+/**
+ * Сколько соседей вычитывать вокруг сообщения, открытого по ссылке.
+ *
+ * Не ноль: пришедший по ссылке почти всегда смотрит и на то, что было рядом, —
+ * а перечитывать ради этого топик заново значило бы платить квотой за то, что
+ * можно было взять сразу. И не больше: окно на одну партицию, брокер всё равно
+ * присылает целый батч, так что сотня офсетов стоит примерно столько же,
+ * сколько один.
+ */
+const LINK_CONTEXT = 50;
+
+/** Звонок в дверь из бэкенда: система принесла ссылку — см. lib.rs. */
+const LINK_EVENT = 'mikui://link';
 
 const isSuperseded = (e: unknown) => String(e).includes(READ_SUPERSEDED);
 
@@ -92,6 +110,23 @@ export function KafkaExplorerPortfolio() {
   const [isClusterUsersModalOpen, setIsClusterUsersModalOpen] = useState(false);
   const [isFavoritesModalOpen, setIsFavoritesModalOpen] = useState(false);
   const [isProduceModalOpen, setIsProduceModalOpen] = useState(false);
+  /** Собранная ссылка на открытое сообщение. null — окном не делились. */
+  const [shareLink, setShareLink] = useState<string | null>(null);
+  const [isShareOpen, setIsShareOpen] = useState(false);
+  const [isOpenLinkOpen, setIsOpenLinkOpen] = useState(false);
+  /** Ссылка, принесённая системой. null — окно открыли пунктом в шапке. */
+  const [incomingLink, setIncomingLink] = useState<string | null>(null);
+  /**
+   * Сообщение, ради которого топик открыли по ссылке, — таблица его подсвечивает.
+   *
+   * Координатами, а не индексом: индекс живёт до ближайшей смены фильтра или
+   * сортировки, а подсветка переживать их обязана. Гаснет, когда человек сам
+   * доводит до строки курсор, и когда уходит с топика.
+   */
+  const [linkedMessage, setLinkedMessage] = useState<{
+    partition: number;
+    offset: number;
+  } | null>(null);
   const [filters, setFilters] = useState<MessageFilter>(EMPTY_FILTER);
   /** Сортировка по клику на заголовок колонки. `null` — обычный порядок
    *  чтения из `readMode`. */
@@ -133,6 +168,23 @@ export function KafkaExplorerPortfolio() {
   // колбэка, а не на момент создания замыкания.
   const topicRef = useRef<string | null>(null);
   topicRef.current = selectedTopic?.name ?? null;
+
+  /**
+   * Переход по ссылке, который ещё не закончился.
+   *
+   * Ссылка называет партицию и офсет, а таблица работает по индексу строки —
+   * значит показать сообщение можно только ПОСЛЕ того, как топик прочитан.
+   * Держать это состоянием нельзя: открытие топика живёт в эффекте, и любая
+   * лишняя зависимость перечитывала бы топик заново. Ref переживает рендеры и
+   * читается ровно там, где чтение закончилось.
+   */
+  const pendingLinkRef = useRef<{
+    topic: string;
+    partition: number;
+    offset: number;
+    format: string | null;
+    typeName: string | null;
+  } | null>(null);
 
   const [clusters, setClusters] = useState<KafkaCluster[]>([]);
   const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
@@ -215,6 +267,10 @@ export function KafkaExplorerPortfolio() {
     }
 
     let cancelled = false;
+    // Схема, которой топик в итоге открылся. Нужна переходу по ссылке: он
+    // сравнивает её с форматом отправителя (см. `finishPendingLink`), а
+    // `openSchema` к тому моменту в этом замыкании ещё прежний.
+    let applied: TopicSchema | null = null;
     setIsLoadingMessages(true);
     // Список меняется целиком — обнуляем его ДО того, как приедут новые строки,
     // иначе Virtuoso успеет отрисовать чужие данные под новым топиком.
@@ -240,6 +296,7 @@ export function KafkaExplorerPortfolio() {
     withSchema
       .then((schema) => {
         if (cancelled) return Promise.reject(new Error(READ_SUPERSEDED));
+        applied = schema;
         setOpenSchema(schema);
         return invoke<OpenTopicResult>('open_topic', {
           params: {
@@ -262,9 +319,15 @@ export function KafkaExplorerPortfolio() {
         if (result.truncated) {
           toast.info(`Loaded ${result.loaded} messages; the topic has more`);
         }
+        // Топик открывали ради одного сообщения — самое время его показать.
+        finishPendingLink(applied);
       })
       .catch((e) => {
         if (cancelled || isSuperseded(e)) return;
+        // Ссылка не сбылась: почему именно — уже сказано в ошибке ниже
+        // («офсета больше нет», «нет доступа»), и держать переход в силе значило
+        // бы выполнить его на следующем открытом топике.
+        pendingLinkRef.current = null;
         console.error('Failed to open topic', e);
         toast.error(`Failed to read topic: ${describeError(e)}`);
         setTotal(0);
@@ -461,6 +524,68 @@ export function KafkaExplorerPortfolio() {
     [selectedIndex, total, showMessageAt],
   );
 
+  /**
+   * Последний шаг перехода по ссылке: топик прочитан — найти в нём то самое
+   * сообщение и открыть.
+   *
+   * Зовётся из эффекта открытия, а не из отдельного эффекта по `isLoading`:
+   * второй эффект в том же коммите увидел бы ещё старое значение флага и
+   * бросился бы искать сообщение до того, как чтение началось.
+   */
+  const finishPendingLink = useCallback(
+    (schema: TopicSchema | null) => {
+      const pending = pendingLinkRef.current;
+      if (!pending) return;
+      pendingLinkRef.current = null;
+      // Пока читалось, ушли на другой топик — переход опоздал.
+      if (pending.topic !== topicRef.current) return;
+
+      // Схема по ссылке не едет и ехать не может: локальные .proto лежат у
+      // отправителя на диске. Сказать, чего не хватает, — единственное, что
+      // здесь вообще можно сделать, и это заметно лучше двоичного мусора без
+      // объяснений. Реестровые схемы (avro, jsonschema) подхватятся сами, и
+      // тогда форматы совпадут и говорить будет не о чем.
+      const mine = schema?.format ?? 'json';
+      if (pending.format && pending.format !== mine) {
+        const named = pending.typeName ? ` (${pending.typeName})` : '';
+        toast.info(
+          `The sender reads this topic as ${pending.format}${named}, you read it as ${mine}. ` +
+            'Load the schema in topic settings to see the same body.',
+        );
+      }
+
+      api
+        .findMessage(pending.partition, pending.offset)
+        .then((index) => {
+          if (topicRef.current !== pending.topic) return;
+          if (index === null) {
+            // Диапазон вокруг офсета прочитался, а самого офсета в нём не
+            // оказалось. Так выглядит дырка в компактированном топике и край
+            // retention — обе причины называем, различить их нечем.
+            toast.error(
+              `No message at partition ${pending.partition}, offset ${pending.offset} — ` +
+                'retention or compaction may have dropped it',
+            );
+            return;
+          }
+          // Подсветка ставится вместе с открытием окна, а не после его
+          // закрытия: закрыть окно можно и мимо кнопки, а найти строку глазами
+          // среди сотни соседей — это ровно то, чего ссылка избавляет.
+          setLinkedMessage({ partition: pending.partition, offset: pending.offset });
+          showMessageAt(index);
+        })
+        .catch((e) => {
+          console.error('Failed to locate the linked message', e);
+          toast.error(`Failed to open the linked message: ${describeError(e)}`);
+        });
+    },
+    [showMessageAt],
+  );
+
+  /** Стабильный колбэк: иначе каждая перерисовка таблицы меняла бы пропс у
+   *  всех видимых строк и обесценивала их `memo`. */
+  const clearHighlight = useCallback(() => setLinkedMessage(null), []);
+
   const handleConfigClick = useCallback((topic: Topic) => {
     setConfigTopic(topic);
     setIsConfigModalOpen(true);
@@ -583,6 +708,10 @@ export function KafkaExplorerPortfolio() {
    *
    * `replace` — прежнее подключение заведомо устарело (у текущей учётки
    * поменяли креды), и откатываться на него нельзя ни при какой неудаче.
+   *
+   * Возвращает список топиков. Нужен переходу по ссылке: тому надо открыть
+   * топик сразу после подключения, а `topics` в его замыкании к этому моменту
+   * ещё прежний — состояние обновится только со следующим рендером.
    */
   const connect = useCallback(
     async (
@@ -647,6 +776,7 @@ export function KafkaExplorerPortfolio() {
         );
 
         toast.success(`Connected to ${label} · ${loaded.length} topics`);
+        return loaded;
       } catch (e) {
         console.error('Failed to list topics', e);
         setTopics([]);
@@ -666,6 +796,94 @@ export function KafkaExplorerPortfolio() {
       connect(api.clusterToPayload(cluster, user), cluster.name).catch(() => {});
     },
     [connect],
+  );
+
+  /**
+   * Переход по ссылке на сообщение — после того, как человек его подтвердил.
+   *
+   * Подключение у воркера одно и открытый топик один, поэтому переход именно
+   * УВОДИТ: подключается к нужному кластеру, если это не текущий, и открывает
+   * нужный кусок нужного топика. Предупреждение об этом показывает окно
+   * подтверждения, здесь уже поздно спрашивать.
+   *
+   * Читается не одно сообщение, а окно вокруг него (`LINK_CONTEXT`): пришедший
+   * по ссылке почти всегда смотрит и на соседей, а стоит это столько же —
+   * брокер всё равно присылает целый батч на партицию.
+   */
+  const followLink = useCallback(
+    async (target: MessageLinkTarget) => {
+      // Список мог измениться, пока окно стояло открытым: кластер успели
+      // удалить. Бэкенд его нашёл, а показывать нам уже нечего.
+      const cluster = clusters.find((c) => c.id === target.cluster);
+      if (!cluster) {
+        toast.error('That connection is no longer in the list');
+        return;
+      }
+
+      let available = topics;
+      if (connectedClusterId !== target.cluster) {
+        try {
+          available = await connect(
+            api.clusterToPayload(cluster, api.activeUser(cluster)),
+            cluster.name,
+          );
+        } catch {
+          // `connect` уже сказал, что именно не вышло.
+          return;
+        }
+      }
+
+      // Топика нет в списке — и это ровно та развилка, которую Kafka не
+      // различает: неавторизованный топик не виден в метаданных так же, как
+      // несуществующий. Формулировка та же, что и у воркера (см. worker.rs),
+      // чтобы человек не гадал, почему на одно и то же две разные жалобы.
+      const topic = available.find((t) => t.name === target.topic);
+      if (!topic) {
+        toast.error(
+          `Topic ${target.topic} is not on ${cluster.name}, ` +
+            'or your Kafka user has no access to it',
+        );
+        return;
+      }
+      if (target.partition >= topic.partitions) {
+        toast.error(
+          `Partition ${target.partition} does not exist: ${target.topic} has ${topic.partitions}`,
+        );
+        return;
+      }
+
+      pendingLinkRef.current = {
+        topic: target.topic,
+        partition: target.partition,
+        offset: target.offset,
+        format: target.format,
+        typeName: target.type_name,
+      };
+
+      // Дальше работает обычный эффект открытия топика: ему всё равно, откуда
+      // взялись партиция и границы — из шапки или из ссылки. Второго пути
+      // чтения здесь нет и быть не должно.
+      setSelectedPartitions([target.partition]);
+      setReadMode('offset');
+      setRange({
+        from_offset: Math.max(0, target.offset - LINK_CONTEXT),
+        to_offset: target.offset + LINK_CONTEXT,
+        from_timestamp: null,
+        to_timestamp: null,
+      });
+      setFilters(EMPTY_FILTER);
+      // Пустой фильтр уедет вместе с `open_topic` — считаем применённым, иначе
+      // следом улетит лишний `set_filter` (тот же приём, что в handleSelectTopic).
+      appliedFilterRef.current = EMPTY_FILTER;
+      // И сортировку: ссылка ведёт к конкретной строке, а не к чужому порядку,
+      // оставшемуся от прошлого топика. Ref обновляем сами — по той же причине.
+      sortRef.current = null;
+      setSort(null);
+      // Новый объект даже для того же топика: перечитать его надо в любом
+      // случае, а эффект смотрит на идентичность.
+      setSelectedTopic({ ...topic });
+    },
+    [clusters, connect, connectedClusterId, topics],
   );
 
   /**
@@ -779,6 +997,9 @@ export function KafkaExplorerPortfolio() {
    *  и границ через этот обработчик не идёт и поиск сохранит. */
   const handleSelectTopic = useCallback((topic: Topic | null) => {
     if (topicRef.current !== (topic?.name ?? null)) {
+      // Подсветка принадлежит сообщению того топика, за которым пришли по
+      // ссылке. В соседнем те же партиция с офсетом — другое сообщение.
+      setLinkedMessage(null);
       setSelectedPartitions(null);
       setReadMode((mode) => (mode === 'offset' || mode === 'timestamp' ? 'newest' : mode));
       setRange(EMPTY_RANGE);
@@ -809,6 +1030,70 @@ export function KafkaExplorerPortfolio() {
   }, [loadFavorites]);
 
   const handleOpenProduce = useCallback(() => setIsProduceModalOpen(true), []);
+
+  /** Ссылку вставляют руками — принесённой системой здесь нет. */
+  const handleOpenLink = useCallback(() => {
+    setIncomingLink(null);
+    setIsOpenLinkOpen(true);
+  }, []);
+
+  /**
+   * Ссылка, которую принесла система.
+   *
+   * Забирается ровно один раз и по двум поводам: при старте (приложение
+   * ЗАПУСТИЛИ ссылкой — события тогда не было, некому было его слушать) и по
+   * звонку в дверь, когда ссылку отдали уже работающему окну. Сам URL приезжает
+   * не событием, а этим запросом: у него должен быть единственный потребитель,
+   * иначе один и тот же переход выполнился бы дважды (см. `PendingLink`).
+   */
+  useEffect(() => {
+    const take = () => {
+      api
+        .takePendingLink()
+        .then((url) => {
+          if (!url) return;
+          setIncomingLink(url);
+          setIsOpenLinkOpen(true);
+        })
+        .catch((e) => console.error('Failed to take the pending link', e));
+    };
+
+    take();
+    const listener = listen(LINK_EVENT, take);
+    return () => {
+      listener.then((stop) => stop()).catch(() => {});
+    };
+  }, []);
+
+  /**
+   * Ссылка на открытое сообщение.
+   *
+   * Собирает её Rust: кластер в ссылке назван идентификатором, который выдал
+   * брокер, а он известен только живому подключению. Схема тоже его — фронту
+   * пришлось бы собирать подсказку о формате самому и разойтись с тем, чем
+   * топик читается на самом деле.
+   */
+  const handleShare = useCallback(() => {
+    const topic = selectedTopic?.name;
+    if (!topic || !selectedMessage) return;
+    api
+      .buildMessageLink({
+        cluster: schemaCluster,
+        cluster_name: connectedName,
+        topic,
+        partition: selectedMessage.partition,
+        offset: selectedMessage.offset,
+        timestamp: selectedMessage.timestamp,
+      })
+      .then((url) => {
+        setShareLink(url);
+        setIsShareOpen(true);
+      })
+      .catch((e) => {
+        console.error('Failed to build a message link', e);
+        toast.error(`Can't build a link: ${describeError(e)}`);
+      });
+  }, [selectedTopic, selectedMessage, schemaCluster, connectedName]);
 
   /**
    * Кладёт открытое сообщение на диск.
@@ -939,6 +1224,7 @@ export function KafkaExplorerPortfolio() {
         onRefresh={handleRefresh}
         onOpenFavorites={handleOpenFavorites}
         onProduce={handleOpenProduce}
+        onOpenLink={handleOpenLink}
       />
 
       <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">
@@ -966,6 +1252,8 @@ export function KafkaExplorerPortfolio() {
                 onLoadMore={handleLoadMore}
                 sort={sort}
                 onSortChange={setSort}
+                highlight={linkedMessage}
+                onHighlightSeen={clearHighlight}
               />
               <StatusBar stats={stats} />
             </>
@@ -983,6 +1271,7 @@ export function KafkaExplorerPortfolio() {
           openMessageSavedId ? () => removeFavorite(openMessageSavedId) : undefined
         }
         onNavigate={handleNavigateMessage}
+        onShare={handleShare}
         // Топик — единственное, чего в окне не видно нигде: партиция, офсет и
         // ключ у сообщения свои, а имя топика осталось в шапке под модалкой.
         description={
@@ -993,6 +1282,39 @@ export function KafkaExplorerPortfolio() {
           ) : undefined
         }
         format={openSchema?.format}
+      />
+
+      {/* Ссылка на открытое сообщение — поверх его окна: делятся, не закрывая
+          того, чем делятся. */}
+      <ShareLinkModal
+        url={shareLink}
+        open={isShareOpen}
+        onOpenChange={setIsShareOpen}
+        description={
+          selectedTopic && selectedMessage ? (
+            <>
+              <span className="text-dim">{connectedName ?? 'unnamed cluster'}</span>
+              <span className="text-dim"> / </span>
+              <span className="text-brand">{selectedTopic.name}</span>
+              <span className="text-dim">
+                {' '}
+                · partition {selectedMessage.partition} · offset {selectedMessage.offset}
+              </span>
+            </>
+          ) : undefined
+        }
+      />
+
+      {/* Переход по ссылке. Не под условием подключения: по ссылке приходят с
+          пустого приложения чаще, чем с открытого топика. */}
+      <OpenLinkModal
+        open={isOpenLinkOpen}
+        onOpenChange={setIsOpenLinkOpen}
+        incoming={incomingLink}
+        connectedClusterId={connectedClusterId}
+        connectedName={connectedName}
+        openTopic={selectedTopic?.name ?? null}
+        onFollow={followLink}
       />
 
       {/* Сохранённое сообщение — в своём окне: у него другое происхождение и

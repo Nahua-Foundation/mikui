@@ -26,6 +26,24 @@ pub enum BodyFormat {
     JsonSchema,
 }
 
+impl BodyFormat {
+    /// Название формата тем же словом, каким он записан на диске и каким его
+    /// знает фронт. Нужно ссылке на сообщение: она несёт подсказку «этот топик
+    /// читается как protobuf», и слово в ней обязано быть тем же самым —
+    /// получатель сравнивает его со своим форматом (см. `crate::link`).
+    ///
+    /// Совпадение с serde закреплено тестом ниже, а не устным договором.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyFormat::Json => "json",
+            BodyFormat::Text => "text",
+            BodyFormat::Proto => "proto",
+            BodyFormat::Avro => "avro",
+            BodyFormat::JsonSchema => "jsonschema",
+        }
+    }
+}
+
 /// Что делать с конвертом Debezium / Kafka Connect в строке таблицы.
 ///
 /// Живёт рядом с `BodyFormat` и хранится там же — в записи топика, — потому что
@@ -351,5 +369,30 @@ impl TopicSchemaView {
     pub fn with_detected_kind(mut self, kind: Option<String>) -> Self {
         self.detected_kind = kind;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `as_str` пишет формат тем же словом, что и serde.
+    ///
+    /// Проверяется, а не подразумевается: этим словом подписана схема топика на
+    /// диске, им же приезжает подсказка в ссылке на сообщение, и разойдись эти
+    /// два места — ссылка на protobuf-топик молча перестала бы узнавать
+    /// protobuf, ничего при этом не сломав на вид.
+    #[test]
+    fn as_str_matches_what_serde_writes() {
+        for format in [
+            BodyFormat::Json,
+            BodyFormat::Text,
+            BodyFormat::Proto,
+            BodyFormat::Avro,
+            BodyFormat::JsonSchema,
+        ] {
+            let serialized = serde_json::to_string(&format).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", format.as_str()));
+        }
     }
 }

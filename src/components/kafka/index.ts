@@ -25,6 +25,8 @@ export { ClusterArchiveModal } from './modals/ClusterArchiveModal';
 export { ClusterUsersModal } from './modals/ClusterUsersModal';
 export { FavoritesModal } from './modals/FavoritesModal';
 export { SavedMessageModal } from './modals/SavedMessageModal';
+export { ShareLinkModal } from './modals/ShareLinkModal';
+export { OpenLinkModal } from './modals/OpenLinkModal';
 
 // Small Components
 export { Tab } from './components/Tab';

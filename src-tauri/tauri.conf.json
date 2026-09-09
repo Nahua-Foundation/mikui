@@ -21,6 +21,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["mikui"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

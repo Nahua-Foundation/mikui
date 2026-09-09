@@ -23,7 +23,11 @@ interface ClusterConfigModalProps {
   mode: 'create' | 'edit';
   onBack?: () => void;
   onSaved?: (cluster: KafkaCluster) => void;
-  onConnect?: (payload: ClusterConnectPayload, name: string) => Promise<void>;
+  /** Возвращённый список топиков форме не нужен — она только ждёт, чем
+   *  кончилось подключение. Тип его не прячет: сузить `Promise<Topic[]>` до
+   *  `Promise<void>` TypeScript не даёт, а заводить ради этого обёртку
+   *  значило бы прятать, что за кнопкой стоит тот же самый `connect`. */
+  onConnect?: (payload: ClusterConnectPayload, name: string) => Promise<unknown>;
   /** Открыть список Kafka-пользователей этого кластера. */
   onManageUsers?: (cluster: KafkaCluster) => void;
   /** Подключены ли мы прямо сейчас именно к этому кластеру. */

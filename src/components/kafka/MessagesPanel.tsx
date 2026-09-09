@@ -40,16 +40,33 @@ function nextDirection(current: SortDirection | null): SortDirection | null {
 interface MessageRowProps {
   row: RowPreview;
   onSelect: (index: number) => void;
+  /** Строка, ради которой открыли топик по ссылке. */
+  highlighted: boolean;
+  /** Курсор дошёл до подсвеченной строки — подсказка своё отработала. */
+  onHighlightSeen: () => void;
 }
 
 /** memo: при подгрузке чанка перерисовываются только новые строки,
  *  а не весь видимый список. */
-const MessageRow = memo(function MessageRow({ row, onSelect }: MessageRowProps) {
+const MessageRow = memo(function MessageRow({
+  row,
+  onSelect,
+  highlighted,
+  onHighlightSeen,
+}: MessageRowProps) {
   return (
     <div
-      className="border-b border-edge cursor-pointer hover:bg-elevated grid gap-4 p-3 text-sm"
+      // Подсветка — тот же `hover:bg-elevated`, только не по курсору: строка,
+      // найденную по ссылке, надо показать среди соседей, а рисовать ради
+      // этого отдельный цвет значило бы заводить второй язык выделения.
+      // Гаснет, как только человек до неё дотянулся курсором: дальше он и сам
+      // знает, где она.
+      className={`border-b border-edge cursor-pointer hover:bg-elevated grid gap-4 p-3 text-sm ${
+        highlighted ? 'bg-elevated' : ''
+      }`}
       style={{ gridTemplateColumns: 'var(--mikui-grid)' }}
       onClick={() => onSelect(row.index)}
+      onMouseEnter={highlighted ? onHighlightSeen : undefined}
     >
       <div className="font-mono text-brand">{row.partition}</div>
       <div className="font-mono text-soft">{row.offset}</div>
@@ -120,6 +137,15 @@ interface MessagesPanelProps {
   /** Клик по заголовку колонки. `null` — обычный порядок чтения. */
   sort: SortSpec | null;
   onSortChange: (sort: SortSpec | null) => void;
+  /**
+   * Сообщение, ради которого топик открыли по ссылке. `null` — обычное чтение.
+   *
+   * Координатами, а не индексом строки: индекс живёт до ближайшей смены
+   * фильтра или сортировки, а подсветка должна пережить и то, и другое —
+   * сообщение от этого не перестаёт быть тем, за которым пришли.
+   */
+  highlight: { partition: number; offset: number } | null;
+  onHighlightSeen: () => void;
 }
 
 export function MessagesPanel({
@@ -134,6 +160,8 @@ export function MessagesPanel({
   onLoadMore,
   sort,
   onSortChange,
+  highlight,
+  onHighlightSeen,
 }: MessagesPanelProps) {
   const [colWidths, setColWidths] = useState<string[]>(DEFAULT_WIDTHS);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -221,10 +249,20 @@ export function MessagesPanel({
   const renderItem = useCallback(
     (index: number) => {
       const row = getRow(index);
-      return row ? <MessageRow row={row} onSelect={onSelectMessage} /> : <PlaceholderRow />;
+      if (!row) return <PlaceholderRow />;
+      const highlighted =
+        !!highlight && row.partition === highlight.partition && row.offset === highlight.offset;
+      return (
+        <MessageRow
+          row={row}
+          onSelect={onSelectMessage}
+          highlighted={highlighted}
+          onHighlightSeen={onHighlightSeen}
+        />
+      );
     },
     // version в зависимостях намеренно: подгрузился чанк — перерисовываем.
-    [getRow, onSelectMessage, version],
+    [getRow, onSelectMessage, version, highlight, onHighlightSeen],
   );
 
   const Footer = useCallback(() => {

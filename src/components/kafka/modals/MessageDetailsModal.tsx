@@ -1,6 +1,6 @@
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '../../ui/button';
-import { Copy, Star, StarOff } from 'lucide-react';
+import { Copy, Link2, Star, StarOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
@@ -55,6 +55,15 @@ interface MessageDetailsModalProps {
    */
   onNavigate?: (delta: -1 | 1) => void;
   /**
+   * Собрать ссылку на это сообщение и показать её.
+   *
+   * Не задан там, где ссылку не на что построить: у сохранённого сообщения
+   * координаты есть, а подключения к его кластеру может не быть вовсе — а
+   * `cluster.id`, которым ссылка называет кластер, известен только от живого
+   * подключения (см. `link.rs`).
+   */
+  onShare?: () => void;
+  /**
    * Формат тела, выбранный для топика. Разобранный protobuf приезжает сюда
    * компактным JSON, поэтому от JSON-топика он тут ничем не отличается —
    * особняком стоит только `text`, где раскладывать тело не просят.
@@ -72,6 +81,7 @@ export function MessageDetailsModal({
   onAddToFavorite,
   onRemoveFavorite,
   onNavigate,
+  onShare,
   format = 'json',
 }: MessageDetailsModalProps) {
   const [activeTab, setActiveTab] = useState<Tab>('payload');
@@ -117,6 +127,18 @@ export function MessageDetailsModal({
       // Стрелка с модификатором — это уже другая команда (у macOS, например,
       // Cmd+↑ ходит по истории), и присваивать её себе нельзя.
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+
+      // Слушатель висит на window, поэтому ловит стрелки и из полей ввода —
+      // в том числе из окна, открытого поверх этого (ссылкой делятся именно
+      // так). Там стрелки двигают курсор, и отбирать их у текста нельзя.
+      const from = event.target as HTMLElement | null;
+      if (
+        from instanceof HTMLInputElement ||
+        from instanceof HTMLTextAreaElement ||
+        from?.isContentEditable
+      ) {
+        return;
+      }
 
       switch (event.key) {
         case 'ArrowUp':
@@ -290,8 +312,24 @@ export function MessageDetailsModal({
                         Save
                       </Button>
                     )}
-                <Button 
-                  variant="outline" 
+                {/* Ссылка отдельно от Copy: тот копирует САМО тело, а эта —
+                    адрес сообщения в кластере. Одной кнопкой это было бы не
+                    выразить, а разница принципиальная — телом делятся, когда
+                    важно содержимое, ссылкой — когда важно место. */}
+                {onShare && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
+                    onClick={onShare}
+                    title="Copy a link that opens this message in mikui"
+                  >
+                    <Link2 className="size-4 mr-1" />
+                    Share
+                  </Button>
+                )}
+                <Button
+                  variant="outline"
                   size="sm"
                   className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
                   onClick={handleCopy}

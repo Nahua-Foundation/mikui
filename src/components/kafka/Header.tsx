@@ -1,4 +1,4 @@
-import { ChevronDown, Filter, RefreshCw, Play, Folder, Search, Send, User, Users } from 'lucide-react';
+import { ChevronDown, Filter, Link2, RefreshCw, Play, Folder, Search, Send, User, Users } from 'lucide-react';
 import { Button } from '../ui/button';
 import {
   DropdownMenu,
@@ -69,6 +69,11 @@ interface HeaderDesktopProps {
   onRefresh: () => void;
   onOpenFavorites: () => void;
   onProduce: () => void;
+  /** Вставить ссылку на сообщение руками. Нужен и при работающей схеме
+   *  `mikui://`: её регистрирует ОС (то есть только у установленной сборки), а
+   *  часть почтовых клиентов и мессенджеров незнакомую схему кликабельной не
+   *  делает вовсе. */
+  onOpenLink: () => void;
 }
 
 /**
@@ -91,6 +96,9 @@ export function togglePartition(
 }
 
 function partitionsLabel(selected: number[] | null, total: number): string {
+  // У топика с одной партицией «all» не сообщает ничего: выбирать не из чего,
+  // и читается всегда она одна. Показываем её номер.
+  if (total === 1) return '0';
   if (!selected || selected.length === 0 || selected.length === total) return 'all';
   if (selected.length <= PARTITIONS_SHOWN_INLINE) return selected.join(', ');
   return `${selected.length} of ${total}`;
@@ -98,6 +106,7 @@ function partitionsLabel(selected: number[] | null, total: number): string {
 
 /** Полный перечень — в подсказке, когда в подпись он не уложился. */
 function partitionsTitle(selected: number[] | null, total: number): string {
+  if (total === 1) return 'The only partition of this topic';
   if (!selected || selected.length === 0 || selected.length === total) {
     return `All ${total} partitions`;
   }
@@ -128,10 +137,13 @@ export function HeaderDesktop({
   onRefresh,
   onOpenFavorites,
   onProduce,
+  onOpenLink,
 }: HeaderDesktopProps) {
   const partitions = topic ? Array.from({ length: topic.partitions }, (_, i) => i) : [];
   const hasActiveFilters = filters.key.trim() !== '' || filters.value.trim() !== '';
   const allPartitions = selectedPartitions === null;
+  /** В топике ровно одна партиция — выбирать не из чего. */
+  const onlyPartition = partitions.length === 1;
 
   const connected = clusterName !== null;
   /** Разбирается ли тело по схеме — от этого зависит, есть ли что искать в
@@ -388,7 +400,13 @@ export function HeaderDesktop({
               <ReadOrder
                 mode={readMode}
                 range={range}
-                singlePartition={selectedPartitions?.length === 1}
+                // `onlyPartition` здесь не для красоты: у топика с одной
+                // партицией выбор `[0]` недостижим — клик по единственной
+                // партиции сводится к «все», то есть к `null` (см.
+                // `togglePartition`). Без этого условия чтение по офсетам на
+                // таком топике не включалось вообще, хотя офсеты там как раз
+                // однозначны: партиция-то одна.
+                singlePartition={selectedPartitions?.length === 1 || onlyPartition}
                 onChange={onReadChange}
               />
             </div>
@@ -419,19 +437,28 @@ export function HeaderDesktop({
                     три партиции из двадцати, открывая список заново на каждую,
                     — это не выбор, а перебор. */}
                 <DropdownMenuContent className="bg-surface border-edge min-w-24 max-h-80 overflow-auto" align="end">
-                  <DropdownMenuCheckboxItem
-                    checked={allPartitions}
-                    onSelect={(e) => e.preventDefault()}
-                    // Снять чек с «all» некуда: пустой выбор — это и есть «all».
-                    onCheckedChange={() => onSelectPartitions(null)}
-                    className={`font-mono cursor-pointer ${
-                      allPartitions ? 'text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
-                    }`}
-                  >
-                    all
-                  </DropdownMenuCheckboxItem>
+                  {/* «all» — это выбор ИЗ нескольких. Когда партиция одна, он
+                      совпадает с ней самой, и два пункта на одно и то же
+                      заставляли бы гадать, чем они отличаются. */}
+                  {!onlyPartition && (
+                    <DropdownMenuCheckboxItem
+                      checked={allPartitions}
+                      onSelect={(e) => e.preventDefault()}
+                      // Снять чек с «all» некуда: пустой выбор — это и есть «all».
+                      onCheckedChange={() => onSelectPartitions(null)}
+                      className={`font-mono cursor-pointer ${
+                        allPartitions ? 'text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
+                      }`}
+                    >
+                      all
+                    </DropdownMenuCheckboxItem>
+                  )}
                   {partitions.map((partition) => {
-                    const checked = selectedPartitions?.includes(partition) ?? false;
+                    // Единственная партиция отмечена всегда: её и читаем, что
+                    // бы ни лежало в `selectedPartitions` — и `null`, и `[0]`
+                    // означают там одно и то же.
+                    const checked =
+                      selectedPartitions?.includes(partition) ?? onlyPartition;
                     return (
                       <DropdownMenuCheckboxItem
                         key={partition}
@@ -461,6 +488,12 @@ export function HeaderDesktop({
             них, ничего не открывая, обычное дело. */}
         <IconAction onClick={onOpenFavorites} title="Saved messages">
           <Folder className="size-4" />
+        </IconAction>
+
+        {/* И тем более не под условием `topic`: по ссылке приходят с пустого
+            приложения чаще, чем с открытого. */}
+        <IconAction onClick={onOpenLink} title="Open a message link">
+          <Link2 className="size-4" />
         </IconAction>
 
         {/* Живой хвост — Фаза 3. Кнопка на месте, чтобы не менять раскладку
