@@ -82,7 +82,7 @@ use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
 use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
 use super::types::*;
-use crate::helpers::{base_config, get_cluster_config, producer_config, PRODUCE_TIMEOUT};
+use crate::helpers::{base_config, consumer_config, producer_config, PRODUCE_TIMEOUT};
 use crate::schema::Decoder;
 
 /// Потолок времени на одно чтение (открытие топика или "загрузить ещё").
@@ -128,7 +128,7 @@ const FIRST_ROUND_CHUNK: i64 = 10;
 /// Это АБСОЛЮТНЫЙ пол, страховка от деления на мусор. Настоящий пол считает
 /// `window_floor` — он заметно выше и зависит от размера сообщений.
 const MIN_ROUND_CHUNK: i64 = 5;
-/// Копия `fetch.message.max.bytes` из `helpers::get_cluster_config`. Держать её
+/// Копия `fetch.message.max.bytes` из `helpers::consumer_config`. Держать её
 /// здесь приходится потому, что от неё зависит минимальный ОСМЫСЛЕННЫЙ размер
 /// окна: столько байт брокер пришлёт по партиции в одном фетче в любом случае,
 /// сколько бы офсетов мы ни попросили. Менять только вместе с оригиналом.
@@ -223,11 +223,26 @@ impl FatalError {
 
 /// Ошибки, которые повтором не лечатся. Всё остальное (брокер не ответил,
 /// разорвалось соединение) librdkafka чинит сама, и вмешиваться незачем.
+///
+/// Список — про НАСТРОЙКИ подключения, и это не случайно: отметку читает
+/// только `wait_until_ready`, то есть окно между «нажали Connect» и «кластер
+/// ответил». Всё, что здесь перечислено, за это окно само не исправится.
+///
+/// `SSL` (это `_SSL`, -181) добавлен потому, что без него самая частая ошибка
+/// первой настройки TLS — не тот CA, не то имя в сертификате, не тот
+/// клиентский ключ — выглядела как «can't reach cluster: BrokerTransportFailure»
+/// после пяти секунд ретраев. Точную причину librdkafka называет сразу и
+/// словами, но она уходила в stderr, а пользователю доставался таймаут.
+/// Ровно так же `UnsupportedSASLMechanism` и `IllegalSASLState` — ответ брокера
+/// «этот механизм я не умею», который повторять бессмысленно.
 fn is_fatal(error: &KafkaError) -> bool {
     matches!(
         error,
         KafkaError::Global(RDKafkaErrorCode::Authentication)
             | KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed)
+            | KafkaError::Global(RDKafkaErrorCode::SSL)
+            | KafkaError::Global(RDKafkaErrorCode::UnsupportedSASLMechanism)
+            | KafkaError::Global(RDKafkaErrorCode::IllegalSASLState)
     )
 }
 
@@ -1090,7 +1105,11 @@ impl Worker {
     }
 
     fn connect(&mut self, payload: ClusterConnectPayload) -> Result<(), String> {
-        let mut conf = get_cluster_config(&payload);
+        // Разбираем payload ровно один раз, а консьюмера и продьюсера
+        // достраиваем поверх результата: второй разбор был бы вторым местом,
+        // где настройки безопасности могут разъехаться.
+        let base = base_config(&payload)?;
+        let mut conf = consumer_config(&base);
         // Статистика нужна только ради измерителя квоты, поэтому включается
         // здесь, а не в общем конфиге: `cluster_test` поднимает клиента на
         // одну проверку связи, и собирать для него JSON раз в секунду незачем.
@@ -1152,14 +1171,14 @@ impl Worker {
         // иначе отправка шла бы под пользователем, которого в шапке уже нет.
         // Следующая отправка поднимет нового — из `connection` ниже.
         drop(self.producer.take());
-        self.connection = Some(base_config(&payload));
+        self.connection = Some(base);
         self.cluster_id = cluster_id;
         self.partition_counts.clear();
         Ok(())
     }
 
     fn test(payload: ClusterConnectPayload) -> Result<(), String> {
-        let conf = get_cluster_config(&payload);
+        let conf = consumer_config(&base_config(&payload)?);
         let fatal = Arc::new(FatalError::default());
         // Свой измеритель, в общий не пишем: проверка связи — не чтение, и
         // засчитывать её в измеренную скорость кластера нечего.
@@ -1637,7 +1656,7 @@ impl Worker {
     /// просто выбрасывал её: измеритель квоты не получал ни одного снимка.
     ///
     /// Очередь здесь именно главная: `group.id` мы не задаём (см.
-    /// `helpers::get_cluster_config`), а без него `BaseConsumer::new` не
+    /// `helpers::consumer_config`), а без него `BaseConsumer::new` не
     /// перенаправляет главную очередь в консьюмерскую и слушает первую.
     ///
     /// Сообщения топика сюда не попадают — они идут в нашу приватную очередь

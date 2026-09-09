@@ -28,21 +28,41 @@ where
         .map_err(|e| format!("background task failed: {e}"))?
 }
 
-/// Подставляет пароль из keychain, если фронт его не прислал.
+/// Подставляет пароли из keychain, если фронт их не прислал.
 ///
-/// Для сохранённой учётки пароль вообще не пересекает границу IPC: фронт шлёт
-/// только идентификатор пользователя, а значение подтягивается здесь.
-fn resolve_password(payload: &mut ClusterConnectPayload) -> Result<(), String> {
-    let already_provided = payload.password.as_deref().is_some_and(|p| !p.is_empty());
-    if already_provided {
-        return Ok(());
+/// Для сохранённого кластера пароли вообще не пересекают границу IPC: фронт
+/// шлёт только идентификаторы, а значения подтягиваются здесь.
+fn resolve_secrets(payload: &mut ClusterConnectPayload) -> Result<(), String> {
+    let sasl_provided = payload.password.as_deref().is_some_and(|p| !p.is_empty());
+    if !sasl_provided {
+        // `id` как запасной ключ — ради записей, которые ещё не пережили
+        // миграцию на список пользователей: там ключом в keychain был
+        // идентификатор кластера.
+        let key = payload.user_id.clone().or_else(|| payload.id.clone());
+        if let Some(key) = key {
+            payload.password = config::secrets::read_password(&key)?;
+        }
     }
-    // `id` как запасной ключ — ради записей, которые ещё не пережили миграцию
-    // на список пользователей: там ключом в keychain был идентификатор кластера.
-    let key = payload.user_id.clone().or_else(|| payload.id.clone());
-    if let Some(key) = key {
-        payload.password = config::secrets::read_password(&key)?;
+
+    // Пароль приватного ключа — только когда ключ вообще задан. Лишний поход в
+    // хранилище секретов не бесплатен: на macOS он в худшем случае показывает
+    // диалог доступа, и делать это на каждом подключении к кластеру без mTLS
+    // незачем.
+    let key_provided = payload
+        .ssl_key_password
+        .as_deref()
+        .is_some_and(|p| !p.is_empty());
+    let uses_client_key = payload
+        .ssl_key_path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    if !key_provided && uses_client_key {
+        if let Some(id) = payload.id.as_deref() {
+            let key = ClusterConfig::key_password_secret_key(id);
+            payload.ssl_key_password = config::secrets::read_password(&key)?;
+        }
     }
+
     Ok(())
 }
 
@@ -55,7 +75,7 @@ async fn cluster_connect(
     worker: tauri::State<'_, WorkerHandle>,
     mut payload: ClusterConnectPayload,
 ) -> Result<(), String> {
-    resolve_password(&mut payload)?;
+    resolve_secrets(&mut payload)?;
     let id = payload.id.clone();
     let user_id = payload.user_id.clone();
     worker
@@ -114,7 +134,7 @@ async fn cluster_test(
     worker: tauri::State<'_, WorkerHandle>,
     mut payload: ClusterConnectPayload,
 ) -> Result<(), String> {
-    resolve_password(&mut payload)?;
+    resolve_secrets(&mut payload)?;
     worker.call(|reply| Command::Test(payload, reply)).await?
 }
 
@@ -130,10 +150,16 @@ async fn list_clusters(app: tauri::AppHandle) -> Result<Vec<ClusterConfig>, Stri
 /// разъехавшийся во вкладке список не должен молча затирать keychain. Ровно то
 /// же и с реестром: им заведуют `save_schema_registry`/`delete_schema_registry`,
 /// и сохранение соседнего поля формы не должно его сносить.
+///
+/// `key_password` — пароль приватного ключа для mTLS, по тем же правилам, что и
+/// пароли учёток: непустая строка — записать в keychain, пустая — удалить
+/// оттуда, `None` — не трогать сохранённый. Отдельным аргументом, а не полем
+/// записи, ровно потому, что в саму запись секретам путь закрыт.
 #[tauri::command]
 async fn save_cluster(
     app: tauri::AppHandle,
     cluster: ClusterConfig,
+    key_password: Option<String>,
 ) -> Result<ClusterConfig, String> {
     let mut cluster = cluster;
     let mut clusters = config::load_clusters(&app)?;
@@ -142,7 +168,27 @@ async fn save_cluster(
         cluster.users = existing.users.clone();
         cluster.active_user_id = existing.active_user_id.clone();
         cluster.schema_registry = existing.schema_registry.clone();
+        cluster.has_key_password = existing.has_key_password;
+    } else {
+        // Новой записи наследовать нечего, а форма о содержимом keychain не
+        // знает: признак считается ниже, по тому, что пришло вместе с ней.
+        cluster.has_key_password = false;
     }
+
+    let secret_key = ClusterConfig::key_password_secret_key(&cluster.id);
+    match key_password.as_deref() {
+        Some("") => {
+            config::secrets::delete_password(&secret_key)?;
+            cluster.has_key_password = false;
+        }
+        Some(secret) => {
+            config::secrets::store_password(&secret_key, secret)?;
+            cluster.has_key_password = true;
+        }
+        // Поле пришло пустым просто потому, что пароль не меняли.
+        None => {}
+    }
+
     cluster.migrate();
 
     match clusters.iter_mut().find(|c| c.id == cluster.id) {
@@ -169,6 +215,17 @@ async fn delete_cluster(app: tauri::AppHandle, id: String) -> Result<(), String>
     for user in &removed.users {
         if let Err(e) = config::secrets::delete_password(&user.id) {
             eprintln!("can't delete password of user {}: {e}", user.id);
+        }
+    }
+    // Секреты самого кластера — реестра и приватного ключа — лежат там же, под
+    // ключами с суффиксом. Раньше они переживали удаление кластера и оставались
+    // в хранилище навсегда: ссылок на них после этого нет ни у кого.
+    for key in [
+        SchemaRegistry::secret_key(&id),
+        ClusterConfig::key_password_secret_key(&id),
+    ] {
+        if let Err(e) = config::secrets::delete_password(&key) {
+            eprintln!("can't delete secret {key}: {e}");
         }
     }
     // Схемы топиков привязаны к кластеру — вместе с ним они и уходят. Ошибку,
@@ -270,12 +327,6 @@ async fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), 
 #[tauri::command]
 async fn cluster_disconnect(worker: tauri::State<'_, WorkerHandle>) -> Result<(), String> {
     worker.call(Command::Disconnect).await
-}
-
-/// Механизмы SASL, поддержанные этой сборкой: GSSAPI линкуется не всегда.
-#[tauri::command]
-fn sasl_mechanisms() -> Vec<&'static str> {
-    helpers::supported_sasl_mechanisms()
 }
 
 #[tauri::command]
@@ -1182,7 +1233,6 @@ pub fn run() {
             cluster_connect,
             cluster_disconnect,
             cluster_test,
-            sasl_mechanisms,
             list_clusters,
             save_cluster,
             delete_cluster,

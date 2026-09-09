@@ -50,8 +50,8 @@ export function describeError(e: unknown): string {
 // --- Подключение ------------------------------------------------------------
 
 /**
- * Payload для сохранённого кластера: пароль не передаём, Rust возьмёт его из
- * keychain по `user_id`.
+ * Payload для сохранённого кластера: пароли не передаём, Rust возьмёт их из
+ * keychain — пароль учётки по `user_id`, пароль ключа по `id` кластера.
  */
 export function clusterToPayload(
   cluster: KafkaCluster,
@@ -65,6 +65,10 @@ export function clusterToPayload(
     sasl_mechanism: cluster.sasl_mechanism,
     username: user?.username,
     ssl_ca_bundle_path: cluster.ssl_ca_bundle_path,
+    ssl_certificate_path: cluster.ssl_certificate_path,
+    ssl_key_path: cluster.ssl_key_path,
+    ssl_skip_hostname_check: cluster.ssl_skip_hostname_check,
+    ssl_skip_certificate_verification: cluster.ssl_skip_certificate_verification,
   };
 }
 
@@ -85,8 +89,6 @@ export const clusterTest = (payload: ClusterConnectPayload) =>
 
 export const clusterDisconnect = () => invoke<void>('cluster_disconnect');
 
-export const saslMechanisms = () => invoke<string[]>('sasl_mechanisms');
-
 // --- Сохранённые подключения ------------------------------------------------
 
 export const listClusters = () => invoke<KafkaCluster[]>('list_clusters');
@@ -94,9 +96,13 @@ export const listClusters = () => invoke<KafkaCluster[]>('list_clusters');
 /**
  * Сохраняет параметры подключения. Список пользователей бэкенд берёт из уже
  * сохранённой записи, а не отсюда: им заведуют `saveClusterUser`/`deleteClusterUser`.
+ *
+ * `keyPassword` — пароль приватного ключа для mTLS, по общему для всех паролей
+ * правилу: непустая строка — записать в keychain, пустая — удалить,
+ * `undefined` — не трогать сохранённый.
  */
-export const saveCluster = (cluster: KafkaCluster) =>
-  invoke<KafkaCluster>('save_cluster', { cluster });
+export const saveCluster = (cluster: KafkaCluster, keyPassword?: string) =>
+  invoke<KafkaCluster>('save_cluster', { cluster, keyPassword });
 
 export const deleteCluster = (id: string) => invoke<void>('delete_cluster', { id });
 

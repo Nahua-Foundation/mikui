@@ -354,6 +354,15 @@ export interface KafkaCluster {
   security_protocol: string;
   sasl_mechanism?: string;
   ssl_ca_bundle_path?: string;
+  /** Клиентская пара для mTLS, оба файла PEM. Осмысленны только вместе. */
+  ssl_certificate_path?: string;
+  ssl_key_path?: string;
+  /** Пароль приватного ключа лежит в keychain — здесь только признак, что он
+   *  там есть, как и у паролей учёток. */
+  has_key_password?: boolean;
+  /** Отказы от проверок TLS. Отсутствие поля означает «проверять». */
+  ssl_skip_hostname_check?: boolean;
+  ssl_skip_certificate_verification?: boolean;
   created_at: string;
   last_used?: string;
   users: ClusterUser[];
@@ -379,11 +388,40 @@ export interface ClusterConnectPayload {
   username?: string;
   password?: string;
   ssl_ca_bundle_path?: string;
+  ssl_certificate_path?: string;
+  ssl_key_path?: string;
+  /** Заполняется только для несохранённой формы — как и `password`. */
+  ssl_key_password?: string;
+  ssl_skip_hostname_check?: boolean;
+  ssl_skip_certificate_verification?: boolean;
 }
+
+/**
+ * Механизмы SASL, которые умеет бэкенд.
+ *
+ * Список продублирован из `helpers::SASL_MECHANISMS`: здесь он наполняет
+ * выпадашку, там проверяет пришедшее. Расходиться им нельзя — механизм, которого
+ * нет в бэкенде, форма предложила бы, а подключение отвергло.
+ *
+ * GSSAPI и OAUTHBEARER отсюда убраны: Kerberos требует Cyrus SASL, который не
+ * собирается под Windows, а OAUTHBEARER без libcurl и колбэка выдачи токена
+ * молча висел бы до таймаута. Подробности — в комментарии к константе в Rust.
+ */
+export const SASL_MECHANISMS = ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'];
+
+/** Механизм для новой записи и для записи, в которой его нет. Должен совпадать
+ *  с `helpers::DEFAULT_SASL_MECHANISM`, иначе форма показывала бы один
+ *  механизм, а подключение шло бы другим. */
+export const DEFAULT_SASL_MECHANISM = 'SCRAM-SHA-512';
 
 /** Требуют ли выбранные настройки безопасности SASL-логина. */
 export function needsSasl(securityProtocol: string): boolean {
   return securityProtocol === 'SASL_PLAINTEXT' || securityProtocol === 'SASL_SSL';
+}
+
+/** Требуют ли выбранные настройки безопасности TLS. */
+export function needsTls(securityProtocol: string): boolean {
+  return securityProtocol === 'SSL' || securityProtocol === 'SASL_SSL';
 }
 
 /**

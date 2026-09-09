@@ -126,8 +126,10 @@ ureq = { version = "3", features = ["platform-verifier"] }
 #
 # Фича `sasl` НЕ включена намеренно. В rdkafka-sys `sasl = ["gssapi"]`, а
 # `gssapi = ["ssl", "sasl2-sys"]`, то есть она тянет Cyrus SASL, который не
-# собирается под Windows. SCRAM-SHA-256/512, PLAIN и OAUTHBEARER librdkafka
-# умеет сама поверх OpenSSL, без Cyrus. Kerberos — через фичу `gssapi` ниже.
+# собирается под Windows. SCRAM-SHA-256/512 и PLAIN librdkafka умеет сама
+# поверх OpenSSL, без Cyrus, и ровно этими тремя механизмами ограничен список
+# в `helpers::SASL_MECHANISMS`. Kerberos не поддержан: ради одного механизма
+# он стоил бы кроссплатформенности.
 [target.'cfg(not(windows))'.dependencies]
 rdkafka = { version = "0.36", default-features = false, features = ["libz", "zstd", "ssl-vendored"] }
 
@@ -148,8 +150,3 @@ rdkafka = { version = "0.36", default-features = false, features = ["libz", "zst
 # экземпляра, то есть ровно в тот же обработчик, что и на macOS.
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-
-[features]
-default = []
-# Kerberos/GSSAPI. Тянет Cyrus SASL (sasl2-sys) — только Linux-сборка.
-gssapi = ["rdkafka/gssapi-vendored"]

@@ -7,14 +7,89 @@ import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Input } from '../../ui/input';
 import { Label } from '../../ui/label';
-import { ClusterConnectPayload, KafkaCluster, newId, SchemaRegistryConfig } from '../types';
+import { Checkbox } from '../../ui/checkbox';
+import {
+  ClusterConnectPayload,
+  DEFAULT_SASL_MECHANISM,
+  KafkaCluster,
+  needsSasl,
+  needsTls,
+  newId,
+  SASL_MECHANISMS,
+  SchemaRegistryConfig,
+} from '../types';
 import * as api from '../api';
 import { describeError } from '../api';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
-/** Запасной список на случай, если бэкенд не ответил. GSSAPI сюда не входит:
- *  он есть не в каждой сборке (Cyrus SASL линкуется только фичей `gssapi`). */
-const FALLBACK_MECHANISMS = ['PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512', 'OAUTHBEARER'];
+/** Имя файла из полного пути — показывать целиком незачем, он не помещается.
+ *  Два разделителя, потому что путь приезжает и из Windows, и из POSIX. */
+function fileName(path: string): string {
+  return (path.split('\\').pop() || '').split('/').pop() || '';
+}
+
+/**
+ * Поле «выбрать файл». Их в форме четыре, и ведут они себя одинаково: кнопка,
+ * имя выбранного файла с полным путём в подсказке и «clear», чтобы выбор можно
+ * было снять, а не только заменить другим.
+ */
+function FileField({
+  label,
+  value,
+  onChange,
+  title,
+  extensions,
+  hint,
+}: {
+  label: string;
+  value: string;
+  onChange: (path: string) => void;
+  /** Заголовок системного диалога. */
+  title: string;
+  extensions: string[];
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <Label className="font-mono text-sm text-soft">{label}</Label>
+      <div className="flex items-center gap-3">
+        <Button
+          type="button"
+          variant="outline"
+          className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+          onClick={async () => {
+            const selected = await openDialog({
+              title,
+              multiple: false,
+              filters: [
+                { name: 'Certificates', extensions },
+                { name: 'All Files', extensions: ['*'] },
+              ],
+            });
+            if (typeof selected === 'string') onChange(selected);
+          }}
+        >
+          {value ? 'Choose another file' : 'Choose file'}
+        </Button>
+        {value && (
+          <>
+            <div className="text-xs text-soft truncate max-w-[260px]" title={value}>
+              Selected: <span className="text-slate-50">{fileName(value)}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => onChange('')}
+              className="font-mono text-xs text-dim hover:text-slate-50 bg-transparent border-none cursor-pointer"
+            >
+              clear
+            </button>
+          </>
+        )}
+      </div>
+      {hint && <p className="font-mono text-xs text-dim">{hint}</p>}
+    </div>
+  );
+}
 
 interface ClusterConfigModalProps {
   open: boolean;
@@ -56,7 +131,17 @@ export function ClusterConfigModal({
   const [username, setUsername] = useState<string>('');
   const [password, setPassword] = useState<string>('');
   const [sslCaBundlePath, setSslCaBundlePath] = useState<string>('');
-  const [saslMechanism, setSaslMechanism] = useState<string>('PLAIN');
+  const [saslMechanism, setSaslMechanism] = useState<string>(DEFAULT_SASL_MECHANISM);
+
+  // TLS. Клиентская пара — это mTLS; выключатели проверок нужны стендам и
+  // кластерам, у которых имя в сертификате не совпадает с адресом.
+  const [sslCertificatePath, setSslCertificatePath] = useState<string>('');
+  const [sslKeyPath, setSslKeyPath] = useState<string>('');
+  const [sslKeyPassword, setSslKeyPassword] = useState<string>('');
+  /** Пароль ключа уже лежит в keychain: пустое поле означает «оставить». */
+  const [sslHasKeyPassword, setSslHasKeyPassword] = useState<boolean>(false);
+  const [skipHostnameCheck, setSkipHostnameCheck] = useState<boolean>(false);
+  const [skipCertificateVerification, setSkipCertificateVerification] = useState<boolean>(false);
 
   // Schema Registry. Живёт на кластере, а не на топике: реестр в кластере один.
   const [registryUrl, setRegistryUrl] = useState<string>('');
@@ -71,16 +156,19 @@ export function ClusterConfigModal({
   const [isTesting, setIsTesting] = useState<boolean>(false);
   const [isTestingRegistry, setIsTestingRegistry] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
-  const [mechanisms, setMechanisms] = useState<string[]>(FALLBACK_MECHANISMS);
 
-  // Какие механизмы доступны, знает только бэкенд: GSSAPI требует Cyrus SASL,
-  // который линкуется не во всех сборках. Спрашиваем один раз за жизнь модалки.
-  useEffect(() => {
-    api
-      .saslMechanisms()
-      .then(setMechanisms)
-      .catch((e) => console.error('Failed to load SASL mechanisms', e));
-  }, []);
+  /**
+   * Что показать в выпадашке механизмов.
+   *
+   * Сохранённое значение показываем даже тогда, когда оно не поддержано: иначе
+   * Select оставил бы триггер пустым, и человек не увидел бы, чем, по мнению
+   * записи, он подключается. Такие значения остались от сборок, где в меню
+   * были GSSAPI и OAUTHBEARER; бэкенд их теперь отвергает по имени, и заменить
+   * их надо осознанно, а не молча.
+   */
+  const mechanismOptions = SASL_MECHANISMS.includes(saslMechanism)
+    ? SASL_MECHANISMS
+    : [...SASL_MECHANISMS, saslMechanism];
 
   /**
    * Правит ли форма логин и пароль.
@@ -103,7 +191,15 @@ export function ClusterConfigModal({
       setBrokers(cluster.brokers);
       setSecurityProtocol(cluster.security_protocol);
       setSslCaBundlePath(cluster.ssl_ca_bundle_path || '');
-      setSaslMechanism(cluster.sasl_mechanism || 'PLAIN');
+      // Умолчание то же, что и в бэкенде: запись без механизма подключается
+      // именно им, и показать здесь что-то другое значило бы соврать.
+      setSaslMechanism(cluster.sasl_mechanism || DEFAULT_SASL_MECHANISM);
+      setSslCertificatePath(cluster.ssl_certificate_path || '');
+      setSslKeyPath(cluster.ssl_key_path || '');
+      setSslHasKeyPassword(cluster.has_key_password ?? false);
+      setSslKeyPassword('');
+      setSkipHostnameCheck(cluster.ssl_skip_hostname_check ?? false);
+      setSkipCertificateVerification(cluster.ssl_skip_certificate_verification ?? false);
       const user = api.activeUser(cluster);
       setUserId(user?.id ?? null);
       setUsername(user?.username ?? '');
@@ -124,7 +220,13 @@ export function ClusterConfigModal({
       setUsername('');
       setPassword('');
       setSslCaBundlePath('');
-      setSaslMechanism('PLAIN');
+      setSaslMechanism(DEFAULT_SASL_MECHANISM);
+      setSslCertificatePath('');
+      setSslKeyPath('');
+      setSslKeyPassword('');
+      setSslHasKeyPassword(false);
+      setSkipHostnameCheck(false);
+      setSkipCertificateVerification(false);
       setRegistryUrl('');
       setRegistryUser('');
       setRegistryPassword('');
@@ -157,6 +259,13 @@ export function ClusterConfigModal({
     username: isSASLRequired ? (editsCredentials ? username : savedUser?.username) : undefined,
     password: isSASLRequired && password ? password : undefined,
     ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
+    ssl_certificate_path: isSSLRequired ? sslCertificatePath : undefined,
+    ssl_key_path: isSSLRequired ? sslKeyPath : undefined,
+    // Как и пароль учётки: сохранённый бэкенд возьмёт из keychain сам, по id
+    // кластера. Отправляем только введённый руками.
+    ssl_key_password: isSSLRequired && sslKeyPassword ? sslKeyPassword : undefined,
+    ssl_skip_hostname_check: isSSLRequired && skipHostnameCheck,
+    ssl_skip_certificate_verification: isSSLRequired && skipCertificateVerification,
   });
 
   const buildConfig = (): KafkaCluster => ({
@@ -166,16 +275,53 @@ export function ClusterConfigModal({
     security_protocol: securityProtocol,
     sasl_mechanism: isSASLRequired ? saslMechanism : undefined,
     ssl_ca_bundle_path: isSSLRequired ? sslCaBundlePath : undefined,
+    ssl_certificate_path: isSSLRequired ? sslCertificatePath : undefined,
+    ssl_key_path: isSSLRequired ? sslKeyPath : undefined,
+    // Признак бэкенд пересчитает сам по тому, что сделал с keychain; здесь он
+    // только чтобы тип был честным — как и список учёток ниже.
+    has_key_password: sslHasKeyPassword,
+    ssl_skip_hostname_check: isSSLRequired && skipHostnameCheck,
+    ssl_skip_certificate_verification: isSSLRequired && skipCertificateVerification,
     created_at: cluster?.created_at || new Date().toISOString(),
     last_used: cluster?.last_used,
-    // Список учёток бэкенд всё равно возьмёт из своей записи — здесь он только
-    // чтобы тип был честным.
     users: cluster?.users ?? [],
     active_user_id: cluster?.active_user_id,
   });
 
+  /**
+   * Первая претензия к форме или `null`, если их нет.
+   *
+   * Проверяем ровно то, во что librdkafka упирается сама, но объясняет своими
+   * словами и с задержкой: пустой адрес и половину клиентской пары она заметит
+   * при создании клиента, а отсутствующий логин — уже отказом брокера. По одной
+   * претензии за раз, потому что вторая обычно следствие первой.
+   */
+  const validate = (): string | null => {
+    if (!brokers.trim()) return 'Bootstrap servers are required';
+
+    if (isSASLRequired) {
+      const login = editsCredentials ? username.trim() : (savedUser?.username ?? '');
+      if (!login) return 'SASL needs a username — add a user for this cluster';
+    }
+
+    if (isSSLRequired) {
+      const hasCertificate = sslCertificatePath.trim() !== '';
+      const hasKey = sslKeyPath.trim() !== '';
+      if (hasCertificate !== hasKey) {
+        return 'Mutual TLS needs both the client certificate and the private key';
+      }
+    }
+
+    return null;
+  };
+
   const handleConnect = async () => {
     if (!onConnect) return;
+    const complaint = validate();
+    if (complaint) {
+      toast.error(complaint);
+      return;
+    }
     try {
       setIsConnecting(true);
       await onConnect(buildPayload(), name || brokers);
@@ -186,13 +332,18 @@ export function ClusterConfigModal({
   };
 
   const handleTestConnection = async () => {
+    const complaint = validate();
+    if (complaint) {
+      toast.error(complaint);
+      return;
+    }
     try {
       setIsTesting(true);
       await api.clusterTest(buildPayload());
       toast.success('Connection test successful');
     } catch (e) {
       console.error(e);
-      toast.error(`Connection test failed: ${e}`);
+      toast.error(`Connection test failed: ${describeError(e)}`);
     } finally {
       setIsTesting(false);
     }
@@ -233,9 +384,25 @@ export function ClusterConfigModal({
   };
 
   const handleSave = async () => {
+    const complaint = validate();
+    if (complaint) {
+      toast.error(complaint);
+      return;
+    }
     try {
       setIsSaving(true);
-      let saved = await api.saveCluster(buildConfig());
+
+      // Пустое поле пароля ключа означает «оставить сохранённый» — как и у
+      // паролей учёток. Стереть его из keychain нужно ровно в одном случае:
+      // сам ключ из настроек убрали, и пароль остался бы от несуществующего.
+      const usesClientKey = isSSLRequired && sslKeyPath.trim() !== '';
+      const keyPassword = sslKeyPassword
+        ? sslKeyPassword
+        : sslHasKeyPassword && !usesClientKey
+          ? ''
+          : undefined;
+
+      let saved = await api.saveCluster(buildConfig(), keyPassword);
 
       // Логин из формы — это учётка кластера, а не отдельная настройка
       // подключения: при создании она заводится первой, при правке обновляет
@@ -291,8 +458,10 @@ export function ClusterConfigModal({
     }
   };
 
-  const isSSLRequired = securityProtocol === 'SSL' || securityProtocol === 'SASL_SSL';
-  const isSASLRequired = securityProtocol === 'SASL_PLAINTEXT' || securityProtocol === 'SASL_SSL';
+  // Через общие предикаты, а не своим сравнением: этот же вопрос задаёт шапка,
+  // и два ответа на него разъехались бы на первом же новом протоколе.
+  const isSSLRequired = needsTls(securityProtocol);
+  const isSASLRequired = needsSasl(securityProtocol);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -380,8 +549,15 @@ export function ClusterConfigModal({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent className="bg-surface border-edge">
-                      {mechanisms.map((mech) => (
-                        <SelectItem key={mech} value={mech} className="text-slate-50 font-mono focus:bg-edge">{mech}</SelectItem>
+                      {mechanismOptions.map((mech) => (
+                        <SelectItem
+                          key={mech}
+                          value={mech}
+                          className="text-slate-50 font-mono focus:bg-edge"
+                        >
+                          {mech}
+                          {!SASL_MECHANISMS.includes(mech) && ' · not supported'}
+                        </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
@@ -485,39 +661,105 @@ export function ClusterConfigModal({
               <div className="space-y-4 border border-edge rounded-lg p-4">
                 <h3 className="font-mono text-brand text-sm">SSL Configuration</h3>
 
-                <div className="grid grid-cols-1 gap-1">
-                  <div className="space-y-1">
-                    <Label className="font-mono text-sm text-soft">
-                      CA bundle
-                    </Label>
-                    <div className="flex items-center gap-3">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
-                        onClick={async () => {
-                          const selected = await openDialog({
-                            title: 'Select CA bundle file',
-                            multiple: false,
-                            filters: [
-                              { name: 'Certificates', extensions: ['crt', 'pem', 'cer'] },
-                              { name: 'All Files', extensions: ['*'] },
-                            ],
-                          });
-                          if (typeof selected === 'string') {
-                            setSslCaBundlePath(selected);
-                          }
-                        }}
-                      >
-                        {sslCaBundlePath ? 'Choose another file' : 'Choose file'}
-                      </Button>
-                      {sslCaBundlePath && (
-                        <div className="text-xs text-soft truncate max-w-[260px]" title={sslCaBundlePath}>
-                          Selected: <span className="text-slate-50">{(sslCaBundlePath.split('\\').pop() || '').split('/').pop()}</span>
-                        </div>
-                      )}
+                <FileField
+                  label="CA bundle"
+                  value={sslCaBundlePath}
+                  onChange={setSslCaBundlePath}
+                  title="Select CA bundle file"
+                  extensions={['crt', 'pem', 'cer']}
+                  // Без своего файла корни берутся из системы: на macOS и Linux
+                  // librdkafka прощупывает стандартные пути, на Windows читает
+                  // Root store. Публично подписанному кластеру бандл не нужен.
+                  hint="Only needed if the brokers are signed by a CA the system does not trust."
+                />
+
+                {/* Клиентская пара — mTLS. Именно PEM: keystore и truststore из
+                    мира Java librdkafka не читает. */}
+                <FileField
+                  label="Client certificate"
+                  value={sslCertificatePath}
+                  onChange={(path) => {
+                    setSslCertificatePath(path);
+                    // Ключ без сертификата не значит ничего, а поля его после
+                    // этого уже не видно: оставшийся путь запер бы форму
+                    // жалобой на половину пары, которую нечем убрать.
+                    if (!path) {
+                      setSslKeyPath('');
+                      setSslKeyPassword('');
+                    }
+                  }}
+                  title="Select client certificate (PEM)"
+                  extensions={['crt', 'pem', 'cer']}
+                  hint="Only for clusters that ask the client to present a certificate."
+                />
+
+                {sslCertificatePath !== '' && (
+                  <>
+                    <FileField
+                      label="Client private key"
+                      value={sslKeyPath}
+                      onChange={setSslKeyPath}
+                      title="Select the private key (PEM)"
+                      extensions={['key', 'pem']}
+                    />
+                    <div className="space-y-1">
+                      <Label className="font-mono text-sm text-soft">Key password</Label>
+                      <Input
+                        type="password"
+                        value={sslKeyPassword}
+                        onChange={(e) => setSslKeyPassword(e.target.value)}
+                        placeholder={
+                          sslHasKeyPassword
+                            ? 'Saved in keychain — leave blank to keep'
+                            : 'Only if the key is encrypted'
+                        }
+                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                      />
                     </div>
+                  </>
+                )}
+
+                {/* Отказы от проверок. Оба выключателя существуют ради стендов
+                    и кластеров, до которых иначе не дотянуться, поэтому названы
+                    тем, что делают, и снабжены ценой. */}
+                <div className="space-y-2 pt-1">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="ssl-skip-hostname"
+                      checked={skipHostnameCheck}
+                      onCheckedChange={(checked) => setSkipHostnameCheck(checked === true)}
+                    />
+                    <Label
+                      htmlFor="ssl-skip-hostname"
+                      className="font-mono text-sm text-soft cursor-pointer"
+                    >
+                      Skip hostname verification
+                    </Label>
                   </div>
+                  <p className="font-mono text-xs text-dim">
+                    For brokers reached by an address the certificate does not name — an IP or
+                    an alias.
+                  </p>
+
+                  <div className="flex items-center gap-2 pt-1">
+                    <Checkbox
+                      id="ssl-skip-verification"
+                      checked={skipCertificateVerification}
+                      onCheckedChange={(checked) =>
+                        setSkipCertificateVerification(checked === true)
+                      }
+                    />
+                    <Label
+                      htmlFor="ssl-skip-verification"
+                      className="font-mono text-sm text-soft cursor-pointer"
+                    >
+                      Skip certificate verification
+                    </Label>
+                  </div>
+                  <p className="font-mono text-xs text-dim">
+                    Traffic stays encrypted, but nothing proves it is the right broker. For test
+                    stands only.
+                  </p>
                 </div>
               </div>
             )}
@@ -571,54 +813,16 @@ export function ClusterConfigModal({
                     </div>
                   </div>
 
-                  <div className="space-y-1">
-                    <Label className="font-mono text-sm text-soft">CA bundle</Label>
-                    <div className="flex items-center gap-3">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
-                        onClick={async () => {
-                          const selected = await openDialog({
-                            title: 'Select CA bundle for the schema registry',
-                            multiple: false,
-                            filters: [
-                              { name: 'Certificates', extensions: ['crt', 'pem', 'cer'] },
-                              { name: 'All Files', extensions: ['*'] },
-                            ],
-                          });
-                          if (typeof selected === 'string') setRegistryCaPath(selected);
-                        }}
-                      >
-                        {registryCaPath ? 'Choose another file' : 'Choose file'}
-                      </Button>
-                      {registryCaPath && (
-                        <div
-                          className="text-xs text-soft truncate max-w-[260px]"
-                          title={registryCaPath}
-                        >
-                          Selected:{' '}
-                          <span className="text-slate-50">
-                            {(registryCaPath.split('\\').pop() || '').split('/').pop()}
-                          </span>
-                        </div>
-                      )}
-                      {registryCaPath && (
-                        <button
-                          type="button"
-                          onClick={() => setRegistryCaPath('')}
-                          className="font-mono text-xs text-dim hover:text-slate-50 bg-transparent border-none cursor-pointer"
-                        >
-                          clear
-                        </button>
-                      )}
-                    </div>
-                    {/* Без своего файла берётся системное хранилище — туда
-                        корпоративный CA обычно и ставят централизованно. */}
-                    <p className="font-mono text-xs text-dim">
-                      Only needed if the registry is signed by a CA the system does not trust.
-                    </p>
-                  </div>
+                  {/* Без своего файла берётся системное хранилище — туда
+                      корпоративный CA обычно и ставят централизованно. */}
+                  <FileField
+                    label="CA bundle"
+                    value={registryCaPath}
+                    onChange={setRegistryCaPath}
+                    title="Select CA bundle for the schema registry"
+                    extensions={['crt', 'pem', 'cer']}
+                    hint="Only needed if the registry is signed by a CA the system does not trust."
+                  />
 
                   <Button
                     type="button"

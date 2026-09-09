@@ -70,6 +70,25 @@ pub struct ClusterConfig {
     pub sasl_mechanism: Option<String>,
     #[serde(default)]
     pub ssl_ca_bundle_path: Option<String>,
+    /// Клиентская пара для mTLS: сертификат и приватный ключ, оба PEM.
+    /// Осмысленны только вместе — подключение с половиной пары отвергается
+    /// (см. `helpers::apply_tls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_certificate_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_key_path: Option<String>,
+    /// Пароля ключа здесь, как и пароля учётки, нет: он лежит в системном
+    /// хранилище секретов под ключом `<id кластера>:sslkey`.
+    #[serde(default)]
+    pub has_key_password: bool,
+    /// Отказы от проверок TLS. Названы через «skip» намеренно: `#[serde(default)]`
+    /// даёт `false`, то есть запись, сделанная прежней сборкой, читается как
+    /// «проверять всё». Обратные по смыслу поля (`verify_*`) дали бы при том же
+    /// умолчании молчаливое отключение проверок на всех старых записях.
+    #[serde(default)]
+    pub ssl_skip_hostname_check: bool,
+    #[serde(default)]
+    pub ssl_skip_certificate_verification: bool,
     pub created_at: String,
     #[serde(default)]
     pub last_used: Option<String>,
@@ -109,6 +128,16 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Ключ пароля приватного ключа в системном хранилище.
+    ///
+    /// С суффиксом по той же причине, что и у реестра (`SchemaRegistry::secret_key`):
+    /// остальные ключи там — идентификаторы учёток, а у мигрированной учётки
+    /// идентификатор совпадает с идентификатором кластера. Без суффикса пароль
+    /// ключа затёр бы её пароль.
+    pub fn key_password_secret_key(cluster_id: &str) -> String {
+        format!("{cluster_id}:sslkey")
+    }
+
     /// Приводит запись к текущему формату.
     ///
     /// Идентификатор мигрированной учётки намеренно равен идентификатору
@@ -230,6 +259,41 @@ mod tests {
 
         assert!(cfg.users.is_empty());
         assert!(cfg.active_user_id.is_none());
+    }
+
+    /// Запись, сделанная сборкой без полей TLS, обязана читаться как «проверять
+    /// сертификат и имя хоста». Умолчание здесь — вопрос безопасности, а не
+    /// удобства.
+    #[test]
+    fn a_record_without_tls_fields_keeps_every_check_on() {
+        let cfg = parse(
+            r#"{
+                "id": "c4", "name": "prod", "brokers": "b:9093",
+                "security_protocol": "SASL_SSL",
+                "created_at": "2026-01-01T00:00:00Z"
+            }"#,
+        );
+
+        assert!(!cfg.ssl_skip_hostname_check);
+        assert!(!cfg.ssl_skip_certificate_verification);
+        assert!(cfg.ssl_certificate_path.is_none());
+        assert!(!cfg.has_key_password);
+    }
+
+    /// Три вида секретов кластера лежат в одном хранилище и различаются только
+    /// ключом. Совпади любые два — один пароль затёр бы другой.
+    #[test]
+    fn secret_keys_of_one_cluster_never_collide() {
+        let cluster = "c1";
+        // Идентификатор мигрированной учётки равен идентификатору кластера —
+        // именно поэтому у остальных секретов суффиксы.
+        let user = cluster.to_string();
+        let registry = SchemaRegistry::secret_key(cluster);
+        let key = ClusterConfig::key_password_secret_key(cluster);
+
+        assert_ne!(user, registry);
+        assert_ne!(user, key);
+        assert_ne!(registry, key);
     }
 
     #[test]

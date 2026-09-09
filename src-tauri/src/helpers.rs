@@ -3,26 +3,42 @@ use std::time::Duration;
 use crate::kafka::ClusterConnectPayload;
 use rdkafka::ClientConfig;
 
-/// Механизмы SASL, которые реально поддержаны текущей сборкой.
-/// GSSAPI требует Cyrus SASL, который линкуется только с фичей `gssapi`
-/// (см. комментарий в Cargo.toml), поэтому список зависит от сборки.
-pub fn supported_sasl_mechanisms() -> Vec<&'static str> {
-    let mut mechs = vec!["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER"];
-    if cfg!(feature = "gssapi") {
-        mechs.push("GSSAPI");
-    }
-    mechs
-}
+/// Механизмы SASL, которые умеет эта сборка.
+///
+/// Список закрытый, и оба отсутствующих в нём механизма отсутствуют по делу.
+///
+/// **GSSAPI** требует Cyrus SASL (`sasl2-sys`), который не собирается под
+/// Windows, — то есть пункт меню стоил бы кроссплатформенности.
+///
+/// **OAUTHBEARER** librdkafka без посторонней помощи не умеет вовсе: токен она
+/// ждёт от приложения через `oauthbearer_token_refresh_cb`, rdkafka-rust ставит
+/// этот колбэк только при `ClientContext::ENABLE_REFRESH_OAUTH_TOKEN`, а
+/// встроенный OIDC-путь (`sasl.oauthbearer.method=oidc`) собирается лишь с
+/// libcurl, которого здесь нет (rdkafka-sys без фичи `curl` конфигурирует
+/// librdkafka с `--disable-curl`). Без всего этого librdkafka просто кладёт в
+/// очередь просьбу выдать токен, обрабатывать её некому, и подключение молча
+/// висит до таймаута. Пункт в меню обещал бы то, чего не бывает.
+///
+/// Тот же список продублирован в `ClusterConfigModal.tsx`, где наполняет
+/// выпадашку. Расходиться им нельзя: здесь проверка, там меню.
+pub const SASL_MECHANISMS: [&str; 3] = ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"];
+
+/// Механизм для записи, в которой он не указан.
+///
+/// Такие записи есть: `sasl_mechanism` появился в `clusters.json` не сразу.
+/// Значение должно совпадать с начальным в форме подключения — иначе форма
+/// показывала бы один механизм, а подключение шло бы другим.
+pub const DEFAULT_SASL_MECHANISM: &str = "SCRAM-SHA-512";
 
 /// Общая часть конфигурации: адреса, сеть, безопасность.
 ///
-/// Отдельно от `get_cluster_config` потому, что отправка сообщения поднимает
+/// Отдельно от `consumer_config` потому, что отправка сообщения поднимает
 /// продьюсера на том же подключении, а консьюмерские настройки (`fetch.*`,
 /// `queued.*`, `auto.offset.reset`) для него не значат ничего: librdkafka
 /// сложит их в конфиг, увидит чужой scope и на каждую напишет предупреждение.
 /// Держать «куда и под кем подключаемся» в одном месте, а «читаем или пишем» —
 /// в другом, заодно избавляет от риска, что продьюсер уедет мимо TLS.
-pub fn base_config(conf: &ClusterConnectPayload) -> ClientConfig {
+pub fn base_config(conf: &ClusterConnectPayload) -> Result<ClientConfig, String> {
     let mut cc = ClientConfig::new();
 
     cc.set("bootstrap.servers", &conf.brokers);
@@ -81,13 +97,18 @@ pub fn base_config(conf: &ClusterConnectPayload) -> ClientConfig {
     cc.set("reconnect.backoff.ms", "300");
     cc.set("reconnect.backoff.max.ms", "10000");
 
-    apply_security(&mut cc, conf);
+    apply_security(&mut cc, conf)?;
 
-    cc
+    Ok(cc)
 }
 
-pub fn get_cluster_config(conf: &ClusterConnectPayload) -> ClientConfig {
-    let mut cc = base_config(conf);
+/// Консьюмерская часть поверх уже настроенного подключения.
+///
+/// Берёт готовый `base_config` по той же причине, по которой его берёт
+/// `producer_config`: подключение настраивается ровно один раз, и второй разбор
+/// того же payload означал бы второе место, где безопасность может разъехаться.
+pub fn consumer_config(base: &ClientConfig) -> ClientConfig {
+    let mut cc = base.clone();
 
     // --- Fetch ------------------------------------------------------------
     // Пара (min.bytes=1, wait.max.ms=500) — дефолт librdkafka, и она лучше
@@ -202,57 +223,379 @@ pub fn producer_config(base: &ClientConfig) -> ClientConfig {
 /// библиотеки, либо ждал впустую после того, как та уже всё бросила.
 pub const PRODUCE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn apply_security(cc: &mut ClientConfig, conf: &ClusterConnectPayload) {
-    // Механизм по умолчанию. PLAIN/SCRAM/OAUTHBEARER librdkafka умеет сама,
-    // без Cyrus SASL.
-    let mechanism = || -> String {
-        conf.sasl_mechanism
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("SCRAM-SHA-512")
-            .to_string()
-    };
-
-    let ca_bundle = conf
-        .ssl_ca_bundle_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let credentials = |cc: &mut ClientConfig| {
-        if let Some(user) = &conf.username {
-            cc.set("sasl.username", user);
-        }
-        if let Some(pwd) = &conf.password {
-            cc.set("sasl.password", pwd);
-        }
-    };
-
+fn apply_security(cc: &mut ClientConfig, conf: &ClusterConnectPayload) -> Result<(), String> {
     match conf.security_protocol.trim().to_ascii_uppercase().as_str() {
+        "PLAINTEXT" => {
+            cc.set("security.protocol", "plaintext");
+        }
         "SSL" => {
             cc.set("security.protocol", "ssl");
-            // Раньше здесь всё было закомментировано, из-за чего режим SSL
-            // молча не работал: CA-бандл из UI никуда не доезжал.
-            if let Some(path) = ca_bundle {
-                cc.set("ssl.ca.location", path);
-            }
-        }
-        "SASL_SSL" => {
-            cc.set("security.protocol", "sasl_ssl");
-            cc.set("sasl.mechanism", mechanism());
-            if let Some(path) = ca_bundle {
-                cc.set("ssl.ca.location", path);
-            }
-            credentials(cc);
+            apply_tls(cc, conf)?;
         }
         "SASL_PLAINTEXT" => {
             cc.set("security.protocol", "sasl_plaintext");
-            cc.set("sasl.mechanism", mechanism());
-            credentials(cc);
+            cc.set("sasl.mechanism", mechanism(conf)?);
+            apply_credentials(cc, conf);
         }
-        _ => {
-            cc.set("security.protocol", "plaintext");
+        "SASL_SSL" => {
+            cc.set("security.protocol", "sasl_ssl");
+            cc.set("sasl.mechanism", mechanism(conf)?);
+            apply_tls(cc, conf)?;
+            apply_credentials(cc, conf);
+        }
+        // Раньше сюда падало всё незнакомое, и подключение молча уходило
+        // открытым текстом: опечатка в `clusters.json` или запись, сделанная
+        // более новой сборкой, давала не отказ, а соединение не по тому
+        // протоколу, о котором просили. Если брокер слушает PLAINTEXT-порт,
+        // такое ещё и удаётся.
+        other => {
+            return Err(format!(
+                "unknown security protocol \"{other}\": expected PLAINTEXT, SSL, \
+                 SASL_PLAINTEXT or SASL_SSL"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Механизм SASL: тот, что назван, либо умолчание для записей без него.
+///
+/// Незнакомый отвергаем, а не отдаём librdkafka: она ответит на него отказом в
+/// создании клиента, но текстом про свой список механизмов, в котором есть и
+/// те, что эта сборка не поддерживает. Сообщение про «this build» точнее.
+/// Отдельно это важно для записей со времён, когда в меню были GSSAPI и
+/// OAUTHBEARER: подключение с ними всё равно не работало.
+fn mechanism(conf: &ClusterConnectPayload) -> Result<String, String> {
+    let named = conf
+        .sasl_mechanism
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(named) = named else {
+        return Ok(DEFAULT_SASL_MECHANISM.to_string());
+    };
+
+    // Регистр librdkafka не важен, но приводим к своему: так значение в конфиге
+    // совпадает с тем, что показано в форме.
+    let upper = named.to_ascii_uppercase();
+    if SASL_MECHANISMS.contains(&upper.as_str()) {
+        Ok(upper)
+    } else {
+        Err(format!(
+            "unsupported SASL mechanism \"{named}\": this build supports {}",
+            SASL_MECHANISMS.join(", ")
+        ))
+    }
+}
+
+fn apply_credentials(cc: &mut ClientConfig, conf: &ClusterConnectPayload) {
+    if let Some(user) = &conf.username {
+        cc.set("sasl.username", user);
+    }
+    // Пароль намеренно не тримится: пробелы по краям — это часть пароля.
+    if let Some(pwd) = &conf.password {
+        cc.set("sasl.password", pwd);
+    }
+}
+
+/// TLS: чем проверяем брокера, чем представляемся сами и от каких проверок
+/// отказываемся.
+fn apply_tls(cc: &mut ClientConfig, conf: &ClusterConnectPayload) -> Result<(), String> {
+    // Раньше здесь всё было закомментировано, из-за чего режим SSL молча не
+    // работал: CA-бандл из UI никуда не доезжал.
+    //
+    // Пустое значение не ставим вовсе, и это не то же самое, что поставить
+    // пустую строку: без `ssl.ca.location` librdkafka ищет корни сама —
+    // на macOS подставляет `probe`, на Windows читает Root store, на Linux при
+    // статически слинкованном OpenSSL прощупывает стандартные пути. Публично
+    // подписанному кластеру свой бандл поэтому не нужен.
+    if let Some(path) = trimmed(&conf.ssl_ca_bundle_path) {
+        cc.set("ssl.ca.location", path);
+    }
+
+    // Клиентская пара — это mTLS. Именно PEM-файлы, а не JKS: keystore и
+    // truststore из мира Java librdkafka не читает.
+    match (
+        trimmed(&conf.ssl_certificate_path),
+        trimmed(&conf.ssl_key_path),
+    ) {
+        (Some(cert), Some(key)) => {
+            cc.set("ssl.certificate.location", cert);
+            cc.set("ssl.key.location", key);
+            // Пароль ключа, как и пароль SASL, не тримится.
+            if let Some(pwd) = conf.ssl_key_password.as_deref().filter(|p| !p.is_empty()) {
+                cc.set("ssl.key.password", pwd);
+            }
+        }
+        (None, None) => {}
+        // Половина пары бесполезна: librdkafka отвергла бы её сама, но уже в
+        // недрах OpenSSL и соответствующим текстом.
+        (Some(_), None) => {
+            return Err("client certificate is set but the private key is missing: \
+                        mutual TLS needs both"
+                .into())
+        }
+        (None, Some(_)) => {
+            return Err("private key is set but the client certificate is missing: \
+                        mutual TLS needs both"
+                .into())
+        }
+    }
+
+    // Дальше — отказы от проверок. Оба выключателя существуют ради стендов и
+    // кластеров, до которых иначе не дотянуться: имя в сертификате брокера
+    // сплошь и рядом не совпадает с адресом, по которому к нему ходят
+    // (bootstrap по IP, alias, проброшенный порт), а на самоподписанных
+    // стендах бандла может не быть вовсе. По умолчанию оба выключателя
+    // выключены, и это свойство закреплено тестом: настройка «не проверять»
+    // обязана быть осознанной.
+    if conf.ssl_skip_hostname_check {
+        cc.set("ssl.endpoint.identification.algorithm", "none");
+    }
+    if conf.ssl_skip_certificate_verification {
+        cc.set("enable.ssl.certificate.verification", "false");
+    }
+
+    Ok(())
+}
+
+/// Непустое значение поля-пути. Пустая строка приезжает из формы наравне с
+/// отсутствием значения и означает ровно то же самое.
+fn trimmed(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Сборка конфигурации — единственная часть подключения, которую можно
+/// проверить без кластера: это чистая функция, а `ClientConfig::get` показывает
+/// каждое выставленное значение. Всё остальное (доехало ли рукопожатие,
+/// принял ли брокер механизм) проверяется только руками на живом кластере,
+/// поэтому здесь закрыта хотя бы таблица «протокол × механизм × TLS».
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(protocol: &str) -> ClusterConnectPayload {
+        ClusterConnectPayload {
+            id: None,
+            user_id: None,
+            brokers: "b:9092".into(),
+            security_protocol: protocol.into(),
+            sasl_mechanism: None,
+            username: Some("alice".into()),
+            password: Some("secret".into()),
+            ssl_ca_bundle_path: None,
+            ssl_certificate_path: None,
+            ssl_key_path: None,
+            ssl_key_password: None,
+            ssl_skip_hostname_check: false,
+            ssl_skip_certificate_verification: false,
+        }
+    }
+
+    fn config(conf: &ClusterConnectPayload) -> ClientConfig {
+        base_config(conf).expect("config should build")
+    }
+
+    // --- Протоколы -----------------------------------------------------------
+
+    #[test]
+    fn plaintext_carries_neither_credentials_nor_tls() {
+        let cc = config(&payload("PLAINTEXT"));
+
+        assert_eq!(cc.get("security.protocol"), Some("plaintext"));
+        assert_eq!(cc.get("sasl.mechanism"), None);
+        // Логин у записи вполне может быть — от прежнего протокола или потому,
+        // что кластер смотрят и так, и так. Слать его в открытую нельзя.
+        assert_eq!(cc.get("sasl.username"), None);
+        assert_eq!(cc.get("sasl.password"), None);
+    }
+
+    #[test]
+    fn ssl_authenticates_the_broker_but_sends_no_login() {
+        let mut conf = payload("SSL");
+        conf.ssl_ca_bundle_path = Some("/certs/ca.pem".into());
+        let cc = config(&conf);
+
+        assert_eq!(cc.get("security.protocol"), Some("ssl"));
+        assert_eq!(cc.get("ssl.ca.location"), Some("/certs/ca.pem"));
+        assert_eq!(cc.get("sasl.mechanism"), None);
+        assert_eq!(cc.get("sasl.username"), None);
+    }
+
+    #[test]
+    fn sasl_plaintext_sends_the_login_without_tls() {
+        let mut conf = payload("SASL_PLAINTEXT");
+        conf.sasl_mechanism = Some("SCRAM-SHA-256".into());
+        let cc = config(&conf);
+
+        assert_eq!(cc.get("security.protocol"), Some("sasl_plaintext"));
+        assert_eq!(cc.get("sasl.mechanism"), Some("SCRAM-SHA-256"));
+        assert_eq!(cc.get("sasl.username"), Some("alice"));
+        assert_eq!(cc.get("sasl.password"), Some("secret"));
+        assert_eq!(cc.get("ssl.ca.location"), None);
+    }
+
+    #[test]
+    fn sasl_ssl_sets_both_halves() {
+        let mut conf = payload("SASL_SSL");
+        conf.sasl_mechanism = Some("SCRAM-SHA-512".into());
+        conf.ssl_ca_bundle_path = Some("/certs/ca.pem".into());
+        let cc = config(&conf);
+
+        assert_eq!(cc.get("security.protocol"), Some("sasl_ssl"));
+        assert_eq!(cc.get("sasl.mechanism"), Some("SCRAM-SHA-512"));
+        assert_eq!(cc.get("sasl.username"), Some("alice"));
+        assert_eq!(cc.get("ssl.ca.location"), Some("/certs/ca.pem"));
+    }
+
+    #[test]
+    fn the_protocol_is_read_case_insensitively_and_untrimmed() {
+        let cc = config(&payload("  sasl_ssl  "));
+        assert_eq!(cc.get("security.protocol"), Some("sasl_ssl"));
+    }
+
+    /// Незнакомый протокол раньше молча становился PLAINTEXT — то есть
+    /// опечатка давала не отказ, а подключение открытым текстом.
+    #[test]
+    fn an_unknown_protocol_is_refused_instead_of_silently_becoming_plaintext() {
+        let e = base_config(&payload("SASL-SSL")).unwrap_err();
+        assert!(e.contains("unknown security protocol"), "{e}");
+        assert!(e.contains("SASL-SSL"), "{e}");
+    }
+
+    // --- Механизмы -----------------------------------------------------------
+
+    /// Умолчание бэкенда и начальное значение формы — одно и то же число.
+    /// Разъехавшись, они дали бы запись, которая подключается одним механизмом,
+    /// а показывает другой.
+    #[test]
+    fn a_record_without_a_mechanism_falls_back_to_the_default() {
+        let mut conf = payload("SASL_SSL");
+        conf.sasl_mechanism = None;
+        assert_eq!(
+            config(&conf).get("sasl.mechanism"),
+            Some(DEFAULT_SASL_MECHANISM)
+        );
+
+        // Пустая строка из формы — то же самое, что отсутствие значения.
+        conf.sasl_mechanism = Some("   ".into());
+        assert_eq!(
+            config(&conf).get("sasl.mechanism"),
+            Some(DEFAULT_SASL_MECHANISM)
+        );
+    }
+
+    #[test]
+    fn a_mechanism_is_normalised_to_upper_case() {
+        let mut conf = payload("SASL_SSL");
+        conf.sasl_mechanism = Some(" scram-sha-512 ".into());
+        assert_eq!(config(&conf).get("sasl.mechanism"), Some("SCRAM-SHA-512"));
+    }
+
+    /// GSSAPI и OAUTHBEARER стояли в меню и вполне могли осесть в
+    /// `clusters.json`. Ни тот, ни другой в этой сборке не работает, и молча
+    /// отдавать их librdkafka значит менять внятный отказ на таймаут.
+    #[test]
+    fn mechanisms_this_build_cannot_do_are_refused_by_name() {
+        for mech in ["GSSAPI", "OAUTHBEARER", "SCRAM-SHA-1"] {
+            let mut conf = payload("SASL_SSL");
+            conf.sasl_mechanism = Some(mech.into());
+            let e = base_config(&conf).unwrap_err();
+            assert!(e.contains("unsupported SASL mechanism"), "{mech}: {e}");
+            assert!(e.contains(mech), "{mech}: {e}");
+        }
+    }
+
+    // --- TLS -----------------------------------------------------------------
+
+    #[test]
+    fn a_client_pair_turns_on_mutual_tls() {
+        let mut conf = payload("SSL");
+        conf.ssl_certificate_path = Some("/certs/client.pem".into());
+        conf.ssl_key_path = Some("/certs/client.key".into());
+        conf.ssl_key_password = Some(" pass phrase ".into());
+        let cc = config(&conf);
+
+        assert_eq!(cc.get("ssl.certificate.location"), Some("/certs/client.pem"));
+        assert_eq!(cc.get("ssl.key.location"), Some("/certs/client.key"));
+        // Пароль ключа не тримится: пробелы по краям — часть пароля.
+        assert_eq!(cc.get("ssl.key.password"), Some(" pass phrase "));
+    }
+
+    #[test]
+    fn half_a_client_pair_is_refused() {
+        let mut only_cert = payload("SASL_SSL");
+        only_cert.ssl_certificate_path = Some("/certs/client.pem".into());
+        let e = base_config(&only_cert).unwrap_err();
+        assert!(e.contains("private key is missing"), "{e}");
+
+        let mut only_key = payload("SASL_SSL");
+        only_key.ssl_key_path = Some("/certs/client.key".into());
+        let e = base_config(&only_key).unwrap_err();
+        assert!(e.contains("client certificate is missing"), "{e}");
+    }
+
+    #[test]
+    fn an_unencrypted_key_gets_no_password_line() {
+        let mut conf = payload("SSL");
+        conf.ssl_certificate_path = Some("/certs/client.pem".into());
+        conf.ssl_key_path = Some("/certs/client.key".into());
+        conf.ssl_key_password = Some(String::new());
+
+        assert_eq!(config(&conf).get("ssl.key.password"), None);
+    }
+
+    /// Проверки выключаются только по прямой просьбе. Молчание в конфиге — это
+    /// «проверять», и никакая миграция записи не должна это менять.
+    #[test]
+    fn verification_is_on_unless_switched_off_explicitly() {
+        let mut conf = payload("SASL_SSL");
+        let cc = config(&conf);
+        assert_eq!(cc.get("ssl.endpoint.identification.algorithm"), None);
+        assert_eq!(cc.get("enable.ssl.certificate.verification"), None);
+
+        conf.ssl_skip_hostname_check = true;
+        conf.ssl_skip_certificate_verification = true;
+        let cc = config(&conf);
+        assert_eq!(
+            cc.get("ssl.endpoint.identification.algorithm"),
+            Some("none")
+        );
+        assert_eq!(cc.get("enable.ssl.certificate.verification"), Some("false"));
+    }
+
+    /// Настройки TLS остаются в записи и после того, как кластер перевели на
+    /// протокол без шифрования. Применять их там нечего.
+    #[test]
+    fn tls_settings_are_ignored_by_protocols_without_tls() {
+        let mut conf = payload("SASL_PLAINTEXT");
+        conf.ssl_ca_bundle_path = Some("/certs/ca.pem".into());
+        conf.ssl_certificate_path = Some("/certs/client.pem".into());
+        conf.ssl_key_path = Some("/certs/client.key".into());
+        conf.ssl_skip_certificate_verification = true;
+        let cc = config(&conf);
+
+        assert_eq!(cc.get("ssl.ca.location"), None);
+        assert_eq!(cc.get("ssl.certificate.location"), None);
+        assert_eq!(cc.get("enable.ssl.certificate.verification"), None);
+    }
+
+    // --- Наследование --------------------------------------------------------
+
+    /// Ради этого `base_config` и отделён от остальных: и чтение, и отправка
+    /// обязаны идти под теми же кредами и по тому же TLS.
+    #[test]
+    fn both_the_consumer_and_the_producer_inherit_security() {
+        let mut conf = payload("SASL_SSL");
+        conf.ssl_ca_bundle_path = Some("/certs/ca.pem".into());
+        let base = config(&conf);
+
+        for cc in [consumer_config(&base), producer_config(&base)] {
+            assert_eq!(cc.get("security.protocol"), Some("sasl_ssl"));
+            assert_eq!(cc.get("sasl.mechanism"), Some(DEFAULT_SASL_MECHANISM));
+            assert_eq!(cc.get("sasl.username"), Some("alice"));
+            assert_eq!(cc.get("sasl.password"), Some("secret"));
+            assert_eq!(cc.get("ssl.ca.location"), Some("/certs/ca.pem"));
         }
     }
 }

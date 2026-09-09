@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 /// может слать больше, чем бэкенду нужно.
 ///
 /// Полей keystore/truststore здесь намеренно нет: это понятия из мира Java
-/// (JKS), а librdkafka их не читает. Для mTLS ей нужны PEM-файлы —
-/// `ssl.certificate.location`, `ssl.key.location`, `ssl.key.password`.
-/// Когда дойдут руки до mTLS, добавляем именно их, а не JKS-пути.
+/// (JKS), а librdkafka их не читает. Клиентская пара для mTLS задаётся
+/// PEM-файлами — `ssl_certificate_path` и `ssl_key_path`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ClusterConnectPayload {
@@ -24,6 +23,25 @@ pub struct ClusterConnectPayload {
     pub username: Option<String>,
     pub password: Option<String>,
     pub ssl_ca_bundle_path: Option<String>,
+    /// Клиентский сертификат (PEM). Вместе с ключом — mTLS.
+    #[serde(default)]
+    pub ssl_certificate_path: Option<String>,
+    /// Приватный ключ к нему (PEM).
+    #[serde(default)]
+    pub ssl_key_path: Option<String>,
+    /// Пароль зашифрованного ключа. Ведёт себя как пароль учётки: у
+    /// сохранённого кластера не пересекает границу IPC, а подставляется из
+    /// keychain (см. `resolve_secrets` в lib.rs).
+    #[serde(default)]
+    pub ssl_key_password: Option<String>,
+    /// Не сверять имя в сертификате брокера с адресом, по которому к нему
+    /// пришли. Нужно там, где bootstrap идёт по IP или через alias.
+    #[serde(default)]
+    pub ssl_skip_hostname_check: bool,
+    /// Не проверять сертификат брокера вообще. Для самоподписанных стендов,
+    /// к которым нет бандла.
+    #[serde(default)]
+    pub ssl_skip_certificate_verification: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
