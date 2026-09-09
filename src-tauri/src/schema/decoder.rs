@@ -1,21 +1,29 @@
 //! Чем превращают тело сообщения в то, что можно показать.
 //!
-//! Один тип на все форматы со схемой. Всё, что стоит по пути тела наружу —
-//! `kafka::text`, буфер воркера, архив сохранённых, — держит именно его и про
-//! protobuf, Avro и JSON Schema не знает ничего: разница между ними кончается
-//! здесь.
+//! Один тип на все форматы, которым для показа нужна работа. Всё, что стоит по
+//! пути тела наружу — `kafka::text`, буфер воркера, архив сохранённых, — держит
+//! именно его и про protobuf, Avro и JSON Schema не знает ничего: разница между
+//! ними кончается здесь.
 //!
-//! Enum, а не `dyn`: вариантов три, все известны в крейте, и виртуальный вызов
-//! на каждое тело в таблице не окупается ничем.
+//! Enum, а не `dyn`: вариантов четыре, все известны в крейте, и виртуальный
+//! вызов на каждое тело в таблице не окупается ничем.
 
 use super::avro::AvroDecoder;
 use super::json::JsonDecoder;
 use super::proto::ProtoDecoder;
+use crate::kafka::encode_hex;
 
 pub enum Decoder {
     Proto(ProtoDecoder),
     Avro(AvroDecoder),
     Json(JsonDecoder),
+    /// Байты как есть, шестнадцатеричной строкой.
+    ///
+    /// Схемы за ним нет никакой, и стоит он здесь ровно потому, что это тоже
+    /// ответ на вопрос «во что превратить тело, чтобы показать». Так он
+    /// достаётся всем трём путям наружу — строке таблицы, окну сообщения и
+    /// поиску по разобранному телу — не трогая ни один из них.
+    Hex,
 }
 
 impl Decoder {
@@ -29,6 +37,8 @@ impl Decoder {
             Decoder::Proto(d) => d.decode(payload),
             Decoder::Avro(d) => d.decode(payload),
             Decoder::Json(d) => d.decode(payload),
+            // Провалиться нечему: любые байты — это hex, включая нулевую длину.
+            Decoder::Hex => Ok(encode_hex(payload)),
         }
     }
 
@@ -49,6 +59,7 @@ impl Decoder {
             Decoder::Proto(d) => d.decode(payload).map(|json| (json, d.enum_values().to_vec())),
             Decoder::Avro(d) => d.decode_with_enums(payload),
             Decoder::Json(d) => d.decode(payload).map(|json| (json, Vec::new())),
+            Decoder::Hex => Ok((encode_hex(payload), Vec::new())),
         }
     }
 }

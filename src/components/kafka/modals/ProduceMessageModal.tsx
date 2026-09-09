@@ -30,7 +30,7 @@ const CHECK_DEBOUNCE_MS = 300;
  *  зарезервирована под «ничего не выбрано». */
 const AUTO_PARTITION = 'auto';
 
-/** Порядок вкладок формата. `text` первым: он же и значение по умолчанию. */
+/** Порядок в селекторе формата. `text` первым: он же и значение по умолчанию. */
 const FORMATS: { value: PayloadFormat; label: string }[] = [
   { value: 'text', label: 'text' },
   { value: 'json', label: 'json' },
@@ -106,7 +106,9 @@ const PLACEHOLDERS: Record<PayloadFormat, string> = {
   proto: 'Pick a message type — the template appears here',
   avro: 'The template appears here once the schema is known',
   jsonschema: 'The template appears here once the schema is known',
-  hex: '1a2b3c — spaces, colons and dashes are ignored',
+  // Тем же видом, каким hex показывает просмотр сообщения: скопированное
+  // оттуда ложится сюда как есть, и подсказка это подтверждает, а не спорит.
+  hex: '0A 15 08 — spaces, colons and dashes are ignored',
 };
 
 /**
@@ -655,42 +657,46 @@ export function ProduceMessageModal({
           {/* Формат и тело */}
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-4">
-              <div className="flex gap-1">
-                {FORMATS.map(({ value, label }) => {
-                  // Формат без схемы кодировать нечем. Пункт не прячем, а
-                  // гасим: иначе непонятно, почему у одного топика формат есть,
-                  // а у соседнего нет.
-                  const disabled =
-                    (value === 'proto' && !canUseProto) ||
-                    (value === 'avro' && !canUseAvro) ||
-                    (value === 'jsonschema' && !canUseJsonSchema);
-                  return (
-                    <Button
-                      key={value}
-                      variant="ghost"
-                      size="sm"
-                      disabled={disabled}
-                      title={
-                        disabled
-                          ? value === 'avro'
-                            ? 'Add a schema registry to this connection or load an .avsc file in the topic settings — or send raw bytes as hex'
-                            : value === 'jsonschema'
-                              ? 'Add a schema registry to this connection or load a schema file in the topic settings — or send the body as plain json'
-                              : 'Load a .proto file in the topic settings first — or send raw bytes as hex'
-                          : undefined
-                      }
-                      className={`font-mono px-3 py-1 h-auto ${
-                        format === value
-                          ? 'bg-brand text-surface hover:bg-brand-hover'
-                          : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
-                      } ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}
-                      onClick={() => setFormat(value)}
-                    >
-                      {label}
-                    </Button>
-                  );
-                })}
-              </div>
+              {/* Селектором, а не рядом кнопок: форматов шесть, и полосой они
+                  занимали половину строки, оставляя выбору типа ровно столько
+                  места, сколько ему не хватало. Заодно это тот же вид, каким
+                  формат выбирают при чтении. */}
+              <Select value={format} onValueChange={(v) => setFormat(v as PayloadFormat)}>
+                <SelectTrigger className="w-40 shrink-0 bg-surface border-edge text-slate-50 font-mono">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-surface border-edge">
+                  {FORMATS.map(({ value, label }) => {
+                    // Формат без схемы кодировать нечем. Пункт не прячем, а
+                    // гасим: иначе непонятно, почему у одного топика формат
+                    // есть, а у соседнего нет.
+                    const missing =
+                      (value === 'proto' && !canUseProto) ||
+                      (value === 'avro' && !canUseAvro) ||
+                      (value === 'jsonschema' && !canUseJsonSchema);
+                    return (
+                      <SelectItem
+                        key={value}
+                        value={value}
+                        disabled={missing}
+                        className="text-slate-50 font-mono focus:bg-edge"
+                      >
+                        {label}
+                        {/* Причина строкой в самом пункте, а не подсказкой:
+                            выключенный пункт не принимает наведение мыши, и
+                            `title` на нём никогда бы не показался. */}
+                        {missing && (
+                          <span className="text-dim">
+                            {value === 'proto'
+                              ? '· load a .proto first'
+                              : '· needs a registry or a schema file'}
+                          </span>
+                        )}
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
 
               {format === 'proto' && (
                 <div className="flex items-center gap-3 min-w-0">

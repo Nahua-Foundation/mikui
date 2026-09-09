@@ -27,11 +27,16 @@ interface TopicConfigModalProps {
   onSchemaChanged?: (topic: string, schema: TopicSchema | null) => void;
 }
 
+/** Все форматы до единого — тот же список, что в шапке (`FormatSelect`).
+ *  Формат, выбранный там, но отсутствующий здесь, оставлял бы этот селектор с
+ *  пустым триггером: Radix показывает подпись выбранного пункта, а пункта нет. */
 const FORMATS: { value: BodyFormat; label: string }[] = [
   { value: 'json', label: 'JSON' },
   { value: 'text', label: 'Text' },
   { value: 'proto', label: 'Proto' },
   { value: 'avro', label: 'Avro' },
+  { value: 'jsonschema', label: 'JSON Schema' },
+  { value: 'hex', label: 'Hex' },
 ];
 
 export function TopicConfigModal({

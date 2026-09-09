@@ -517,14 +517,14 @@ async fn build_message_link(
 ///
 /// Имя берётся оттуда, где оно у формата живёт: у protobuf это выбранный
 /// message, у avro — subject реестра либо запись из .avsc, у JSON Schema —
-/// subject. У `json` и `text` имени нет и быть не может: там нет схемы.
+/// subject. У `json`, `text` и `hex` имени нет и быть не может: там нет схемы.
 fn schema_hint(view: TopicSchemaView) -> (Option<String>, Option<String>) {
     let format = view.format;
     let type_name = match format {
         BodyFormat::Proto => view.message,
         BodyFormat::Avro => view.avro.and_then(|a| a.subject.or(a.record)),
         BodyFormat::JsonSchema => view.json.and_then(|j| j.subject),
-        BodyFormat::Json | BodyFormat::Text => None,
+        BodyFormat::Json | BodyFormat::Text | BodyFormat::Hex => None,
     };
     (Some(format.as_str().to_string()), type_name)
 }

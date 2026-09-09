@@ -239,6 +239,9 @@ pub fn decoder(
         // пять байт. Ровно из-за них такой топик и выглядел мусором. Схема у
         // формата стоит только на пути отправки, см. `json_for_produce`.
         BodyFormat::JsonSchema => Ok(Some(Arc::new(Decoder::Json(JsonDecoder::new())))),
+        // Тоже без схемы и без настроек: показать байты можно всегда, чем бы
+        // топик ни оказался на самом деле.
+        BodyFormat::Hex => Ok(Some(Arc::new(Decoder::Hex))),
         _ => Ok(None),
     }
 }

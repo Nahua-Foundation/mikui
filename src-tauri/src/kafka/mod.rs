@@ -15,6 +15,8 @@ mod worker;
 // разошёлся бы с первым.
 pub(crate) mod text;
 
-pub use hex::decode as decode_hex;
+// Разбор нужен отправке (`lib.rs`), печать — показу тела (`schema::Decoder`).
+// Обе поимённо, а не модулем целиком: больше в нём ничего и нет.
+pub use hex::{decode as decode_hex, encode as encode_hex};
 pub use types::*;
 pub use worker::{Command, WorkerHandle};

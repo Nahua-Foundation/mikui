@@ -233,6 +233,22 @@ mod tests {
         assert!(is_text(b""));
     }
 
+    /// Hex — это уже текст, и метка `[binary]` на нём была бы ложью: показано
+    /// ровно то, что лежит в теле, и показано целиком. Ровно за этим формат и
+    /// заводился — то же тело без него уезжает символами замены.
+    #[test]
+    fn a_hex_body_is_shown_in_full_and_is_not_called_binary() {
+        let raw = [0xff, 0x00, 0x1a];
+        assert!(!is_text(&raw));
+
+        let shown = body(Some(&Decoder::Hex), &raw);
+        assert_eq!(shown.value, "FF 00 1A");
+        assert!(!shown.binary);
+        assert!(shown.decode_error.is_none());
+        // Enum здесь взяться неоткуда: схемы за форматом нет никакой.
+        assert!(shown.enum_values.is_empty());
+    }
+
     // --- Ключ --------------------------------------------------------------
     //
     // Ровно тот случай, ради которого у ключа завёлся свой декодер: на

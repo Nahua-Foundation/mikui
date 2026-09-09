@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 /// голому JSON-топику заголовок снимать не с чего, а `Json` — это ещё и
 /// осознанный выбор «показывай как есть», который обязан отменять
 /// автоопределение.
+///
+/// `Hex` — тоже показ без всякой схемы, но противоположный `Text`: тот
+/// показывает то, что удалось прочитать как UTF-8, подставляя символы замены
+/// вместо остального, а этот — сами байты, все до единого. Нужен там, где тело
+/// не рассматривают, а забирают: чтобы переслать его дальше или воспроизвести
+/// в другом месте, и метка `[binary]` для этого бесполезна. Печатается ровно в
+/// том виде, который форма отправки принимает обратно (`kafka::hex`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BodyFormat {
@@ -24,6 +31,7 @@ pub enum BodyFormat {
     Avro,
     #[serde(rename = "jsonschema")]
     JsonSchema,
+    Hex,
 }
 
 impl BodyFormat {
@@ -40,6 +48,7 @@ impl BodyFormat {
             BodyFormat::Proto => "proto",
             BodyFormat::Avro => "avro",
             BodyFormat::JsonSchema => "jsonschema",
+            BodyFormat::Hex => "hex",
         }
     }
 }
@@ -210,6 +219,9 @@ impl TopicSchema {
             // JSON Schema не требует вообще ничего: снять confluent-заголовок
             // декодер умеет и без схемы, а больше для показа ничего и не надо.
             BodyFormat::JsonSchema => true,
+            // Hex тем более: он печатает те самые байты, что пришли, и схема
+            // ему не нужна по определению.
+            BodyFormat::Hex => true,
             _ => false,
         }
     }
@@ -390,6 +402,7 @@ mod tests {
             BodyFormat::Proto,
             BodyFormat::Avro,
             BodyFormat::JsonSchema,
+            BodyFormat::Hex,
         ] {
             let serialized = serde_json::to_string(&format).unwrap();
             assert_eq!(serialized, format!("\"{}\"", format.as_str()));

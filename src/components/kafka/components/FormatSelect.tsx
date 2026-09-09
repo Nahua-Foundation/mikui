@@ -1,4 +1,13 @@
-import { Braces, ChevronDown, FileJson, FileText, Settings2, Shapes, Type } from 'lucide-react';
+import {
+  Binary,
+  Braces,
+  ChevronDown,
+  FileJson,
+  FileText,
+  Settings2,
+  Shapes,
+  Type,
+} from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -13,6 +22,9 @@ const FORMATS: { value: BodyFormat; label: string; icon: typeof Braces }[] = [
   { value: 'jsonschema', label: 'json schema', icon: FileJson },
   { value: 'proto', label: 'proto', icon: FileText },
   { value: 'avro', label: 'avro', icon: Shapes },
+  // Последним: это не «ещё один способ прочитать тело», а отказ его читать —
+  // байты как есть, чтобы забрать и унести.
+  { value: 'hex', label: 'hex', icon: Binary },
 ];
 
 /**

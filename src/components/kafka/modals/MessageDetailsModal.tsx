@@ -4,7 +4,7 @@ import { Copy, Link2, Star, StarOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
-import { BodyFormat, FullMessage, MessageHeader } from '../types';
+import { BodyFormat, FullMessage, MessageHeader, showsRawBody } from '../types';
 import { formatTimestamp } from '../format';
 import { detectEnvelope } from '../lens';
 import { EnvelopeView } from '../components/EnvelopeView';
@@ -93,11 +93,12 @@ export function MessageDetailsModal({
    * двести на окно таблицы, — поэтому здесь можно позволить себе полный разбор
    * без всяких потолков, в отличие от превью строки (см. `kafka::lens`).
    *
-   * `text` в счёт не идёт: у него пользователь прямо попросил показывать тело
-   * как есть, и разбирать его вопреки этому значило бы не слушать.
+   * `text` и `hex` в счёт не идут: у них пользователь прямо попросил показывать
+   * тело как есть, и разбирать его вопреки этому значило бы не слушать. У `hex`
+   * разбирать вдобавок нечего — там строка из шестнадцатеричных цифр.
    */
   const envelope = useMemo(
-    () => (message && format !== 'text' ? detectEnvelope(message.value) : null),
+    () => (message && !showsRawBody(format) ? detectEnvelope(message.value) : null),
     [message, format],
   );
 
@@ -195,9 +196,11 @@ export function MessageDetailsModal({
    *  сбил бы нумерацию, а у чего угодно другого одна строка на всё тело
    *  растянулась бы в бесконечную полосу. */
   const formatJson = (jsonString: string): { text: string; isJson: boolean } => {
-    // Явно выбранный Text просят показать как есть — раскладывать его по
-    // строкам значило бы решать за пользователя.
-    if (format === 'text') return { text: jsonString, isJson: false };
+    // Явно выбранные text и hex просят показать как есть — раскладывать их по
+    // строкам значило бы решать за пользователя. У hex это ещё и единственный
+    // верный ответ: тело из одних цифр (`12345678`) разобралось бы как число и
+    // уехало в JSON-ветку, где его покрасили бы как число.
+    if (showsRawBody(format)) return { text: jsonString, isJson: false };
     try {
       return { text: JSON.stringify(JSON.parse(jsonString), null, 2), isJson: true };
     } catch {
@@ -363,9 +366,15 @@ export function MessageDetailsModal({
                   {/* JSON content. `whitespace-pre` — не украшение: отступы,
                       которые расставил JSON.stringify, HTML по умолчанию
                       сминает, и форматированный JSON выглядел плоским. */}
+                  {/* `break-words`, а не `break-all`: перенос ищется по
+                      пробелам и рвёт слово только тогда, когда оно и само в
+                      строку не влезает. У hex это обязательно — `break-all`
+                      разрывал бы пару цифр посреди байта (`C8` на двух
+                      строках), а длинную ленту текста без пробелов обе
+                      настройки переносят одинаково. */}
                   <div
                     className={`font-mono leading-6 flex-1 ${
-                      isJson ? 'whitespace-pre' : 'whitespace-pre-wrap break-all'
+                      isJson ? 'whitespace-pre' : 'whitespace-pre-wrap break-words'
                     }`}
                   >
                     {lines.map((line, index) => (
