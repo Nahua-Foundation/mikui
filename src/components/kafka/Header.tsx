@@ -34,6 +34,13 @@ import { ThemeToggle } from './components/ThemeToggle';
 /** Со скольки выбранных партиций перечисление перестаёт помещаться в шапку. */
 const PARTITIONS_SHOWN_INLINE = 3;
 
+/** Почему фильтр не редактируется во время глубокого поиска. Текст один на
+ *  поле, кнопку фильтров и все поля внутри — объяснение у них общее. */
+const FILTER_LOCKED =
+  'The deep search is sifting messages as they arrive, so the buffer holds only what ' +
+  'already matched — a wider filter would have nothing left to search. Stop the search to ' +
+  'change it.';
+
 interface HeaderDesktopProps {
   /** null — читаем все партиции топика. */
   selectedPartitions: number[] | null;
@@ -59,6 +66,16 @@ interface HeaderDesktopProps {
   onManageUsers: () => void;
   filters: MessageFilter;
   onFiltersChange: (filters: MessageFilter) => void;
+  /**
+   * Идёт глубокий поиск — поля фильтра заперты.
+   *
+   * Это не перестраховка. Поиск просеивает НА ВХОДЕ и в буфере оставляет только
+   * то, что подошло: сузить запрос по такому буферу можно, а расширить нечем —
+   * расширенный молча не нашёл бы ничего нового, потому что искать уже негде.
+   * Запертое поле с подсказкой честнее такого молчания, тем более что кнопка
+   * «стоп» стоит рядом.
+   */
+  isSearching: boolean;
   /** Чем показывать тела открытого топика. */
   format: BodyFormat;
   onFormatChange: (format: BodyFormat) => void;
@@ -130,6 +147,7 @@ export function HeaderDesktop({
   onManageUsers,
   filters,
   onFiltersChange,
+  isSearching,
   format,
   onFormatChange,
   lens,
@@ -273,13 +291,20 @@ export function HeaderDesktop({
                   value={filters.value}
                   onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
                   placeholder="Search in messages"
+                  disabled={isSearching}
+                  title={isSearching ? FILTER_LOCKED : undefined}
                   className="bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8 pr-9 w-64"
                 />
                 <DropdownMenu>
                   <DropdownMenuTrigger
-                    title="Filters"
-                    className={`absolute right-2 top-1/2 -translate-y-1/2 bg-transparent border-none outline-none cursor-pointer p-0 transition-colors ${
-                      hasActiveFilters ? 'text-brand' : 'text-dim hover:text-strong'
+                    title={isSearching ? FILTER_LOCKED : 'Filters'}
+                    disabled={isSearching}
+                    className={`absolute right-2 top-1/2 -translate-y-1/2 bg-transparent border-none outline-none p-0 transition-colors disabled:cursor-not-allowed ${
+                      isSearching
+                        ? 'text-dim opacity-50'
+                        : `cursor-pointer ${
+                            hasActiveFilters ? 'text-brand' : 'text-dim hover:text-strong'
+                          }`
                     }`}
                   >
                     <Filter className="size-4" />

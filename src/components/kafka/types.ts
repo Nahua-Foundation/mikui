@@ -295,7 +295,7 @@ export interface MemoryUsage {
   memory_limit: number;
 }
 
-export interface OpenTopicResult extends QuotaInfo, MemoryUsage {
+export interface OpenTopicResult extends QuotaInfo, MemoryUsage, ReadScope {
   /** Число видимых строк с учётом фильтра — это totalCount для списка. */
   total: number;
   /** Сколько всего вычитано в буфер до фильтрации. */
@@ -306,6 +306,49 @@ export interface OpenTopicResult extends QuotaInfo, MemoryUsage {
   truncated: boolean;
 }
 
+/**
+ * Сколько топика просмотрено и сколько его всего.
+ *
+ * Отдельно от `loaded` (сколько лежит в буфере): при глубоком поиске эти числа
+ * расходятся принципиально — просмотрено 50 000, в буфере три находки, в топике
+ * около 92 000.
+ */
+export interface ReadScope {
+  /** Сколько сообщений просмотрено с момента открытия топика — включая
+   *  выброшенные фильтром при глубоком поиске. */
+  scanned: number;
+  /**
+   * Сколько сообщений в читаемых партициях ПРИМЕРНО. `null` — границы партиций
+   * ещё не сняты.
+   *
+   * Это число офсетов, а не сообщений: на компактированных партициях офсетов
+   * больше, часть из них уже никому не отдадут. Поэтому оценка сверху, и в UI
+   * она обязана называться приблизительной.
+   */
+  approx_total: number | null;
+}
+
+/**
+ * Чем открывать топик. Один тип на `open_topic` и на `deep_search`: поиск
+ * заново открывает тот же топик с того же конца и в тех же границах, и
+ * разъехаться этим двум наборам нельзя — иначе поиск пойдёт не по тому, что
+ * показано в таблице.
+ */
+export interface OpenTopicParams {
+  topic: string;
+  start_from: StartFrom;
+  /** Сколько сообщений вычитать на каждую партицию. `deep_search` игнорирует:
+   *  он идёт до конца топика. */
+  limit: number;
+  /** null — все партиции топика. */
+  partitions: number[] | null;
+  filter: MessageFilter;
+  /** Границы чтения. Пустые — весь топик с конца, названного в `start_from`. */
+  range: ReadRange;
+  /** Сортировка по столбцу. null — обычный порядок чтения. */
+  sort: SortSpec | null;
+}
+
 /** Сколько ещё сообщений вычитать на каждую ещё не исчерпанную партицию. */
 export interface LoadMoreParams {
   additional: number;
@@ -313,7 +356,7 @@ export interface LoadMoreParams {
 
 /** Снимок хода ещё не завершённого `open_topic`/`load_more` — опрашивается
  *  по таймеру, пока идёт загрузка. */
-export interface OpenTopicProgress extends QuotaInfo, MemoryUsage {
+export interface OpenTopicProgress extends QuotaInfo, MemoryUsage, ReadScope {
   /** Топик, к которому относится снимок: ответ опроса может разминуться со
    *  сменой топика, и без этой проверки счётчики перепутались бы. */
   topic: string | null;
@@ -323,6 +366,9 @@ export interface OpenTopicProgress extends QuotaInfo, MemoryUsage {
   truncated: boolean;
   /** true — чтения в фоне уже нет, снимок финальный. */
   done: boolean;
+  /** Идёт глубокий поиск, а не обычное чтение. У обычного чтения есть свой
+   *  конец, и оно закончится само; поиск идёт до конца топика. */
+  searching: boolean;
 }
 
 /**

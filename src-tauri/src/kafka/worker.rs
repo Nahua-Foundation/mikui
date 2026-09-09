@@ -78,7 +78,7 @@ use tokio::sync::oneshot;
 use super::filter::Needle;
 use super::lens::{self, LensMode};
 use super::quota::{QuotaEstimate, QuotaMeter};
-use super::raw_consumer::{self, RawMessage, RawQueue, RawTopic};
+use super::raw_consumer::{self, RawQueue, RawTopic};
 use super::store::MessageStore;
 use super::text::{self, PREVIEW_BYTES};
 use super::types::*;
@@ -498,6 +498,33 @@ const DELIVERY_POLL_STEP: Duration = Duration::from_millis(100);
 /// Фронт узнаёт его по строке и молчит: это не сбой, а нормальный ход событий.
 pub const READ_SUPERSEDED: &str = "read superseded";
 
+/// Ответ на глубокий поиск, остановленный пользователем. Отдельно от
+/// `READ_SUPERSEDED`: там чтение стало не нужно, а здесь оно было ОТМЕНЕНО, и
+/// фронт на это обязан отреагировать — перечитать топик обычным способом.
+pub const SEARCH_STOPPED: &str = "search stopped";
+
+/// Насколько глубоко читать и что оставлять в арене.
+///
+/// Два способа читать один топик, и различаются они не размером, а тем, что
+/// считается результатом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadDepth {
+    /// Обычное открытие топика (и «Load more»): по `limit` сообщений на
+    /// партицию, в арену ложится ВСЁ вычитанное, чтение упирается в дедлайн и
+    /// байтовый бюджет. Фильтр применяется потом, к тому, что уже лежит.
+    Window,
+    /// Глубокий поиск: топик до конца, в арену ложатся ТОЛЬКО совпадения с
+    /// фильтром, дедлайна и байтового бюджета нет.
+    ///
+    /// Отбрасывание непопавшего — не оптимизация, а условие, без которого
+    /// операция невозможна. Арена — 256 МБ (`store::DEFAULT_MAX_BYTES`), и на
+    /// топике с телами по 20–70 КБ это 4–13 тысяч сообщений: чтение упёрлось бы
+    /// в буфер, не дойдя и до десятой части такого топика. Плата за это —
+    /// буфер, в котором больше нет «всего прочитанного», поэтому снятие
+    /// фильтра после поиска требует перечитать топик заново.
+    WholeTopic,
+}
+
 type Reply<T> = oneshot::Sender<T>;
 
 pub enum Command {
@@ -522,6 +549,22 @@ pub enum Command {
     /// шлётся снаружи воркера.
     ContinueRead,
     LoadMore(LoadMoreParams, Reply<Result<OpenTopicResult, String>>),
+    /// Прочитать топик до конца, оставив в арене только совпадения с фильтром.
+    ///
+    /// Параметры те же, что у `OpenTopic`, и это не совпадение: поиск ЗАНОВО
+    /// открывает топик с того же конца и теми же границами. Продолжить с места,
+    /// где встало обычное чтение, нельзя — в арене к тому моменту лежит
+    /// непросеянное, и места под находки в ней уже может не быть.
+    DeepSearch(OpenTopicParams, Reply<Result<OpenTopicResult, String>>),
+    /// Остановить глубокий поиск. Арена и курсоры сбрасываются: буфер после
+    /// поиска содержит только находки, и оставлять его как есть значило бы
+    /// показать пользователю таблицу, из которой пропало всё непопавшее.
+    /// Перечитать топик обычным способом — дело фронта, он это и так умеет.
+    ///
+    /// Отвечает тем, было ли что останавливать. `false` — поиск успел
+    /// закончиться сам, пока летела команда; перечитывать топик в этом случае
+    /// не надо, иначе клик по «стоп» стирал бы только что найденное.
+    StopSearch(Reply<bool>),
     GetOpenTopicProgress(Reply<Result<OpenTopicProgress, String>>),
     SetFilter(MessageFilter, Reply<Result<usize, String>>),
     /// Клик по заголовку колонки. `None` возвращает обычный порядок чтения.
@@ -604,21 +647,6 @@ impl WorkerHandle {
             .await
             .map_err(|_| "kafka worker dropped the reply".to_string())
     }
-}
-
-/// Перекладывает сообщение из буфера rdkafka в арену. Свободная функция, а не
-/// метод: во время чтения `store` заимствуется отдельно от остального `Worker`.
-/// Возвращает false, когда бюджет буфера исчерпан.
-fn absorb(store: &mut MessageStore, msg: &RawMessage) -> bool {
-    let headers = msg.headers();
-    store.push(
-        msg.partition(),
-        msg.offset(),
-        msg.timestamp_millis(),
-        msg.key().unwrap_or(&[]),
-        msg.payload().unwrap_or(&[]),
-        &headers,
-    )
 }
 
 /// Что известно про партицию между раундами. Переживает завершение чтения:
@@ -870,6 +898,23 @@ enum Frontier {
     Nothing,
 }
 
+/// Чем глубокий поиск просеивает сообщения на входе.
+///
+/// Готовится ОДИН РАЗ на всё чтение, а не на каждом шаге, и не берётся из
+/// `Worker::filter` на лету — по двум причинам. Первая: `PreparedFilter::new`
+/// аллоцирует иглы, и на топике в сто тысяч сообщений это было бы двести
+/// аллокаций на ровном месте. Вторая важнее — `SetFilter` может прилететь
+/// посреди поиска (поле в шапке на это время заперто, но отложенная отправка
+/// могла уже быть в пути), и тогда половина буфера оказалась бы просеяна одним
+/// запросом, половина другим. Запрос, с которым поиск начался, — тот же, с
+/// которым он закончится.
+struct Sieve {
+    filter: PreparedFilter,
+    /// Своя копия ссылки на декодер: `search_decoded` разбирает тело, а
+    /// одалживать `Worker::decoder` посреди цикла, где занят `store`, неудобно.
+    decoder: Option<Arc<Decoder>>,
+}
+
 /// Ещё не завершённое чтение — раскладывается по шагам через
 /// `Command::ContinueRead`.
 struct PendingRead {
@@ -898,6 +943,20 @@ struct PendingRead {
     /// Стартовый бюджет партиции. Нужен только в фазе `Watermarks`: курсоров,
     /// которым его можно проставить, до неё ещё не существует.
     budget: i64,
+    /// Обычное чтение или глубокий поиск. Решает две вещи: останавливаться ли
+    /// по дедлайну и по байтовому бюджету.
+    depth: ReadDepth,
+    /// Чем просеивать на входе. `None` — не просеивать, в арену идёт всё.
+    sieve: Option<Sieve>,
+    /// Сколько байт ПРОСМОТРЕНО за текущий раунд — вся добыча окна, включая
+    /// выброшенную фильтром. Не то же, что прирост арены: при глубоком поиске
+    /// в арену попадают единицы, а цена офсета считается по всему просмотренному
+    /// (см. `MessageStore::footprint` и `window_floor`).
+    round_scanned_bytes: usize,
+    /// Сколько сообщений просмотрено за текущий раунд. Оборванный раунд
+    /// отматывается целиком — вместе с этим счётчиком, иначе «просмотрено» в
+    /// шкале учло бы окно, которое будет вычитано заново.
+    round_scanned: u64,
     /// Запрошенные границы. Живут в чтении, а не в воркере: применяются они
     /// ровно один раз, сразу после watermarks, и дальше уже вшиты в курсоры —
     /// поэтому `load_more` за диапазон не выходит, ничего о нём не зная.
@@ -944,6 +1003,13 @@ struct Worker {
     /// заморожен и только дописывается, поэтому всё до этой границы
     /// пересматривать не надо — см. `extend_view`.
     view_scanned: usize,
+    /// Сколько сообщений ПРОСМОТРЕНО с момента открытия топика.
+    ///
+    /// Отдельно от `store.committed_len()`, и при глубоком поиске эти два
+    /// расходятся на порядки: просмотрено пятьдесят тысяч, в буфере лежат три
+    /// находки. Обычному чтению они равны, но и там это разные величины —
+    /// одна про топик, другая про буфер.
+    scanned: u64,
     filter: MessageFilter,
     /// Сортировка по столбцу поверх обычного порядка чтения. `None` — порядок
     /// как есть в `store` (уже отфильтрованный, см. `rebuild_view`).
@@ -996,6 +1062,7 @@ impl Worker {
             store: MessageStore::default(),
             view: Vec::new(),
             view_scanned: 0,
+            scanned: 0,
             filter: MessageFilter::default(),
             sort: None,
             open_topic: None,
@@ -1036,9 +1103,18 @@ impl Worker {
                 Command::DescribeTopic(topic, reply) => {
                     let _ = reply.send(self.describe_topic(&topic));
                 }
-                Command::OpenTopic(params, reply) => self.start_open_topic(params, reply),
+                Command::OpenTopic(params, reply) => {
+                    self.start_open_topic(params, ReadDepth::Window, reply)
+                }
                 Command::ContinueRead => self.continue_read(),
                 Command::LoadMore(params, reply) => self.start_load_more(params, reply),
+                Command::DeepSearch(params, reply) => {
+                    self.start_open_topic(params, ReadDepth::WholeTopic, reply)
+                }
+                Command::StopSearch(reply) => {
+                    let stopped = self.stop_search();
+                    let _ = reply.send(stopped);
+                }
                 Command::GetOpenTopicProgress(reply) => {
                     let _ = reply.send(Ok(self.progress()));
                 }
@@ -1482,11 +1558,39 @@ impl Worker {
     fn start_open_topic(
         &mut self,
         params: OpenTopicParams,
+        depth: ReadDepth,
         reply: Reply<Result<OpenTopicResult, String>>,
     ) {
+        // Поиск без запроса — это чтение всего топика в буфер без дедлайна и
+        // без байтового бюджета, то есть ровно то, от чего эти два ограничения
+        // и защищают. Сито в таком поиске пропускает всё, и он упрётся в
+        // память — просто не через полминуты, а молча и надолго. UI такого не
+        // предлагает; отказ здесь — на случай, если однажды предложит.
+        //
+        // Проверка стоит ДО `cancel_pending_read`: отклонённый запрос не должен
+        // рушить идущее чтение.
+        if depth == ReadDepth::WholeTopic
+            && params.filter.key.is_empty()
+            && params.filter.value.is_empty()
+        {
+            let _ = reply.send(Err(
+                "a deep search needs a filter: without one there is nothing to sift, \
+                 and the whole topic would go into the buffer"
+                    .into(),
+            ));
+            return;
+        }
+
         self.cancel_pending_read();
 
-        let limit = params.limit.clamp(1, 100_000) as i64;
+        // Глубокий поиск бюджетом не ограничен вовсе: он идёт до конца топика,
+        // и остановить его может только находка буфера, конец партиций или
+        // пользователь. `limit` из параметров при этом игнорируется — фронт
+        // присылает те же параметры, что и при обычном открытии.
+        let limit = match depth {
+            ReadDepth::Window => params.limit.clamp(1, 100_000) as i64,
+            ReadDepth::WholeTopic => i64::MAX,
+        };
         let partition_count = match self.partition_counts.get(&params.topic).copied() {
             Some(c) => c,
             None => {
@@ -1530,7 +1634,8 @@ impl Worker {
         };
 
         eprintln!(
-            "[open_topic] {} partitions={}/{partition_count} start_from={:?} range={:?} per_partition_limit={limit}",
+            "[open_topic] {} partitions={}/{partition_count} start_from={:?} range={:?} \
+             per_partition_limit={limit} depth={depth:?}",
             params.topic,
             partitions.len(),
             params.start_from,
@@ -1538,6 +1643,7 @@ impl Worker {
         );
 
         self.store.clear();
+        self.scanned = 0;
         self.filter = params.filter;
         self.sort = params.sort;
         self.newest_first = params.range.newest_first(params.start_from);
@@ -1571,9 +1677,74 @@ impl Worker {
             round_mark_bytes: 0,
             budget: limit,
             range: params.range,
+            depth,
+            // Строится ПОСЛЕ `self.filter = params.filter` выше — из того же
+            // запроса, с которым топик открывается, и тем же `prepared_filter`,
+            // которым потом просеивается буфер под таблицу.
+            sieve: match depth {
+                ReadDepth::Window => None,
+                ReadDepth::WholeTopic => Some(Sieve {
+                    filter: self.prepared_filter(),
+                    decoder: self.decoder.clone(),
+                }),
+            },
+            round_scanned_bytes: 0,
+            round_scanned: 0,
         });
 
         let _ = self.tx.send(Command::ContinueRead);
+    }
+
+    /// Останавливает глубокий поиск по требованию пользователя.
+    ///
+    /// Сбрасывает буфер, а не оставляет находки: после поиска в арене лежат
+    /// ТОЛЬКО они, и оставить её как есть значило бы показать таблицу, из
+    /// которой молча исчезло всё непопавшее под фильтр. Топик после этого
+    /// перечитывает фронт — обычным `open_topic`, как будто его только что
+    /// открыли.
+    ///
+    /// Обычное чтение не трогает: остановка предлагается только на поиске, а
+    /// прилететь эта команда может и позже, когда чтение уже другое. Отвечает
+    /// тем, было ли что останавливать.
+    fn stop_search(&mut self) -> bool {
+        let is_search = self
+            .pending_read
+            .as_ref()
+            .is_some_and(|p| p.depth == ReadDepth::WholeTopic);
+        if !is_search {
+            // Поиск успел закончиться сам — трогать нечего, и в особенности
+            // нечего сбрасывать: в буфере лежит его законный результат.
+            return false;
+        }
+
+        if let Some(pending) = self.pending_read.take() {
+            Self::stop_all(&pending);
+            eprintln!(
+                "[stop_search] {} stopped after {:?}, {} scanned, {} kept",
+                pending.topic_name,
+                pending.started.elapsed(),
+                self.scanned,
+                self.store.len()
+            );
+            // Именно ошибкой, а не результатом: результат означал бы «поиск
+            // закончился, вот что нашлось», и фронт показал бы находки в
+            // таблице, из которой пропало непопавшее.
+            let _ = pending.reply.send(Err(SEARCH_STOPPED.to_string()));
+        }
+
+        // Топик остаётся открытым (`open_topic` не снимаем): фронт сейчас
+        // перечитает его, и снимать имя ради двух команд значило бы на это
+        // время оставить воркер без ответа на вопрос «что открыто».
+        self.store.release();
+        self.cursors.clear();
+        self.view.clear();
+        self.view_scanned = 0;
+        self.scanned = 0;
+        self.window = FIRST_ROUND_CHUNK;
+        self.last_round = None;
+        self.kept_per_offset = None;
+        self.has_timestamps = false;
+        true
     }
 
     /// "Загрузить ещё": поднимает бюджет каждой ещё не исчерпанной партиции и
@@ -1630,6 +1801,13 @@ impl Worker {
             // Диапазон уже вшит в границы курсоров — здесь его применять
             // повторно нечему и незачем.
             range: ReadRange::default(),
+            // «Load more» продолжает обычное чтение: в арену по-прежнему
+            // ложится всё. Дочитывать под фильтр — это глубокий поиск, и он
+            // начинается с начала топика, а не с этого места.
+            depth: ReadDepth::Window,
+            sieve: None,
+            round_scanned_bytes: 0,
+            round_scanned: 0,
         };
         self.begin_round(pending);
     }
@@ -1680,7 +1858,7 @@ impl Worker {
         if let Some(pending) = self.pending_read.take() {
             Self::stop_all(&pending);
             // Незавершённый раунд — дырявое окно; его добыча не годится.
-            self.store.truncate(pending.round_mark);
+            self.rollback_round(&pending);
             eprintln!(
                 "[worker] {} read cancelled (superseded) after {:?}",
                 pending.topic_name,
@@ -1936,26 +2114,34 @@ impl Worker {
     fn begin_round(&mut self, mut pending: PendingRead) {
         let newest_first = self.newest_first;
 
-        if pending.started.elapsed() >= READ_DEADLINE {
-            eprintln!(
-                "[begin_round] {} stopping at round boundary: deadline after {:?}",
-                pending.topic_name,
-                pending.started.elapsed()
-            );
-            self.finish_read(pending, true);
-            return;
-        }
-        let read_bytes = self
-            .store
-            .byte_size()
-            .saturating_sub(pending.bytes_at_start);
-        if read_bytes >= READ_BYTE_BUDGET {
-            eprintln!(
-                "[begin_round] {} stopping at round boundary: {read_bytes} bytes read",
-                pending.topic_name
-            );
-            self.finish_read(pending, true);
-            return;
+        // Дедлайн и байтовый бюджет — это обещание «вернуть управление
+        // пользователю через полминуты». Глубокому поиску они противоречат по
+        // смыслу: он и есть длинная операция, о чём пользователь предупреждён,
+        // а прерви его здесь — он остановится ровно там, где ничего ещё не
+        // нашлось, и выглядеть это будет как «поиск не работает». Остановить
+        // его может конец топика, полный буфер находок или кнопка «стоп».
+        if pending.depth == ReadDepth::Window {
+            if pending.started.elapsed() >= READ_DEADLINE {
+                eprintln!(
+                    "[begin_round] {} stopping at round boundary: deadline after {:?}",
+                    pending.topic_name,
+                    pending.started.elapsed()
+                );
+                self.finish_read(pending, true);
+                return;
+            }
+            let read_bytes = self
+                .store
+                .byte_size()
+                .saturating_sub(pending.bytes_at_start);
+            if read_bytes >= READ_BYTE_BUDGET {
+                eprintln!(
+                    "[begin_round] {} stopping at round boundary: {read_bytes} bytes read",
+                    pending.topic_name
+                );
+                self.finish_read(pending, true);
+                return;
+            }
         }
 
         let active = self
@@ -2042,6 +2228,8 @@ impl Worker {
 
         pending.round_mark = self.store.len();
         pending.round_mark_bytes = self.store.byte_size();
+        pending.round_scanned_bytes = 0;
+        pending.round_scanned = 0;
         pending.round_started = Instant::now();
         pending.phase = ReadPhase::Reading(round);
         self.pending_read = Some(pending);
@@ -2068,6 +2256,13 @@ impl Worker {
         // Ошибка не обрабатывается на месте: пока жив `round`, `pending`
         // заимствован и его нельзя ни отдать, ни разобрать на части.
         let mut failure: Option<String> = None;
+
+        // Сито готово с начала чтения и за него не меняется — см. `Sieve`.
+        // Забираем его себе на время цикла: `pending.phase` рядом занят
+        // изменяемо, и одалживать соседнее поле сквозь него неудобно.
+        let sieve = pending.sieve.take();
+        let mut scanned = 0u64;
+        let mut scanned_bytes = 0usize;
 
         for msg in batch {
             let p = msg.partition();
@@ -2107,16 +2302,15 @@ impl Worker {
                         );
                         continue;
                     }
-                    if !absorb(&mut self.store, &msg) {
-                        eprintln!(
-                            "[step_reading] {} buffer budget hit at {} messages",
-                            pending.topic_name,
-                            self.store.len()
-                        );
-                        buffer_full = true;
-                        break;
-                    }
+                    // Всё, что дошло сюда, ПРОСМОТРЕНО — вне зависимости от
+                    // того, оставим мы его или выбросим. Отсюда и счётчики, и
+                    // цена офсета, и отметка времени партиции: они описывают
+                    // топик, а не буфер, и от фильтра зависеть не должны.
+                    // Считать их по одним находкам значило бы сказать окну, что
+                    // офсеты почти бесплатны, — и раунд разросся бы до дедлайна
+                    // (см. `window_floor`).
                     rp.absorbed += 1;
+                    scanned += 1;
 
                     let ts = msg.timestamp_millis();
                     if ts > 0 {
@@ -2124,6 +2318,41 @@ impl Worker {
                     }
                     if let Some(c) = self.cursors.get_mut(&p) {
                         c.observe(newest_first, ts);
+                    }
+
+                    // Ключ, тело и заголовки разбираются РОВНО ОДИН РАЗ:
+                    // `RawMessage::headers` каждый раз обходит C-список и
+                    // аллоцирует вектор, а на глубоком поиске через это место
+                    // проходит весь топик.
+                    let key = msg.key().unwrap_or(&[]);
+                    let value = msg.payload().unwrap_or(&[]);
+                    let headers = msg.headers();
+                    scanned_bytes += MessageStore::footprint(key, value, &headers);
+
+                    // Сито стоит ПОСЛЕ учёта и ДО арены: непопавшее в топике
+                    // было, а в буфере его не будет.
+                    if let Some(sieve) = &sieve {
+                        if !sieve.filter.matches(key, value, sieve.decoder.as_deref()) {
+                            continue;
+                        }
+                    }
+
+                    let stored = self.store.push(
+                        msg.partition(),
+                        msg.offset(),
+                        ts,
+                        key,
+                        value,
+                        &headers,
+                    );
+                    if !stored {
+                        eprintln!(
+                            "[step_reading] {} buffer budget hit at {} messages",
+                            pending.topic_name,
+                            self.store.len()
+                        );
+                        buffer_full = true;
+                        break;
                     }
                 }
                 RDKafkaRespErr::RD_KAFKA_RESP_ERR__PARTITION_EOF => {
@@ -2149,9 +2378,17 @@ impl Worker {
             }
         }
 
+        // Заимствование `round` кончилось вместе с циклом — только теперь
+        // `pending` снова целиком наш. Сито возвращается на место: следующий
+        // шаг того же чтения просеивает тем же самым.
+        pending.sieve = sieve;
+        self.scanned += scanned;
+        pending.round_scanned += scanned;
+        pending.round_scanned_bytes += scanned_bytes;
+
         if let Some(e) = failure {
             Self::stop_all(&pending);
-            self.store.truncate(pending.round_mark);
+            self.rollback_round(&pending);
             let _ = pending.reply.send(Err(e));
             return;
         }
@@ -2181,7 +2418,13 @@ impl Worker {
     fn close_round(&mut self, pending: &mut PendingRead) {
         let newest_first = self.newest_first;
         let elapsed = pending.round_started.elapsed();
-        let bytes = self.store.byte_size() - pending.round_mark_bytes;
+        let kept_bytes = self.store.byte_size() - pending.round_mark_bytes;
+        // Мерить цену офсета надо по ПРОСМОТРЕННОМУ, а не по осевшему в арене.
+        // При обычном чтении это одно и то же число (кладётся всё, что
+        // просмотрено, и `footprint` считает ровно то же, что занимает `push`),
+        // а при глубоком поиске они расходятся на порядки — и по осевшему
+        // офсеты выглядели бы почти бесплатными.
+        let bytes = pending.round_scanned_bytes;
         let window = self.window;
         let quota = self.quota.estimate();
         let ReadPhase::Reading(round) = &mut pending.phase else {
@@ -2196,9 +2439,17 @@ impl Worker {
         self.quota.record_offsets(offsets);
         eprintln!(
             "[round] {} {} partitions, window {window}, +{absorbed} messages of {offsets} \
-             offsets, +{bytes} bytes in {elapsed:?}{}",
+             offsets, +{bytes} bytes scanned{} in {elapsed:?}{}",
             pending.topic_name,
             round.len(),
+            // Второе число печатается только когда расходится с первым, то есть
+            // только на глубоком поиске: там видно, сколько из просмотренного
+            // сито оставило, и это главная цифра его эффективности.
+            if kept_bytes == bytes {
+                String::new()
+            } else {
+                format!(" ({kept_bytes} kept)")
+            },
             match quota {
                 // «kept» против «paid» — главный индикатор впустую потраченной
                 // квоты: брокер шлёт по `fetch.message.max.bytes` на партицию
@@ -2254,8 +2505,19 @@ impl Worker {
     /// курсоры остались на границе окна, `load_more` перечитает его целиком.
     fn abort_round(&mut self, pending: PendingRead) {
         Self::stop_all(&pending);
-        self.store.truncate(pending.round_mark);
+        self.rollback_round(&pending);
         self.finish_read(pending, true);
+    }
+
+    /// Отматывает недоделанный раунд: и добычу, и счётчик просмотренного.
+    ///
+    /// Второе — не педантизм. Окно оборванного раунда будет вычитано ЗАНОВО
+    /// (курсоры остались на его границе), и оставленный счётчик посчитал бы эти
+    /// сообщения дважды — шкала «просмотрено N из ~M» уехала бы за собственный
+    /// знаменатель.
+    fn rollback_round(&mut self, pending: &PendingRead) {
+        self.store.truncate(pending.round_mark);
+        self.scanned = self.scanned.saturating_sub(pending.round_scanned);
     }
 
     /// Отдаёт итог чтения. `interrupted` — чтение оборвалось, а не упёрлось в
@@ -2281,6 +2543,7 @@ impl Worker {
             memory: self.memory_usage(),
             truncated,
             quota: self.quota_info(),
+            scope: self.read_scope(),
         }));
     }
 
@@ -2379,6 +2642,30 @@ impl Worker {
             total: self.view.len(),
             truncated: self.pending_read.is_some(),
             done: self.pending_read.is_none(),
+            scope: self.read_scope(),
+            searching: self
+                .pending_read
+                .as_ref()
+                .is_some_and(|p| p.depth == ReadDepth::WholeTopic),
+        }
+    }
+
+    /// Сколько топика просмотрено и сколько его всего.
+    ///
+    /// Знаменатель — сумма `high - low` по курсорам, то есть уже с учётом и
+    /// выбранных партиций, и заданных границ чтения: диапазон вшивается в
+    /// курсоры сразу после watermarks. Спрашивать топик целиком было бы
+    /// неверно — прогресс шёл бы к числу, до которого чтение и не собиралось.
+    fn read_scope(&self) -> ReadScope {
+        ReadScope {
+            scanned: self.scanned,
+            // Пустые курсоры — границы ещё не сняты. Ноль здесь означал бы
+            // «в топике ничего нет», а это совсем другая новость.
+            approx_total: if self.cursors.is_empty() {
+                None
+            } else {
+                Some(self.cursors.values().map(|c| c.high - c.low).sum())
+            },
         }
     }
 
@@ -2389,6 +2676,7 @@ impl Worker {
         self.sort = None;
         self.view.clear();
         self.view_scanned = 0;
+        self.scanned = 0;
         self.cursors.clear();
         self.has_timestamps = false;
         // Схема принадлежит топику. Оставить её — значит показать следующий
@@ -2446,15 +2734,26 @@ impl Worker {
         self.view = view;
     }
 
+    /// Разобранный фильтр из текущего состояния воркера.
+    ///
+    /// Одно место на оба применения фильтра — по буферу (`grow_from`) и на
+    /// входе (сито глубокого поиска, см. `Sieve`). Разойдись эти два, и поиск
+    /// клал бы в арену не то, что таблица потом из неё показывает: например,
+    /// просеивал бы по сырым байтам там, где показ ищет ещё и по разобранному
+    /// телу, — и найденное сообщение не доехало бы до экрана.
+    ///
+    /// Готовится каждый раз заново, а не хранится полем: `decoder` меняется
+    /// командой `SetDecoder` без пересборки представления, и закэшированный
+    /// рядом флаг «есть чем разбирать» протух бы молча. Две аллокации на проход
+    /// по буферу — не та цена, за которую стоит держать производное состояние.
+    fn prepared_filter(&self) -> PreparedFilter {
+        PreparedFilter::new(&self.filter, self.decoder.is_some())
+    }
+
     /// Обёртка над свободной `grow_view`: собирает разобранный фильтр из
     /// текущего состояния воркера, а саму работу отдаёт наружу.
-    ///
-    /// Фильтр готовится ЗДЕСЬ, а не хранится полем: `decoder` меняется командой
-    /// `SetDecoder` без пересборки представления, и закэшированный рядом флаг
-    /// «есть чем разбирать» протух бы молча. Две аллокации на проход по буферу
-    /// — не та цена, за которую стоит держать производное состояние.
     fn grow_from(&self, view: &mut Vec<u32>, from: usize) -> usize {
-        let prepared = PreparedFilter::new(&self.filter, self.decoder.is_some());
+        let prepared = self.prepared_filter();
         grow_view(
             &self.store,
             &prepared,
@@ -2774,6 +3073,48 @@ mod tests {
             frontier_ts: None,
             barren_rounds: 0,
         }
+    }
+
+    /// Воркер без кластера — годится всему, что считается по своим полям.
+    fn offline_worker() -> Worker {
+        let (tx, _rx) = mpsc::channel();
+        Worker::new(tx)
+    }
+
+    /// Знаменатель шкалы поиска — сумма по КУРСОРАМ, а не по топику: партиции
+    /// выбирает пользователь, границы чтения тоже, и прогресс обязан идти к
+    /// тому, что читается на самом деле.
+    #[test]
+    fn approx_total_counts_only_the_partitions_being_read() {
+        let mut worker = offline_worker();
+        worker.cursors.insert(0, cursor(10, 110, NEWEST, 1000));
+        worker.cursors.insert(3, cursor(0, 50, NEWEST, 1000));
+
+        let scope = worker.read_scope();
+        // 100 офсетов в первой, 50 во второй; `low` вычитается — то, что съел
+        // retention, читать всё равно не будут.
+        assert_eq!(scope.approx_total, Some(150));
+        assert_eq!(scope.scanned, 0);
+    }
+
+    /// Пустые курсоры — это «границы ещё не сняты», а не «в топике ноль».
+    /// Ноль здесь превратился бы в шкалу «0 из 0», то есть в готовый поиск,
+    /// который ещё даже не начинался.
+    #[test]
+    fn approx_total_is_unknown_before_the_watermarks_are_in() {
+        assert_eq!(offline_worker().read_scope().approx_total, None);
+    }
+
+    /// Глубокий поиск ставит бюджет партиции в `i64::MAX` — окна от этого не
+    /// должны ни переполниться, ни разъехаться: партиция читается до конца
+    /// ровно теми же окнами, что и с обычным бюджетом.
+    #[test]
+    fn an_unbounded_budget_still_walks_the_partition_in_normal_windows() {
+        let windows = walk(cursor(0, 25, OLDEST, i64::MAX), OLDEST, 10);
+        assert_eq!(windows, vec![(0, 10), (10, 20), (20, 25)]);
+
+        let backwards = walk(cursor(0, 25, NEWEST, i64::MAX), NEWEST, 10);
+        assert_eq!(backwards, vec![(15, 25), (5, 15), (0, 5)]);
     }
 
     /// Прокручивает раунды до упора и отдаёт список окон в порядке чтения.

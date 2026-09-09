@@ -16,6 +16,7 @@ import {
   LoadMoreParams,
   MessageFilter,
   MessageLinkTarget,
+  OpenTopicParams,
   OpenTopicProgress,
   OpenTopicResult,
   LensSetting,
@@ -23,14 +24,12 @@ import {
   ProduceRequest,
   ProduceResult,
   MessageForm,
-  ReadRange,
   RowPreview,
   SavedMessage,
   SchemaRegistryConfig,
   SaveFavoriteResult,
   Settings,
   ShareRequest,
-  StartFrom,
   Topic,
   TopicDetails,
   TopicSchema,
@@ -138,19 +137,36 @@ export const getTopics = () => invoke<Topic[]>('get_topics');
 export const describeTopic = (topic: string) =>
   invoke<TopicDetails>('describe_topic', { topic });
 
-export const openTopic = (params: {
-  topic: string;
-  start_from: StartFrom;
-  limit: number;
-  /** null — все партиции топика. */
-  partitions: number[] | null;
-  filter: MessageFilter;
-  /** Границы чтения. Пустые — весь топик с конца, названного в `start_from`. */
-  range: ReadRange;
-}) => invoke<OpenTopicResult>('open_topic', { params });
+export const openTopic = (params: OpenTopicParams) =>
+  invoke<OpenTopicResult>('open_topic', { params });
 
 export const loadMore = (params: LoadMoreParams) =>
   invoke<OpenTopicResult>('load_more', { params });
+
+/**
+ * Прочитать топик до конца, оставив в буфере только совпадения с фильтром.
+ *
+ * Параметры те же, что у `openTopic`, и это не совпадение: поиск ЗАНОВО
+ * открывает топик с того же конца и в тех же границах — продолжить с места,
+ * где встало обычное чтение, нельзя (в буфере лежит непросеянное, и места под
+ * находки в нём может не остаться). `limit` бэкенд здесь игнорирует.
+ *
+ * Долгая операция; отменяется `stopSearch`. Отмена приезжает сюда ошибкой
+ * `SEARCH_STOPPED` — это не сбой.
+ */
+export const deepSearch = (params: OpenTopicParams) =>
+  invoke<OpenTopicResult>('deep_search', { params });
+
+/**
+ * Остановить глубокий поиск. Буфер после этого пуст: в нём лежали одни находки,
+ * и показывать их как «весь топик» было бы обманом — топик положено перечитать
+ * обычным `openTopic`.
+ *
+ * `false` — останавливать было нечего: поиск успел закончиться сам, пока летела
+ * команда. Тогда буфер не тронут и перечитывать НЕ надо — иначе клик по «стоп»
+ * в последнюю секунду стирал бы только что найденное.
+ */
+export const stopSearch = () => invoke<boolean>('stop_search');
 
 export const getOpenTopicProgress = () =>
   invoke<OpenTopicProgress>('get_open_topic_progress');

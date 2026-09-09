@@ -324,6 +324,30 @@ pub struct OpenTopicResult {
     pub truncated: bool,
     #[serde(flatten)]
     pub quota: QuotaInfo,
+    #[serde(flatten)]
+    pub scope: ReadScope,
+}
+
+/// Сколько топика уже просмотрено и сколько его всего.
+///
+/// Отдельно от `loaded` (сколько лежит в буфере) и не ради полноты. При
+/// глубоком поиске эти три числа расходятся принципиально: просмотрено 50 000,
+/// в буфере лежат 3 находки, а всего в топике около 92 000. Без знаменателя
+/// «просмотрено 50 000» не отвечает на единственный вопрос, который задают
+/// долгой операции, — сколько ещё ждать.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReadScope {
+    /// Сколько сообщений изъято из очереди с момента открытия топика — то есть
+    /// просмотрено, независимо от того, попали они под фильтр или выброшены.
+    pub scanned: u64,
+    /// Сколько сообщений в читаемых партициях ПРИМЕРНО.
+    ///
+    /// Это сумма `high - low` по курсорам, то есть число офсетов, а не
+    /// сообщений: на компактированных партициях офсетов больше — часть из них
+    /// уже никому не отдадут. Поэтому оценка сверху, и в UI она обязана быть
+    /// названа приблизительной. `None` — границы партиций ещё не сняты.
+    pub approx_total: Option<i64>,
 }
 
 /// Сколько памяти держит буфер сообщений и сколько ему позволено.
@@ -385,6 +409,13 @@ pub struct OpenTopicProgress {
     pub done: bool,
     #[serde(flatten)]
     pub quota: QuotaInfo,
+    #[serde(flatten)]
+    pub scope: ReadScope,
+    /// Идёт глубокий поиск, а не обычное чтение. Различать их обязательно:
+    /// у обычного чтения есть свой конец (лимит на партицию), и оно закончится
+    /// само, а глубокий поиск идёт до конца топика и ждёт либо находок, либо
+    /// того, что его остановят.
+    pub searching: bool,
 }
 
 /// Строка таблицы. Тело обрезано: таблица всё равно показывает его в одну
@@ -591,6 +622,10 @@ mod tests {
                 active_brokers: 7,
                 known_brokers: 10,
             },
+            scope: ReadScope {
+                scanned: 50_000,
+                approx_total: Some(92_556),
+            },
         })
         .unwrap();
 
@@ -600,8 +635,12 @@ mod tests {
         // Шкала памяти читает эти два поля с верхнего уровня.
         assert_eq!(json["memory_bytes"], 8192);
         assert_eq!(json["memory_limit"], 256 * 1024 * 1024);
+        // Шкала поиска — эти два, оттуда же.
+        assert_eq!(json["scanned"], 50_000);
+        assert_eq!(json["approx_total"], 92_556);
         assert!(json.get("quota").is_none(), "поля должны быть плоскими");
         assert!(json.get("memory").is_none(), "поля должны быть плоскими");
+        assert!(json.get("scope").is_none(), "поля должны быть плоскими");
     }
 
     #[test]
@@ -615,6 +654,8 @@ mod tests {
             truncated: false,
             done: false,
             quota: QuotaInfo::default(),
+            scope: ReadScope::default(),
+            searching: false,
         })
         .unwrap();
 
@@ -623,5 +664,10 @@ mod tests {
         assert!(json["read_bytes_per_sec"].is_null());
         assert_eq!(json["peak_throttle_ms"], 0);
         assert_eq!(json["buffer_bytes"], 128);
+        // Границы ещё не сняты — знаменателя нет, и это null, а не ноль:
+        // «неизвестно сколько» и «нисколько» в шкале выглядят по-разному.
+        assert!(json["approx_total"].is_null());
+        assert_eq!(json["scanned"], 0);
+        assert_eq!(json["searching"], false);
     }
 }

@@ -12,6 +12,7 @@ import {
   MessageFilter,
   MessageLinkTarget,
   KafkaCluster,
+  OpenTopicParams,
   OpenTopicResult,
   ReadMode,
   ReadRange,
@@ -55,6 +56,10 @@ const PROGRESS_POLL_MS = 250;
 const FILTER_DEBOUNCE_MS = 200;
 /** Бэкенд отвечает так на чтение, отменённое сменой топика — см. worker.rs. */
 const READ_SUPERSEDED = 'read superseded';
+/** А так — на глубокий поиск, остановленный кнопкой. Отдельно от предыдущего:
+ *  там чтение стало не нужно, здесь его отменили, и топик после этого
+ *  перечитывается — см. `handleStopSearch`. */
+const SEARCH_STOPPED = 'search stopped';
 
 /** Не чаще одного тоста об ошибке декодирования за это время. Сообщения чужого
  *  формата идут полосой, и без паузы каждое окно выдачи заливало бы экран. */
@@ -75,6 +80,7 @@ const LINK_CONTEXT = 50;
 const LINK_EVENT = 'mikui://link';
 
 const isSuperseded = (e: unknown) => String(e).includes(READ_SUPERSEDED);
+const isStopped = (e: unknown) => String(e).includes(SEARCH_STOPPED);
 
 const describeError = api.describeError;
 
@@ -140,6 +146,35 @@ export function KafkaExplorerPortfolio() {
   const [stats, setStats] = useState<OpenTopicResult | null>(null);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
+  /** Идёт глубокий поиск: топик читается до конца, в буфер попадают только
+   *  совпадения. Отдельно от `isLoadingMessages` — у этих двух разный конец
+   *  (у чтения свой лимит, у поиска только топик, буфер или кнопка «стоп») и
+   *  разный вид в таблице. */
+  const [isSearching, setIsSearching] = useState(false);
+  /**
+   * Счётчик перечитываний открытого топика теми же параметрами.
+   *
+   * Нужен ровно одному случаю: остановке глубокого поиска. Она оставляет буфер
+   * пустым (в нём лежали одни находки), и топик надо открыть заново — теми же
+   * топиком, партициями и границами, то есть без единого изменения в
+   * зависимостях эффекта открытия. Без этого счётчика эффект бы не перезапустился.
+   */
+  const [readNonce, setReadNonce] = useState(0);
+  /**
+   * В буфере лежит добыча глубокого поиска, а не обычное чтение.
+   *
+   * Это состояние приходится знать снаружи, потому что буфер в нём НЕ
+   * представляет топик: непопавшее под фильтр в него не кладут. Отсюда два
+   * следствия, и оба важны.
+   *
+   * Первое: смена фильтра по такому буферу бессмысленна — расширенный запрос
+   * искал бы в том, что уже просеяно прошлым, и молча не нашёл бы ничего
+   * нового. Поэтому она перечитывает топик, а не пересевает буфер.
+   *
+   * Второе: «Load more» дописал бы в тот же буфер НЕпросеянное, и «loaded»
+   * стало бы смесью двух разных величин. Поэтому не предлагается.
+   */
+  const [searchedBuffer, setSearchedBuffer] = useState(false);
 
   // Растёт, когда меняется САМ СПИСОК: другой топик, партиция, направление
   // чтения, фильтр. Сбрасывает кэш окон и обесценивает ответы на устаревшие
@@ -150,6 +185,33 @@ export function KafkaExplorerPortfolio() {
   /** Схема ОТКРЫТОГО топика. Нужна модалке, чтобы знать, в каком виде приехало
    *  тело; всем остальным заведует бэкенд. */
   const [openSchema, setOpenSchema] = useState<TopicSchema | null>(null);
+
+  /**
+   * Чем открывать топик — ОДИН набор на обычное чтение и на глубокий поиск.
+   *
+   * Поиск читает тот же топик, с того же конца и в тех же границах, что и
+   * таблица под ним; разъедься эти два набора — и он искал бы не в том, что
+   * показано. Поэтому набор один, а не два похожих в двух местах.
+   */
+  const readParams = useCallback(
+    (topic: Topic): OpenTopicParams => ({
+      topic: topic.name,
+      // Границы задают направление сами (см. `ReadRange::newest_first`),
+      // и когда они есть, это поле бэкенду не указ.
+      start_from: readMode === 'newest' ? 'newest' : 'oldest',
+      limit: DEFAULT_PARTITION_LIMIT,
+      partitions: selectedPartitions,
+      filter: filters,
+      range,
+      sort,
+    }),
+    [readMode, selectedPartitions, filters, range, sort],
+  );
+  // Через ref: эффект открытия топика намеренно НЕ зависит от фильтра (его
+  // применяет `set_filter`, без похода в Kafka), а `readParams` от фильтра
+  // зависит. В зависимостях эффекта он перечитывал бы топик на каждый символ.
+  const readParamsRef = useRef(readParams);
+  readParamsRef.current = readParams;
 
   const lastDecodeToast = useRef(0);
   const reportDecodeError = useCallback((error: string) => {
@@ -272,6 +334,10 @@ export function KafkaExplorerPortfolio() {
     // `openSchema` к тому моменту в этом замыкании ещё прежний.
     let applied: TopicSchema | null = null;
     setIsLoadingMessages(true);
+    // Обычное чтение кладёт в буфер всё — то есть снимает признак «в буфере
+    // одни находки», чем бы он ни был поставлен. В том числе и после
+    // остановленного поиска: это перечитывание и есть его продолжение.
+    setSearchedBuffer(false);
     // Список меняется целиком — обнуляем его ДО того, как приедут новые строки,
     // иначе Virtuoso успеет отрисовать чужие данные под новым топиком.
     setTotal(0);
@@ -298,19 +364,7 @@ export function KafkaExplorerPortfolio() {
         if (cancelled) return Promise.reject(new Error(READ_SUPERSEDED));
         applied = schema;
         setOpenSchema(schema);
-        return invoke<OpenTopicResult>('open_topic', {
-          params: {
-            topic: selectedTopic.name,
-            // Границы задают направление сами (см. `ReadRange::newest_first`),
-            // и когда они есть, это поле бэкенду не указ.
-            start_from: readMode === 'newest' ? 'newest' : 'oldest',
-            limit: DEFAULT_PARTITION_LIMIT,
-            partitions: selectedPartitions,
-            filter: filters,
-            range,
-            sort,
-          },
-        });
+        return api.openTopic(readParamsRef.current(selectedTopic));
       })
       .then((result) => {
         if (cancelled) return;
@@ -355,8 +409,12 @@ export function KafkaExplorerPortfolio() {
     //
     // Партиции и границы — строкой, а не объектом: у объекта каждый рендер
     // новая идентичность, и топик перечитывался бы на ровном месте.
+    //
+    // `readNonce` — перечитать то же самое теми же параметрами. Единственный
+    // его источник — остановка глубокого поиска: она оставляет буфер пустым,
+    // и топик надо открыть заново, ничего в выборе не поменяв.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTopic, partitionsKey, rangeKey]);
+  }, [selectedTopic, partitionsKey, rangeKey, readNonce]);
 
   // Опрос хода чтения — общий для открытия топика и для "Load more".
   //
@@ -367,7 +425,7 @@ export function KafkaExplorerPortfolio() {
   // Чтение публикует строки только в хвост, поэтому generation здесь НЕ
   // трогаем — кэш окон остаётся валидным (см. useMessageWindow).
   useEffect(() => {
-    if (!isLoadingMessages && !isLoadingMore) return;
+    if (!isLoadingMessages && !isLoadingMore && !isSearching) return;
 
     const timer = window.setInterval(() => {
       api
@@ -386,13 +444,104 @@ export function KafkaExplorerPortfolio() {
             peak_throttle_ms: p.peak_throttle_ms,
             active_brokers: p.active_brokers,
             known_brokers: p.known_brokers,
+            scanned: p.scanned,
+            approx_total: p.approx_total,
           });
         })
         .catch(() => {});
     }, PROGRESS_POLL_MS);
 
     return () => window.clearInterval(timer);
-  }, [isLoadingMessages, isLoadingMore]);
+  }, [isLoadingMessages, isLoadingMore, isSearching]);
+
+  /**
+   * Глубокий поиск: прочитать топик до конца, оставив только совпадения.
+   *
+   * Топик открывается ЗАНОВО, поэтому таблица обнуляется прямо здесь, до
+   * ответа: буфер на бэкенде уже сбрасывается, и показывать поверх него старые
+   * строки — значит показывать то, чего там больше нет.
+   */
+  const handleDeepSearch = useCallback(() => {
+    const topic = selectedTopic;
+    if (!topic) return;
+    const topicAtRequest = topicRef.current;
+    const params = readParamsRef.current(topic);
+
+    // Отложенная отправка фильтра, если она ещё в пути, уже не нужна и вредна:
+    // поиск везёт этот же фильтр в своих параметрах, а `set_filter`, прилетев
+    // следом, поменял бы его на бэкенде посреди чтения. Сито от этого не
+    // поедет (оно снято на старте — см. `Sieve`), а вот таблица показала бы
+    // буфер, просеянный одним запросом, через другой.
+    //
+    // «Применённым» отмечается ровно то, что уехало в поиск, — не значение из
+    // замыкания: иначе следующая же смена фильтра могла бы счесть себя
+    // ненужной, сравнив себя не с тем.
+    if (filterTimer.current !== null) {
+      window.clearTimeout(filterTimer.current);
+      filterTimer.current = null;
+    }
+    appliedFilterRef.current = params.filter;
+
+    setIsSearching(true);
+    setSearchedBuffer(true);
+    setTotal(0);
+    setGeneration((g) => g + 1);
+    // Счётчики предыдущего чтения обнуляются здесь же, а не с первым тиком
+    // опроса: иначе четверть секунды шкала показывала бы «просмотрено 1000» от
+    // того чтения, которое поиск только что стёр. Измеренная квота остаётся —
+    // она про кластер, а не про это чтение.
+    setStats((prev) =>
+      prev ? { ...prev, total: 0, loaded: 0, scanned: 0, approx_total: null } : prev,
+    );
+
+    api
+      .deepSearch(params)
+      .then((result) => {
+        if (topicRef.current !== topicAtRequest) return;
+        setTotal(result.total);
+        setStats(result);
+        if (result.total === 0) {
+          toast.info(
+            result.truncated
+              ? 'Search stopped before the end of the topic; nothing matched so far'
+              : 'Nothing in this topic matches the filter',
+          );
+        }
+      })
+      .catch((e) => {
+        // Остановлен пользователем или вытеснен уходом с топика — и то, и
+        // другое нормальный ход событий, а не сбой. Перечитывание после
+        // остановки заводит `handleStopSearch`, здесь делать нечего.
+        if (isStopped(e) || isSuperseded(e) || topicRef.current !== topicAtRequest) return;
+        console.error('deep_search failed', e);
+        toast.error(`Search failed: ${describeError(e)}`);
+      })
+      .finally(() => setIsSearching(false));
+  }, [selectedTopic]);
+
+  /**
+   * Остановить поиск и вернуть топик в обычный вид.
+   *
+   * Буфер после остановки пуст: в нём лежали ОДНИ находки, и оставить их в
+   * таблице значило бы показать топик, из которого молча пропало всё
+   * непопавшее. Поэтому топик перечитывается заново — тем же эффектом, что и
+   * при обычном открытии, со схемой и сбросом кэша окон.
+   */
+  const handleStopSearch = useCallback(() => {
+    api
+      .stopSearch()
+      .then((stopped) => {
+        // Не успели: поиск закончился сам, пока летела команда. Буфер не
+        // тронут, и перечитывать топик значило бы стереть только что найденное.
+        if (stopped) setReadNonce((n) => n + 1);
+      })
+      .catch((e) => {
+        console.error('stop_search failed', e);
+        // Остановить не вышло, а состояние буфера неизвестно — перечитываем,
+        // это единственный способ вернуть таблицу к чему-то определённому.
+        setReadNonce((n) => n + 1);
+      });
+  }, []);
 
   // "Загрузить ещё": продолжает уже открытый топик с того окна, на котором
   // остановилось предыдущее чтение — без повторной вычитки уже показанного.
@@ -437,7 +586,19 @@ export function KafkaExplorerPortfolio() {
     filterTimer.current = window.setTimeout(() => {
       const topicAtRequest = topicRef.current;
       appliedFilterRef.current = filters;
-      invoke<number>('set_filter', { filter: filters })
+
+      // В буфере лежит добыча поиска — пересевать её новым запросом нельзя.
+      // Просеяно уже прошлым фильтром, и расширенный запрос честно не нашёл бы
+      // ничего нового: искать негде. Перечитываем топик обычным чтением, с
+      // новым фильтром — это ровно то состояние, в котором пользователь
+      // оказался бы, введя этот запрос сразу.
+      if (searchedBuffer) {
+        setReadNonce((n) => n + 1);
+        return;
+      }
+
+      api
+        .setFilter(filters)
         .then((visible) => {
           // Ушли с топика, пока считалось — ответ относится к чужому буферу.
           if (topicRef.current !== topicAtRequest) return;
@@ -450,7 +611,7 @@ export function KafkaExplorerPortfolio() {
     return () => {
       if (filterTimer.current !== null) window.clearTimeout(filterTimer.current);
     };
-  }, [filters, selectedTopic]);
+  }, [filters, selectedTopic, searchedBuffer]);
 
   // Клик по заголовку колонки — как фильтр, пересчитывается в Rust по уже
   // загруженному буферу. В отличие от фильтра, который только выбрасывает
@@ -1216,6 +1377,7 @@ export function KafkaExplorerPortfolio() {
         onClusterClick={handleClusterClick}
         filters={filters}
         onFiltersChange={setFilters}
+        isSearching={isSearching}
         format={openSchema?.format ?? 'json'}
         onFormatChange={handleFormatChange}
         lens={openSchema?.lens ?? null}
@@ -1245,11 +1407,22 @@ export function KafkaExplorerPortfolio() {
                 onSelectMessage={showMessageAt}
                 isLoading={isLoadingMessages}
                 version={version}
-                canLoadMore={!!stats?.truncated}
-                // Пока идёт начальное чтение, воркер откажет ("a read is already
-                // in progress") — кнопку не предлагаем вовсе.
-                isLoadingMore={isLoadingMore || isLoadingMessages}
+                // Обычная догрузка дописала бы в буфер НЕпросеянное, а там
+                // после поиска лежат одни находки: «loaded» стало бы смесью
+                // двух разных величин. Дочитать топик после поиска можно только
+                // поиском же — или перечитав его с другим фильтром.
+                canLoadMore={!!stats?.truncated && !searchedBuffer}
+                truncated={!!stats?.truncated}
+                // Пока идёт начальное чтение или поиск, воркер откажет ("a read
+                // is already in progress") — кнопку не предлагаем вовсе.
+                isLoadingMore={isLoadingMore || isLoadingMessages || isSearching}
                 onLoadMore={handleLoadMore}
+                hasFilter={filters.key.trim() !== '' || filters.value.trim() !== ''}
+                isSearching={isSearching}
+                searchedBuffer={searchedBuffer}
+                scope={stats}
+                onDeepSearch={handleDeepSearch}
+                onStopSearch={handleStopSearch}
                 sort={sort}
                 onSortChange={setSort}
                 highlight={linkedMessage}

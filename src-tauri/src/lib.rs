@@ -409,6 +409,31 @@ async fn load_more(
         .await?
 }
 
+/// Читает топик до конца, оставляя в буфере только сообщения, попавшие под
+/// фильтр. Долгая операция: она и задумана такой — см. `ReadDepth::WholeTopic`.
+///
+/// Параметры те же, что у `open_topic` (кроме `limit`, который здесь не при
+/// чём): поиск заново открывает топик с того же конца и в тех же границах.
+#[tauri::command]
+async fn deep_search(
+    worker: tauri::State<'_, WorkerHandle>,
+    params: OpenTopicParams,
+) -> Result<OpenTopicResult, String> {
+    worker
+        .call(|reply| Command::DeepSearch(params, reply))
+        .await?
+}
+
+/// Останавливает глубокий поиск и сбрасывает буфер. Топик после этого положено
+/// перечитать обычным `open_topic` — иначе в таблице останутся одни находки.
+///
+/// `false` — останавливать было нечего: поиск успел закончиться сам, и его
+/// результат в буфере законный. Перечитывать топик в этом случае не надо.
+#[tauri::command]
+async fn stop_search(worker: tauri::State<'_, WorkerHandle>) -> Result<bool, String> {
+    worker.call(Command::StopSearch).await
+}
+
 /// Дешёвый снимок хода ещё не завершённого `open_topic`/`load_more` — фронт
 /// опрашивает эту команду по таймеру, пока идёт загрузка.
 #[tauri::command]
@@ -1244,6 +1269,8 @@ pub fn run() {
             describe_topic,
             open_topic,
             load_more,
+            deep_search,
+            stop_search,
             get_open_topic_progress,
             set_filter,
             set_sort,

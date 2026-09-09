@@ -59,6 +59,25 @@ export function StatusBar({ stats }: StatusBarProps) {
       <div className="flex flex-row items-center gap-2 min-w-0 truncate">
         <span className="text-soft">{stats.loaded.toLocaleString()} msg</span>
 
+        {/* После глубокого поиска в буфере лежат ОДНИ находки, и «3 msg» без
+            второго числа читается как «в топике три сообщения». Показываем,
+            сколько за этими тремя просмотрено. Пока числа совпадают — то есть
+            при обычном чтении — второго нет: там оно ничего не добавляет. */}
+        {stats.scanned > stats.loaded && (
+          <>
+            <span>·</span>
+            <span
+              title={
+                'How many messages were read from the topic to produce the rows above. ' +
+                'A deep search keeps only the matches, so it looks at far more than it shows.'
+              }
+            >
+              {stats.scanned.toLocaleString()} scanned
+              {stats.approx_total !== null && ` of ~${stats.approx_total.toLocaleString()}`}
+            </span>
+          </>
+        )}
+
         {/* Скорость, которую даёт кластер. Без неё медленная загрузка
             неотличима от зависшего приложения — а на кластере с квотой на
             чтение она медленная всегда.

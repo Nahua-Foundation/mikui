@@ -197,6 +197,26 @@ impl MessageStore {
         out
     }
 
+    /// Сколько байт арены заняло бы это сообщение, если его положить.
+    ///
+    /// Нужна глубокому поиску: он кладёт в арену только находки, а мерить
+    /// «полезных байт на офсет» обязан по ВСЕМУ просмотренному — от этого
+    /// числа считается пол размера окна (`worker::window_floor`), и с одними
+    /// находками офсеты выглядели бы почти бесплатными. Окно тогда уходит в
+    /// свой максимум, раунд не укладывается в дедлайн и выбрасывается целиком.
+    ///
+    /// Живёт рядом с `push`, а не у вызывающего, ровно затем, чтобы формулы не
+    /// разъехались: раскладка байт в арене — дело этого модуля.
+    pub fn footprint(key: &[u8], value: &[u8], headers: &[(&str, &[u8])]) -> usize {
+        // Заголовки лежат с четырёхбайтовой длиной перед каждым куском —
+        // и перед именем, и перед значением (см. `append_chunk`).
+        let headers_bytes: usize = headers
+            .iter()
+            .map(|(name, value)| 4 + name.len() + 4 + value.len())
+            .sum();
+        key.len() + value.len() + headers_bytes
+    }
+
     /// Добавляет сообщение. Возвращает false, если буфер исчерпан.
     pub fn push(
         &mut self,
@@ -359,6 +379,40 @@ mod tests {
         assert_eq!(read[0], ("content-type", b"application/json".as_slice()));
         assert_eq!(read[1], ("empty", b"".as_slice()));
         assert_eq!(read[2], ("binary", [0xff, 0x00, 0xfe].as_slice()));
+    }
+
+    /// Тот самый инвариант, ради которого `footprint` живёт в этом модуле:
+    /// предсказанный размер обязан совпасть с приростом арены байт в байт.
+    /// Разойдутся — и глубокий поиск начнёт мерить окно по неверной цене
+    /// офсета, что уже однажды разваливало чтение (см. `window_floor`).
+    #[test]
+    fn footprint_matches_the_actual_arena_growth() {
+        /// Ключ, тело и заголовки одного сообщения.
+        type Case<'a> = (&'a [u8], &'a [u8], Vec<(&'a str, &'a [u8])>);
+
+        let cases: Vec<Case> = vec![
+            (b"", b"", vec![]),
+            (b"k", b"v", vec![]),
+            (
+                b"key-42",
+                &[0xff, 0x00, 0xfe],
+                vec![
+                    ("content-type", b"application/json".as_slice()),
+                    ("empty", b"".as_slice()),
+                ],
+            ),
+        ];
+
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        for (key, value, headers) in cases {
+            let before = store.byte_size();
+            assert!(store.push(0, 0, 0, key, value, &headers));
+            assert_eq!(
+                store.byte_size() - before,
+                MessageStore::footprint(key, value, &headers),
+                "footprint разошёлся с ареной на key={key:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RowPreview, SortColumn, SortDirection, SortSpec } from './types';
+import { ReadScope, RowPreview, SortColumn, SortDirection, SortSpec } from './types';
 import { formatTimestamp } from './format';
 import { OP_LABELS } from './lens';
 import { Virtuoso } from 'react-virtuoso';
@@ -122,6 +122,154 @@ function PlaceholderRow() {
   );
 }
 
+/**
+ * Ход глубокого поиска: сколько просмотрено, сколько нашлось, и кнопка «стоп».
+ *
+ * Шкала здесь не украшение. Поиск идёт минутами и почти всё это время таблица
+ * под ним пуста — без знаменателя «просмотрено 12 345» неотличимо от зависшего
+ * приложения, а именно на этом кластере медленное чтение под квотой выглядит
+ * зависанием чаще, чем хотелось бы.
+ *
+ * Знаменатель приблизительный, и в подписи это сказано словом «~», а не
+ * умолчанием: это число офсетов, а на компактированных партициях их больше, чем
+ * сообщений (см. `ReadScope.approx_total`). Дойдя до конца, поиск честно
+ * остановится «на 80 000 из ~92 000» — и объяснение этому лежит в подсказке.
+ */
+function SearchProgress({
+  scope,
+  found,
+  onStop,
+}: {
+  scope: ReadScope;
+  found: number;
+  onStop: () => void;
+}) {
+  const { scanned, approx_total: approx } = scope;
+  // Доля считается только когда знаменатель есть И он осмысленный. Пока
+  // границы партиций не сняты, шкалы нет вовсе: полоса, стоящая на нуле,
+  // выглядит как «не двигается», а не как «ещё не знаем сколько».
+  const share = approx && approx > 0 ? Math.min(scanned / approx, 1) : null;
+
+  return (
+    <div className="flex flex-row items-center gap-3 border-b border-edge bg-surface px-3 py-1.5 font-mono text-xs shrink-0">
+      <span className="text-brand shrink-0">searching…</span>
+      <span className="text-soft shrink-0">
+        {scanned.toLocaleString()}
+        {approx !== null && ` of ~${approx.toLocaleString()}`} scanned
+      </span>
+      <span className="text-dim shrink-0">·</span>
+      <span className={found > 0 ? 'text-strong shrink-0' : 'text-dim shrink-0'}>
+        {found.toLocaleString()} found
+      </span>
+
+      {share !== null && (
+        <div
+          className="relative h-1.5 min-w-16 flex-1 overflow-hidden rounded-full bg-edge"
+          title={
+            `Scanned ${scanned.toLocaleString()} of about ${approx?.toLocaleString()} messages. ` +
+            'The total is an estimate from partition offsets: on a compacted topic there are ' +
+            'more offsets than surviving messages, so the search can legitimately finish short ' +
+            'of it.'
+          }
+        >
+          <div
+            className="absolute left-0 top-0 h-full rounded-full bg-brand transition-[width] duration-300"
+            // Ширина считается от данных и в классы Tailwind не укладывается.
+            style={{ width: `${Math.max(share * 100, share > 0 ? 2 : 0)}%` }}
+          />
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={onStop}
+        title="Stop the search and re-read the topic the usual way"
+        className="ml-auto shrink-0 cursor-pointer rounded border border-edge px-2 py-0.5 text-soft hover:bg-elevated hover:text-strong"
+      >
+        Stop
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Насколько глубоко в топик заглянул фильтр.
+ *
+ * Одна фраза на два места — пустую таблицу и футер под найденным. Числа в них
+ * одни и те же, и разойтись их формулировкам нельзя: пользователь сверяет
+ * «нашлось два» именно с этой строкой, решая, довериться результату или искать
+ * дальше.
+ */
+function coverage(scanned: number, approx: number | null, searched: boolean): string {
+  const of = approx !== null && approx > scanned ? ` of about ${approx.toLocaleString()}` : '';
+  // «Просмотрено» против «загружено»: после глубокого поиска в буфере лежат
+  // единицы, а просмотрены были десятки тысяч, и «загружено» показало бы не ту
+  // цифру, которой мерится проделанная работа.
+  return searched
+    ? `${scanned.toLocaleString()} messages searched${of}`
+    : `${scanned.toLocaleString()} messages read so far${of}`;
+}
+
+/**
+ * Пустая таблица с активным фильтром.
+ *
+ * До этого экрана здесь было просто «No messages», и это был тупик: кнопка
+ * «Load more» живёт в футере списка, а списка при нуле строк нет вовсе —
+ * дочитать топик было нельзя никак, кроме сброса фильтра. Теперь тут сказано,
+ * ЧТО именно просмотрено, и предложено единственное действие, которое имеет
+ * смысл дальше.
+ */
+function NothingMatched({
+  scanned,
+  approx,
+  canSearchDeeper,
+  searchedBuffer,
+  onDeepSearch,
+}: {
+  scanned: number;
+  approx: number | null;
+  canSearchDeeper: boolean;
+  searchedBuffer: boolean;
+  onDeepSearch: () => void;
+}) {
+  return (
+    <div className="mx-auto max-w-md p-6 text-center font-mono">
+      <div className="text-soft text-sm">
+        Nothing matched — {coverage(scanned, approx, searchedBuffer)}.
+      </div>
+
+      {canSearchDeeper ? (
+        <>
+          {/* Сказано и то, сколько это стоит, и то, что операция отменяемая:
+              без первого кнопку не нажмут на большом топике, без второго
+              нажмут и испугаются, что приложение зависло. */}
+          <div className="mt-3 text-xs text-dim leading-relaxed">
+            {searchedBuffer
+              ? 'The search did not reach the end of the topic. Running it again starts over ' +
+                'from the same end — narrow the filter first if it stopped on a full buffer.'
+              : 'The rest of the topic has not been read yet. A deep search reads it through ' +
+                'and keeps only the matches — this takes a while on a large topic, and you ' +
+                'can stop it at any time.'}
+          </div>
+          <button
+            type="button"
+            onClick={onDeepSearch}
+            className="mt-4 cursor-pointer rounded bg-brand px-4 py-2 text-sm text-surface hover:bg-brand-hover"
+          >
+            {searchedBuffer ? 'Search again' : 'Search the whole topic'}
+          </button>
+        </>
+      ) : (
+        <div className="mt-3 text-xs text-dim leading-relaxed">
+          {searchedBuffer
+            ? 'The whole topic has been searched — nothing in it matches this filter.'
+            : 'The whole topic has been read — there is nothing else to search.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface MessagesPanelProps {
   total: number;
   getRow: (index: number) => RowPreview | undefined;
@@ -130,10 +278,26 @@ interface MessagesPanelProps {
   isLoading: boolean;
   /** Растёт при подгрузке чанка — сигнал перерисовать видимые строки. */
   version: number;
-  /** В топике есть ещё непрочитанные сообщения — показать кнопку. */
+  /** Можно предложить обычную догрузку. Уже, чем `truncated`: в буфер после
+   *  глубокого поиска дописывать непросеянное нельзя. */
   canLoadMore: boolean;
+  /** В топике осталось непрочитанное — независимо от того, чем его дочитывать. */
+  truncated: boolean;
   isLoadingMore: boolean;
   onLoadMore: () => void;
+  /** Фильтр не пуст. От этого зависит, что означает пустая таблица: «в топике
+   *  ничего нет» или «ничего не подошло». */
+  hasFilter: boolean;
+  /** Идёт глубокий поиск по всему топику. */
+  isSearching: boolean;
+  /** В буфере лежит добыча поиска, а не обычное чтение: непопавшее под фильтр
+   *  в него не клали. Меняет смысл счётчиков под таблицей. */
+  searchedBuffer: boolean;
+  /** Сколько просмотрено и сколько всего — знаменатель приблизительный
+   *  (см. `ReadScope`). `null` — открытого топика нет. */
+  scope: ReadScope | null;
+  onDeepSearch: () => void;
+  onStopSearch: () => void;
   /** Клик по заголовку колонки. `null` — обычный порядок чтения. */
   sort: SortSpec | null;
   onSortChange: (sort: SortSpec | null) => void;
@@ -156,8 +320,15 @@ export function MessagesPanel({
   isLoading,
   version,
   canLoadMore,
+  truncated,
   isLoadingMore,
   onLoadMore,
+  hasFilter,
+  isSearching,
+  searchedBuffer,
+  scope,
+  onDeepSearch,
+  onStopSearch,
   sort,
   onSortChange,
   highlight,
@@ -265,21 +436,84 @@ export function MessagesPanel({
     [getRow, onSelectMessage, version, highlight, onHighlightSeen],
   );
 
+  /**
+   * Что стоит под последней найденной строкой.
+   *
+   * Главное здесь — то, чего тут раньше не было вовсе: пока топик дочитан не до
+   * конца, найденное НЕ ЗНАЧИТ «всё найденное». Две подошедшие строки выглядят
+   * как исчерпывающий ответ, хотя это ответ по той тысяче сообщений на
+   * партицию, которую успели прочитать. Поэтому предложение искать глубже стоит
+   * здесь независимо от того, нашлось что-нибудь или нет, — как и объяснение,
+   * по какой части топика получен текущий ответ.
+   */
   const Footer = useCallback(() => {
+    // Поиск оборвался, не дойдя до конца топика, — почти всегда потому, что
+    // буфер заполнился находками. Обычной догрузкой это не лечится (она
+    // дописала бы непросеянное), поэтому вместо кнопок — что делать дальше.
+    //
+    // `!isSearching` обязателен: пока поиск ИДЁТ, «в топике есть ещё» верно по
+    // определению, и без этой проверки объявление о том, что он остановился,
+    // висело бы под таблицей всё время его работы.
+    if (searchedBuffer && truncated && !isSearching) {
+      return (
+        <div className="p-3 text-center font-mono text-xs text-dim">
+          The search stopped before the end of the topic — the buffer is full of matches.
+          Narrow the filter and search again to get past this point.
+        </div>
+      );
+    }
+
+    // Глубже искать нечего, дочитывать нечего — футер пуст, как и раньше.
     if (!canLoadMore) return null;
+
+    const offerSearch = hasFilter && !searchedBuffer;
     return (
-      <div className="p-3 flex justify-center">
-        <button
-          type="button"
-          onClick={onLoadMore}
-          disabled={isLoadingMore}
-          className="px-4 py-2 text-sm font-mono rounded border border-edge text-soft hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {isLoadingMore ? 'Loading…' : 'Load more'}
-        </button>
+      <div className="flex flex-col items-center gap-2 p-3 font-mono">
+        {offerSearch && scope && (
+          <div className="text-center text-xs text-dim">
+            These matches are from the {coverage(scope.scanned, scope.approx_total, false)} —
+            the rest of the topic has not been read yet.
+          </div>
+        )}
+        <div className="flex flex-row items-center gap-2">
+          <button
+            type="button"
+            onClick={onLoadMore}
+            disabled={isLoadingMore}
+            className="px-4 py-2 text-sm font-mono rounded border border-edge text-soft hover:bg-elevated disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isLoadingMore ? 'Loading…' : 'Load more'}
+          </button>
+          {/* Рядом с «Load more», а не вместо неё: это два разных ответа на
+              «мало нашлось». Дочитать ещё тысячу на партицию дёшево и часто
+              достаточно; пройти топик целиком дорого и отменяемо. Выбор между
+              ними зависит от того, насколько редкое ищут, — а этого знать
+              отсюда нельзя. */}
+          {offerSearch && (
+            <button
+              type="button"
+              onClick={onDeepSearch}
+              disabled={isLoadingMore}
+              title="Read the topic through to the end, keeping only the matches. Takes a while on a large topic; you can stop it at any time."
+              className="rounded bg-brand px-4 py-2 text-sm text-surface hover:bg-brand-hover disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Search the whole topic
+            </button>
+          )}
+        </div>
       </div>
     );
-  }, [canLoadMore, isLoadingMore, onLoadMore]);
+  }, [
+    canLoadMore,
+    truncated,
+    searchedBuffer,
+    hasFilter,
+    scope,
+    isSearching,
+    isLoadingMore,
+    onLoadMore,
+    onDeepSearch,
+  ]);
 
   const virtuosoComponents = useMemo(() => ({ Footer }), [Footer]);
 
@@ -343,16 +577,30 @@ export function MessagesPanel({
       </div>
 
       <div className="flex-1 min-h-0 overflow-hidden h-full flex flex-col">
-        {isLoading && total > 0 && (
-          <div className="px-3 py-1 text-xs font-mono text-soft border-b border-edge bg-surface shrink-0">
-            Loading… {total} so far
-          </div>
-        )}
-        {isLoading && total === 0 ? (
-          <div className="p-4 text-center text-soft font-mono">Reading from Kafka…</div>
-        ) : total === 0 ? (
-          <div className="p-4 text-center text-dim font-mono">No messages</div>
+        {/* Поиск идёт своей полосой и ВСЕГДА, в том числе когда таблица под ней
+            пуста: пустая таблица — обычное состояние поиска на протяжении
+            большей части его работы, и именно тогда шкала нужна больше всего.
+            Полоса обычного чтения показывается по прежнему правилу — только
+            когда что-то уже нашлось; до первых строк своё сообщение есть ниже. */}
+        {isSearching ? (
+          // `scope` подставляется пустым, а не гасит полосу: без неё исчезла бы
+          // и кнопка «стоп», а долгая операция без способа её прервать — это
+          // то самое, чего здесь быть не должно.
+          <SearchProgress
+            scope={scope ?? { scanned: 0, approx_total: null }}
+            found={total}
+            onStop={onStopSearch}
+          />
         ) : (
+          isLoading &&
+          total > 0 && (
+            <div className="px-3 py-1 text-xs font-mono text-soft border-b border-edge bg-surface shrink-0">
+              Loading… {total} so far
+            </div>
+          )
+        )}
+
+        {total > 0 ? (
           <Virtuoso
             style={{ height: '100%' }}
             totalCount={total}
@@ -360,6 +608,26 @@ export function MessagesPanel({
             itemContent={renderItem}
             components={virtuosoComponents}
           />
+        ) : isSearching ? (
+          // Коротко и без объяснений: сколько просмотрено, сколько нашлось и
+          // как остановиться — всё это уже сказано полосой прямо над этим
+          // местом, и повторять её здесь значило бы занять экран дважды.
+          <div className="p-4 text-center font-mono text-dim">No matches yet</div>
+        ) : isLoading ? (
+          <div className="p-4 text-center text-soft font-mono">Reading from Kafka…</div>
+        ) : hasFilter ? (
+          <NothingMatched
+            scanned={scope?.scanned ?? 0}
+            approx={scope?.approx_total ?? null}
+            // Именно `truncated`, а не `canLoadMore`: обычная догрузка после
+            // поиска запрещена, а вот повторить поиск можно всегда, пока в
+            // топике осталось непрочитанное.
+            canSearchDeeper={truncated}
+            searchedBuffer={searchedBuffer}
+            onDeepSearch={onDeepSearch}
+          />
+        ) : (
+          <div className="p-4 text-center text-dim font-mono">No messages</div>
         )}
       </div>
     </div>
