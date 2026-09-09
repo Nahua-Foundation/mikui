@@ -42,7 +42,7 @@ function OrderButton({
       className={`font-mono px-3 py-1 h-auto ${
         active
           ? 'bg-brand text-surface hover:bg-brand-hover'
-          : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
+          : 'bg-transparent text-soft hover:bg-edge hover:text-strong'
       }`}
       onClick={onClick}
     >
@@ -112,7 +112,7 @@ export function FavoritesModal({
           `sm:max-w-lg`, и без парного sm-варианта ширина схлопывалась до 32rem
           на любом окне шире 640 px. Тем же приёмом задана ширина окна
           сообщения. */}
-      <DialogContentNoClose className="flex flex-col max-w-5xl sm:max-w-5xl max-h-[90vh] overflow-hidden bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="flex flex-col max-w-5xl sm:max-w-5xl max-h-[90vh] overflow-hidden bg-surface border-edge text-strong">
         <DialogHeader className="shrink-0 border-b border-edge pb-4">
           <DialogTitle className="font-mono text-soft text-lg">
             Saved Messages ({items.length})

@@ -206,7 +206,7 @@ export function TopicsPanel({ topics, selectedTopic, onTopicSelect, onTopicInfo 
             value={topicFilter}
             onChange={(e) => setTopicFilter(e.target.value)}
             placeholder="Filter topics..."
-            className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8"
+            className="bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8"
           />
         </div>
       </div>

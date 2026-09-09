@@ -49,7 +49,7 @@ export function ShareLinkModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-2xl bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="max-w-2xl bg-surface border-edge text-strong">
         <DialogHeader className="border-b border-edge pb-4">
           <DialogTitle className="font-mono text-soft text-lg">Share this message</DialogTitle>
           <DialogDescription className="font-mono text-soft text-sm">
@@ -64,12 +64,12 @@ export function ShareLinkModal({
               value={url ?? ''}
               readOnly
               onFocus={(e) => e.currentTarget.select()}
-              className="bg-sunken border-edge text-slate-50 font-mono text-xs"
+              className="bg-sunken border-edge text-strong font-mono text-xs"
             />
             <Button
               variant="outline"
               size="sm"
-              className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 shrink-0"
+              className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong shrink-0"
               onClick={() => url && copy(url)}
             >
               <Copy className="size-4 mr-1" />

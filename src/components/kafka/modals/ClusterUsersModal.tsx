@@ -150,7 +150,7 @@ export function ClusterUsersModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-2xl max-h-[85vh] bg-surface border-edge text-slate-50 flex flex-col">
+      <DialogContentNoClose className="max-w-2xl max-h-[85vh] bg-surface border-edge text-strong flex flex-col">
         <DialogHeader className="border-b border-edge pb-4 flex-shrink-0">
           <DialogTitle className="font-mono text-soft text-lg">
             Users · {cluster.name}
@@ -172,7 +172,7 @@ export function ClusterUsersModal({
                   onChange={(e) => setUsername(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   placeholder="Enter username"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                  className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                 />
               </div>
               <div className="space-y-2">
@@ -183,7 +183,7 @@ export function ClusterUsersModal({
                   onChange={(e) => setPassword(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   placeholder="Enter password"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                  className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                 />
               </div>
             </div>
@@ -218,7 +218,7 @@ export function ClusterUsersModal({
                         <Input
                           value={editUsername}
                           onChange={(e) => setEditUsername(e.target.value)}
-                          className="bg-surface border-edge text-slate-50 font-mono"
+                          className="bg-surface border-edge text-strong font-mono"
                         />
                       </div>
                       <div className="space-y-2">
@@ -232,7 +232,7 @@ export function ClusterUsersModal({
                               ? 'Saved in keychain — leave blank to keep'
                               : 'Enter password'
                           }
-                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
                     </div>
@@ -250,7 +250,7 @@ export function ClusterUsersModal({
                         onClick={() => setEditingId(null)}
                         variant="outline"
                         size="sm"
-                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
                       >
                         <X className="size-4 mr-1" />
                         Cancel
@@ -269,11 +269,11 @@ export function ClusterUsersModal({
                     <div className="flex items-center gap-2">
                       {user.id === activeUserId && (
                         <span
-                          className="size-2 rounded-full bg-green-500 shrink-0"
+                          className="size-2 rounded-full bg-ok shrink-0"
                           title="Connected as this user"
                         />
                       )}
-                      <span className="font-mono text-slate-50 truncate">{user.username}</span>
+                      <span className="font-mono text-strong truncate">{user.username}</span>
                     </div>
                     <div className="font-mono text-xs text-dim mt-1 flex items-center gap-1">
                       <KeyRound className="size-3" />
@@ -294,7 +294,7 @@ export function ClusterUsersModal({
                         onClick={() => handleDelete(user)}
                         disabled={busy}
                         size="sm"
-                        className="bg-danger text-slate-50 hover:bg-danger-hover font-mono disabled:opacity-50"
+                        className="bg-danger text-strong hover:bg-danger-hover font-mono disabled:opacity-50"
                       >
                         Delete
                       </Button>
@@ -302,7 +302,7 @@ export function ClusterUsersModal({
                         onClick={() => setConfirmingId(null)}
                         variant="outline"
                         size="sm"
-                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
                       >
                         Cancel
                       </Button>
@@ -336,7 +336,7 @@ export function ClusterUsersModal({
             <Button
               onClick={onBack}
               variant="outline"
-              className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+              className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
             >
               Back
             </Button>
@@ -344,7 +344,7 @@ export function ClusterUsersModal({
           <Button
             onClick={() => onOpenChange(false)}
             variant="outline"
-            className="ml-auto bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+            className="ml-auto bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
           >
             Done
           </Button>

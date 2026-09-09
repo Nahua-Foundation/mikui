@@ -176,7 +176,7 @@ export function TopicConfigModal({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContentNoClose
-        className="max-w-md bg-surface border-edge text-slate-50"
+        className="max-w-md bg-surface border-edge text-strong"
         aria-describedby={undefined}
       >
         {/* Кнопки «в избранное» здесь больше нет: она показывала тост и не
@@ -195,7 +195,7 @@ export function TopicConfigModal({
           <div className="space-y-2">
             <Label className="font-mono text-sm text-soft">Message Type</Label>
             <Select value={format} onValueChange={(v) => setFormat(v as BodyFormat)}>
-              <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+              <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className="bg-surface border-edge">
@@ -203,7 +203,7 @@ export function TopicConfigModal({
                   <SelectItem
                     key={value}
                     value={value}
-                    className="text-slate-50 font-mono focus:bg-edge"
+                    className="text-strong font-mono focus:bg-edge"
                   >
                     {label}
                   </SelectItem>
@@ -237,7 +237,7 @@ export function TopicConfigModal({
                       <div key={file.name} className="flex items-center gap-2 p-2">
                         <FileText className="size-3.5 shrink-0 text-dim" />
                         <div className="min-w-0 flex-1">
-                          <div className="font-mono text-xs text-slate-50 truncate">
+                          <div className="font-mono text-xs text-strong truncate">
                             {file.name}
                           </div>
                           {/* Исходный путь: по нему работает «обновить», и
@@ -259,7 +259,7 @@ export function TopicConfigModal({
                           type="button"
                           onClick={() => handleRemove(file.name)}
                           disabled={busy}
-                          className="p-1 text-dim hover:text-slate-50 disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                          className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
                           title="Remove this file"
                         >
                           <X className="size-3.5" />
@@ -281,7 +281,7 @@ export function TopicConfigModal({
                   onClick={handleLoadFiles}
                   disabled={busy}
                   variant="outline"
-                  className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                  className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
                 >
                   <Upload className="size-4 mr-2" />
                   {busy ? 'Working…' : 'Load Proto Files'}
@@ -295,7 +295,7 @@ export function TopicConfigModal({
                   onValueChange={setMessage}
                   disabled={busy || messages.length === 0}
                 >
-                  <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+                  <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                     <SelectValue
                       placeholder={
                         messages.length === 0 ? 'Load a .proto file first' : 'Choose a message'
@@ -307,7 +307,7 @@ export function TopicConfigModal({
                       <SelectItem
                         key={name}
                         value={name}
-                        className="text-slate-50 font-mono focus:bg-edge"
+                        className="text-strong font-mono focus:bg-edge"
                       >
                         {name}
                       </SelectItem>
@@ -365,7 +365,7 @@ export function TopicConfigModal({
             <Button
               onClick={() => onOpenChange(false)}
               variant="outline"
-              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
             >
               Cancel
             </Button>

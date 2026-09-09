@@ -33,7 +33,7 @@ export function ClusterArchiveModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-4xl max-h-[80vh] bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="max-w-4xl max-h-[80vh] bg-surface border-edge text-strong">
         <DialogHeader className="border-b border-edge pb-4">
           <div className="flex items-center justify-between">
             <div>
@@ -88,11 +88,11 @@ export function ClusterArchiveModal({
                     <div className="flex items-center gap-2">
                       {cluster.id === connectedClusterId && (
                         <span
-                          className="size-2 rounded-full bg-green-500 shrink-0"
+                          className="size-2 rounded-full bg-ok shrink-0"
                           title="Connected"
                         />
                       )}
-                      <span className="font-mono text-slate-50 truncate" title={cluster.name}>
+                      <span className="font-mono text-strong truncate" title={cluster.name}>
                         {cluster.name}
                       </span>
                     </div>
@@ -117,7 +117,7 @@ export function ClusterArchiveModal({
                         e.stopPropagation();
                         onDeleteCluster(cluster.id);
                       }}
-                      className="p-1 text-dim hover:text-red-400 transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+                      className="p-1 text-dim hover:text-danger-hover transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
                       title="Delete cluster"
                     >
                       <Trash2 className="size-4" />

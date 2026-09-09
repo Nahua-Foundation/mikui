@@ -66,7 +66,7 @@ function DiffTable({ rows, op }: { rows: DiffRow[]; op: string }) {
             <div className="text-dim">
               {row.changed ? <ArrowRight className="size-3" /> : null}
             </div>
-            <div className={`break-all ${row.changed ? 'text-slate-50' : 'text-dim'}`}>
+            <div className={`break-all ${row.changed ? 'text-strong' : 'text-dim'}`}>
               {row.after ?? <span className="text-dim">—</span>}
             </div>
           </div>

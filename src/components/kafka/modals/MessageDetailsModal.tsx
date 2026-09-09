@@ -229,7 +229,7 @@ export function MessageDetailsModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-[58rem] sm:max-w-[58rem] max-h-[90vh] bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="max-w-[58rem] sm:max-w-[58rem] max-h-[90vh] bg-surface border-edge text-strong">
         <DialogHeader className="border-b border-edge pb-4">
           <DialogTitle className="font-mono text-soft text-lg">{title}</DialogTitle>
           <DialogDescription className="font-mono text-soft text-sm">
@@ -250,11 +250,11 @@ export function MessageDetailsModal({
             </div>
             <div>
               <div className="font-mono text-sm text-soft mb-1">Key</div>
-              <div className="font-mono text-slate-50">{message.key}</div>
+              <div className="font-mono text-strong">{message.key}</div>
             </div>
             <div>
               <div className="font-mono text-sm text-soft mb-1">Timestamp</div>
-              <div className="font-mono text-slate-50">{formatTimestamp(message.timestamp)}</div>
+              <div className="font-mono text-strong">{formatTimestamp(message.timestamp)}</div>
             </div>
           </div>
           
@@ -277,7 +277,7 @@ export function MessageDetailsModal({
                     className={`font-mono px-3 py-1 h-auto ${
                       activeTab === tab
                         ? 'bg-brand text-surface hover:bg-brand-hover'
-                        : 'bg-transparent text-soft hover:bg-edge hover:text-slate-50'
+                        : 'bg-transparent text-soft hover:bg-edge hover:text-strong'
                     }`}
                     onClick={() => setActiveTab(tab)}
                   >
@@ -307,7 +307,7 @@ export function MessageDetailsModal({
                       <Button
                         variant="outline"
                         size="sm"
-                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
+                        className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong"
                         onClick={onAddToFavorite}
                         title="Keep this message on disk — it will outlive the topic's retention."
                       >
@@ -323,7 +323,7 @@ export function MessageDetailsModal({
                   <Button
                     variant="outline"
                     size="sm"
-                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
+                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong"
                     onClick={onShare}
                     title="Copy a link that opens this message in mikui"
                   >
@@ -334,7 +334,7 @@ export function MessageDetailsModal({
                 <Button
                   variant="outline"
                   size="sm"
-                  className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
+                  className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong"
                   onClick={handleCopy}
                 >
                   <Copy className="size-4 mr-1" />

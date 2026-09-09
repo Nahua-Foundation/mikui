@@ -515,7 +515,7 @@ export function ProduceMessageModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-[52rem] sm:max-w-[52rem] max-h-[90vh] bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="max-w-[52rem] sm:max-w-[52rem] max-h-[90vh] bg-surface border-edge text-strong">
         <DialogHeader className="border-b border-edge pb-4 min-w-0">
           <DialogTitle className="font-mono text-soft text-lg">Produce to topic</DialogTitle>
           {/* Имя топика — подзаголовком, а не в самом заголовке: оно бывает
@@ -535,13 +535,13 @@ export function ProduceMessageModal({
             <div className="space-y-2">
               <Label className="font-mono text-sm text-soft">Partition</Label>
               <Select value={partition} onValueChange={setPartition}>
-                <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+                <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="bg-surface border-edge max-h-80">
                   <SelectItem
                     value={AUTO_PARTITION}
-                    className="text-slate-50 font-mono focus:bg-edge"
+                    className="text-strong font-mono focus:bg-edge"
                   >
                     automatic
                   </SelectItem>
@@ -555,7 +555,7 @@ export function ProduceMessageModal({
                     <SelectItem
                       key={p}
                       value={String(p)}
-                      className="text-slate-50 font-mono focus:bg-edge"
+                      className="text-strong font-mono focus:bg-edge"
                     >
                       {String(p)}
                     </SelectItem>
@@ -579,7 +579,7 @@ export function ProduceMessageModal({
                 value={key}
                 onChange={(e) => setKey(e.target.value)}
                 placeholder="Optional"
-                className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
               />
               <div className="font-mono text-xs text-dim">
                 {key === '' ? 'No key — not the same as an empty one.' : 'Sent as UTF-8.'}
@@ -618,18 +618,18 @@ export function ProduceMessageModal({
                         value={header.key}
                         onChange={(e) => updateHeader(index, { key: e.target.value })}
                         placeholder="key"
-                        className="h-8 w-48 shrink-0 bg-surface border-edge text-slate-50 font-mono text-xs placeholder:text-dim"
+                        className="h-8 w-48 shrink-0 bg-surface border-edge text-strong font-mono text-xs placeholder:text-dim"
                       />
                       <Input
                         value={header.value}
                         onChange={(e) => updateHeader(index, { value: e.target.value })}
                         placeholder="value"
-                        className="h-8 flex-1 min-w-0 bg-surface border-edge text-slate-50 font-mono text-xs placeholder:text-dim"
+                        className="h-8 flex-1 min-w-0 bg-surface border-edge text-strong font-mono text-xs placeholder:text-dim"
                       />
                       <button
                         type="button"
                         onClick={() => removeHeader(index)}
-                        className="p-1 text-dim hover:text-slate-50 bg-transparent border-none cursor-pointer shrink-0"
+                        className="p-1 text-dim hover:text-strong bg-transparent border-none cursor-pointer shrink-0"
                         title="Remove this header"
                       >
                         <X className="size-3.5" />
@@ -662,7 +662,7 @@ export function ProduceMessageModal({
                   места, сколько ему не хватало. Заодно это тот же вид, каким
                   формат выбирают при чтении. */}
               <Select value={format} onValueChange={(v) => setFormat(v as PayloadFormat)}>
-                <SelectTrigger className="w-40 shrink-0 bg-surface border-edge text-slate-50 font-mono">
+                <SelectTrigger className="w-40 shrink-0 bg-surface border-edge text-strong font-mono">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="bg-surface border-edge">
@@ -679,7 +679,7 @@ export function ProduceMessageModal({
                         key={value}
                         value={value}
                         disabled={missing}
-                        className="text-slate-50 font-mono focus:bg-edge"
+                        className="text-strong font-mono focus:bg-edge"
                       >
                         {label}
                         {/* Причина строкой в самом пункте, а не подсказкой:
@@ -715,7 +715,7 @@ export function ProduceMessageModal({
                       // пока в поле нечего терять, и после правки тела это
                       // единственный способ вернуть её — а текстом кнопка не
                       // читалась как кнопка вообще.
-                      className="h-9 shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono text-xs"
+                      className="h-9 shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono text-xs"
                     >
                       <RotateCcw className="size-3.5" />
                       template
@@ -744,7 +744,7 @@ export function ProduceMessageModal({
                         `min-w-0` на значении — оно само тоже flex-элемент,
                         теперь уже внутри триггера, и та же история. */}
                     <SelectTrigger
-                      className="w-72 min-w-0 bg-surface border-edge text-slate-50 font-mono text-xs *:data-[slot=select-value]:block *:data-[slot=select-value]:min-w-0"
+                      className="w-72 min-w-0 bg-surface border-edge text-strong font-mono text-xs *:data-[slot=select-value]:block *:data-[slot=select-value]:min-w-0"
                       title={protoMessage ?? undefined}
                     >
                       <SelectValue placeholder="Choose a message">
@@ -759,7 +759,7 @@ export function ProduceMessageModal({
                         <SelectItem
                           key={name}
                           value={name}
-                          className="text-slate-50 font-mono focus:bg-edge"
+                          className="text-strong font-mono focus:bg-edge"
                         >
                           {name}
                         </SelectItem>
@@ -778,7 +778,7 @@ export function ProduceMessageModal({
                       size="sm"
                       onClick={applyTemplate}
                       title="Replace the body with a fresh template"
-                      className="h-9 shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono text-xs"
+                      className="h-9 shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono text-xs"
                     >
                       <RotateCcw className="size-3.5" />
                       template
@@ -837,7 +837,7 @@ export function ProduceMessageModal({
                 spellCheck={false}
                 style={SCROLLBAR_GUTTER}
                 className={`relative block h-64 w-full resize-none bg-transparent p-3 font-mono text-sm leading-6 whitespace-pre-wrap break-words outline-none placeholder:text-dim ${
-                  highlighted ? 'text-transparent caret-slate-50' : 'text-slate-50'
+                  highlighted ? 'text-transparent caret-strong' : 'text-strong'
                 }`}
               />
             </div>
@@ -910,7 +910,7 @@ export function ProduceMessageModal({
             <Button
               onClick={() => onOpenChange(false)}
               variant="outline"
-              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
             >
               Cancel
             </Button>

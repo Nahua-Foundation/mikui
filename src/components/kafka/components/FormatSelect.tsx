@@ -63,7 +63,7 @@ export function FormatSelect({ format, onChange, onOpenSchema }: FormatSelectPro
       {/* Два уровня — как у соседнего селектора партиций: подпись постоянной
           ширины сверху, значение под ней. */}
       <DropdownMenu>
-        <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
+        <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-strong bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
           <div className="flex flex-col items-start leading-tight">
             <span className="text-dim">format</span>
             {/* Подпись из того же списка, что и пункты меню: у `jsonschema`
@@ -81,8 +81,8 @@ export function FormatSelect({ format, onChange, onOpenSchema }: FormatSelectPro
               key={value}
               className={`font-mono cursor-pointer ${
                 value === format
-                  ? 'bg-edge text-slate-50'
-                  : 'text-soft hover:bg-edge hover:text-slate-50'
+                  ? 'bg-edge text-strong'
+                  : 'text-soft hover:bg-edge hover:text-strong'
               }`}
               onClick={() => onChange(value)}
             >

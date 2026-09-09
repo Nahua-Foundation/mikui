@@ -29,6 +29,7 @@ import { IconAction } from './components/IconAction';
 import { FormatSelect, needsSchema } from './components/FormatSelect';
 import { LensSelect } from './components/LensSelect';
 import { ReadOrder } from './components/ReadOrder';
+import { ThemeToggle } from './components/ThemeToggle';
 
 /** Со скольки выбранных партиций перечисление перестаёт помещаться в шапку. */
 const PARTITIONS_SHOWN_INLINE = 3;
@@ -173,9 +174,9 @@ export function HeaderDesktop({
               ></div>
             ) : connected ? (
               <div className="relative">
-                <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-                <div className="absolute inset-0 w-2 h-2 bg-green-500 rounded-full animate-pulse opacity-75"></div>
-                <div className="absolute inset-0 w-2 h-2 bg-green-500 rounded-full shadow-[0_0_6px_rgba(34,197,94,0.6)]"></div>
+                <div className="w-2 h-2 bg-ok rounded-full"></div>
+                <div className="absolute inset-0 w-2 h-2 bg-ok rounded-full animate-pulse opacity-75"></div>
+                <div className="absolute inset-0 w-2 h-2 bg-ok rounded-full shadow-[0_0_6px_var(--ok-glow)]"></div>
               </div>
             ) : (
               <div className="w-2 h-2 bg-edge rounded-full" title="Not connected"></div>
@@ -201,7 +202,7 @@ export function HeaderDesktop({
                 {/* Мельче названия кластера: кластер — это «где я», а учётка
                     — уточнение к нему, и спорить с ним за внимание ей незачем. */}
                 <DropdownMenu>
-                  <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-center border-none outline-none cursor-pointer">
+                  <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-strong bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-center border-none outline-none cursor-pointer">
                     <User className="size-3.5" />
                     <span className={activeUser ? '' : 'text-dim'}>
                       {activeUser ? activeUser.username : 'no user'}
@@ -217,8 +218,8 @@ export function HeaderDesktop({
                         key={user.id}
                         className={`font-mono cursor-pointer justify-between ${
                           user.id === activeUserId
-                            ? 'bg-edge text-slate-50'
-                            : 'text-soft hover:bg-edge hover:text-slate-50'
+                            ? 'bg-edge text-strong'
+                            : 'text-soft hover:bg-edge hover:text-strong'
                         }`}
                         onClick={() => onSelectUser(user)}
                       >
@@ -237,7 +238,7 @@ export function HeaderDesktop({
                     )}
                     <DropdownMenuSeparator className="bg-edge" />
                     <DropdownMenuItem
-                      className="font-mono cursor-pointer text-soft hover:bg-edge hover:text-slate-50"
+                      className="font-mono cursor-pointer text-soft hover:bg-edge hover:text-strong"
                       onClick={onManageUsers}
                     >
                       <Users className="size-4" />
@@ -272,13 +273,13 @@ export function HeaderDesktop({
                   value={filters.value}
                   onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
                   placeholder="Search in messages"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8 pr-9 w-64"
+                  className="bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8 pr-9 w-64"
                 />
                 <DropdownMenu>
                   <DropdownMenuTrigger
                     title="Filters"
                     className={`absolute right-2 top-1/2 -translate-y-1/2 bg-transparent border-none outline-none cursor-pointer p-0 transition-colors ${
-                      hasActiveFilters ? 'text-brand' : 'text-dim hover:text-slate-50'
+                      hasActiveFilters ? 'text-brand' : 'text-dim hover:text-strong'
                     }`}
                   >
                     <Filter className="size-4" />
@@ -291,7 +292,7 @@ export function HeaderDesktop({
                           value={filters.key}
                           onChange={(e) => onFiltersChange({ ...filters, key: e.target.value })}
                           placeholder="Filter by key..."
-                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
                       <div className="space-y-2">
@@ -300,7 +301,7 @@ export function HeaderDesktop({
                           value={filters.value}
                           onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
                           placeholder="Filter by message content..."
-                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
                       <div className="flex items-center gap-2">
@@ -349,7 +350,7 @@ export function HeaderDesktop({
                           onClick={() => onFiltersChange(EMPTY_FILTER)}
                           variant="outline"
                           size="sm"
-                          className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                          className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
                         >
                           Clear
                         </Button>
@@ -421,7 +422,7 @@ export function HeaderDesktop({
                   до того, что переставало в неё влезать. Подпись сверху
                   постоянной ширины, значение под ней. */}
               <DropdownMenu>
-                <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
+                <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-strong bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
                   <div className="flex flex-col items-start leading-tight">
                     <span className="text-dim">partitions</span>
                     <span
@@ -447,7 +448,7 @@ export function HeaderDesktop({
                       // Снять чек с «all» некуда: пустой выбор — это и есть «all».
                       onCheckedChange={() => onSelectPartitions(null)}
                       className={`font-mono cursor-pointer ${
-                        allPartitions ? 'text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
+                        allPartitions ? 'text-strong' : 'text-soft hover:bg-edge hover:text-strong'
                       }`}
                     >
                       all
@@ -470,7 +471,7 @@ export function HeaderDesktop({
                           )
                         }
                         className={`font-mono cursor-pointer ${
-                          checked ? 'text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
+                          checked ? 'text-strong' : 'text-soft hover:bg-edge hover:text-strong'
                         }`}
                       >
                         {partition}
@@ -519,6 +520,11 @@ export function HeaderDesktop({
             <RefreshCw className="size-4" />
           </IconAction>
         )}
+
+        {/* Последним в шапке — в самом углу окна. Тема не зависит ни от топика,
+            ни от подключения, поэтому и место у неё такое, из которого её не
+            вытесняют появляющиеся и исчезающие селекторы. */}
+        <ThemeToggle />
       </div>
     </div>
   );

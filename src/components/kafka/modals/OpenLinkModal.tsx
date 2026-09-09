@@ -14,7 +14,7 @@ function Field({ label, value, accent }: { label: string; value: string; accent?
   return (
     <div className="flex items-baseline gap-4 font-mono">
       <div className="w-24 shrink-0 text-xs text-dim">{label}</div>
-      <div className={`min-w-0 truncate ${accent ? 'text-brand' : 'text-slate-50'}`} title={value}>
+      <div className={`min-w-0 truncate ${accent ? 'text-brand' : 'text-strong'}`} title={value}>
         {value}
       </div>
     </div>
@@ -117,7 +117,7 @@ export function OpenLinkModal({
       {/* 50rem вместо 42rem: в окне четыре поля с длинными значениями — имя
           топика и имя кластера, — и в прежнюю ширину они укладывались только
           усечением. */}
-      <DialogContentNoClose className="max-w-[50rem] sm:max-w-[50rem] bg-surface border-edge text-slate-50">
+      <DialogContentNoClose className="max-w-[50rem] sm:max-w-[50rem] bg-surface border-edge text-strong">
         <DialogHeader className="border-b border-edge pb-4">
           <DialogTitle className="font-mono text-soft text-lg">Open a message link</DialogTitle>
           <DialogDescription className="font-mono text-soft text-sm">
@@ -164,7 +164,7 @@ export function OpenLinkModal({
               <Button
                 variant="outline"
                 size="sm"
-                className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50"
+                className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong"
                 onClick={() => onOpenChange(false)}
               >
                 Cancel
@@ -188,7 +188,7 @@ export function OpenLinkModal({
                 onChange={(e) => setText(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && text.trim() && resolve(text)}
                 placeholder="mikui://message/v1?…"
-                className="bg-sunken border-edge text-slate-50 font-mono text-xs placeholder:text-dim"
+                className="bg-sunken border-edge text-strong font-mono text-xs placeholder:text-dim"
               />
               <Button
                 size="sm"

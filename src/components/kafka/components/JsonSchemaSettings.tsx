@@ -176,7 +176,7 @@ export function JsonSchemaSettings({
               <div key={file.name} className="flex items-center gap-2 p-2">
                 <FileJson className="size-3.5 shrink-0 text-dim" />
                 <div className="min-w-0 flex-1">
-                  <div className="font-mono text-xs text-slate-50 truncate">
+                  <div className="font-mono text-xs text-strong truncate">
                     {file.name}
                     {/* Первый файл — основная схема, остальные разрешают её
                         `$ref`. Порядок здесь значащий, и молчать о нём нельзя. */}
@@ -211,7 +211,7 @@ export function JsonSchemaSettings({
                     )
                   }
                   disabled={busy}
-                  className="p-1 text-dim hover:text-slate-50 disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                  className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
                   title="Remove this file"
                 >
                   <X className="size-3.5" />
@@ -233,7 +233,7 @@ export function JsonSchemaSettings({
           onClick={handleLoadFiles}
           disabled={busy}
           variant="outline"
-          className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+          className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
         >
           <Upload className="size-4 mr-2" />
           {busy ? 'Working…' : 'Load Schema Files'}

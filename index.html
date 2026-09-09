@@ -4,8 +4,35 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>mikui</title>
+    <!--
+      Тема ставится здесь, а не в React, и именно до загрузки бандла.
+
+      Класс `dark` на `<html>` — единственный носитель темы (правило и хранение
+      описаны в `src/theme.ts`). Поставить его из компонента нельзя без вспышки:
+      первый кадр успевает нарисоваться темой из `:root`, то есть светлой, и
+      тёмная тема въезжает миганием. Скрипт синхронный и без `type="module"` —
+      значит, выполняется до разбора остального документа и до первой отрисовки.
+
+      Правило по умолчанию продублировано с `DEFAULT_THEME`: разделить их не на
+      чем — модуль тут ещё не загружен, — поэтому расхождение стоит одного
+      мигания при старте, и менять значение надо в двух местах.
+    -->
+    <script>
+      (function () {
+        var theme = 'dark';
+        try {
+          var saved = window.localStorage.getItem('mikui.theme');
+          if (saved === 'dark' || saved === 'light') theme = saved;
+        } catch (e) {
+          /* Хранилище недоступно — остаётся тема по умолчанию. */
+        }
+        var root = document.documentElement;
+        if (theme === 'dark') root.classList.add('dark');
+        root.style.colorScheme = theme;
+      })();
+    </script>
   </head>
-  <body class="dark">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

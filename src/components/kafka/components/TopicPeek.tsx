@@ -35,11 +35,16 @@ export interface PeekAnchor {
  *  строки. Тень со всех сторон рисовала на этом стыке резкую вертикальную
  *  полосу поперёк однотонной панели — ровно там, где ничего быть не должно.
  *  Смещение (8px вправо, 4px вниз) больше, чем размытие внутрь, поэтому левее и
- *  выше самого элемента тени не остаётся вовсе, а сам он непрозрачный. */
+ *  выше самого элемента тени не остаётся вовсе, а сам он непрозрачный.
+ *
+ *  Сама тень — токен `shadow-peek`: геометрия у обеих тем общая, а плотность
+ *  своя (`--peek-shadow` в `globals.css`). Полупрозрачный чёрный, рассчитанный
+ *  на тёмную панель, на светлой читается грязным пятном, а не приподнятым
+ *  слоем. */
 export function TopicPeek({ anchor }: { anchor: PeekAnchor }) {
   return createPortal(
     <div
-      className="fixed z-50 pointer-events-none flex items-center overflow-hidden text-ellipsis whitespace-nowrap rounded-r-md bg-surface pr-2 font-mono font-[450] text-[14px] leading-[20px] text-slate-50 shadow-[8px_4px_16px_-4px_rgba(0,0,0,0.55)]"
+      className="fixed z-50 pointer-events-none flex items-center overflow-hidden text-ellipsis whitespace-nowrap rounded-r-md bg-surface pr-2 font-mono font-[450] text-[14px] leading-[20px] text-strong shadow-peek"
       style={{
         left: anchor.left,
         top: anchor.top,

@@ -55,7 +55,7 @@ export const TopicRow = memo(function TopicRow({
           )}
           <div
             className={`basis-0 font-mono font-[450] grow leading-[0] min-h-px min-w-px relative shrink-0 text-[14px] text-left ${
-              isSelected ? 'text-slate-50' : 'text-soft hover:text-slate-50'
+              isSelected ? 'text-strong' : 'text-soft hover:text-strong'
             }`}
           >
             {/* `data-topic-name` — по нему список находит элемент, чтобы

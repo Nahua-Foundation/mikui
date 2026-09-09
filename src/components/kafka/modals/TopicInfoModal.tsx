@@ -41,7 +41,7 @@ function Stat({
   return (
     <div className="flex flex-col gap-1 rounded border border-edge px-3 py-2" title={hint}>
       <span className="font-mono text-[11px] text-dim">{label}</span>
-      <span className={`font-mono text-sm ${alarming ? 'text-danger' : 'text-slate-50'}`}>
+      <span className={`font-mono text-sm ${alarming ? 'text-danger' : 'text-strong'}`}>
         {value}
       </span>
     </div>
@@ -190,7 +190,7 @@ export function TopicInfoModal({ topic, open, onOpenChange }: TopicInfoModalProp
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContentNoClose
-        className="max-w-2xl bg-surface border-edge text-slate-50"
+        className="max-w-2xl bg-surface border-edge text-strong"
         aria-describedby={undefined}
       >
         <DialogHeader className="border-b border-edge pb-4 min-w-0">
@@ -262,7 +262,7 @@ export function TopicInfoModal({ topic, open, onOpenChange }: TopicInfoModalProp
                   <button
                     type="button"
                     onClick={() => setShowPartitions((v) => !v)}
-                    className="flex items-center gap-1 font-mono text-xs text-dim hover:text-slate-50 bg-transparent border-none p-0 cursor-pointer transition-colors"
+                    className="flex items-center gap-1 font-mono text-xs text-dim hover:text-strong bg-transparent border-none p-0 cursor-pointer transition-colors"
                   >
                     {showPartitions ? (
                       <ChevronDown className="size-3.5" />
@@ -314,10 +314,10 @@ export function TopicInfoModal({ topic, open, onOpenChange }: TopicInfoModalProp
                             <span className={lagging ? 'text-danger' : 'text-soft'}>
                               {partition.in_sync}/{partition.replicas}
                             </span>
-                            <span className="text-slate-50 truncate" title={offsetsLabel(partition)}>
+                            <span className="text-strong truncate" title={offsetsLabel(partition)}>
                               {offsetsLabel(partition)}
                             </span>
-                            <span className="text-slate-50 text-right">
+                            <span className="text-strong text-right">
                               {messageCount(partition)}
                             </span>
                           </div>
@@ -345,7 +345,7 @@ export function TopicInfoModal({ topic, open, onOpenChange }: TopicInfoModalProp
                       value={needle}
                       onChange={(e) => setNeedle(e.target.value)}
                       placeholder="Filter settings..."
-                      className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim pl-8"
+                      className="bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8"
                     />
                   </div>
 
@@ -361,7 +361,7 @@ export function TopicInfoModal({ topic, open, onOpenChange }: TopicInfoModalProp
                             этой разницы не видно, что топику задали руками. */}
                         <span
                           className={`font-mono text-xs break-all ${
-                            entry.is_default ? 'text-dim' : 'text-slate-50'
+                            entry.is_default ? 'text-dim' : 'text-strong'
                           }`}
                         >
                           {entry.value === null || entry.value === '' ? NO_VALUE : entry.value}
@@ -387,7 +387,7 @@ export function TopicInfoModal({ topic, open, onOpenChange }: TopicInfoModalProp
             <Button
               onClick={() => onOpenChange(false)}
               variant="outline"
-              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
             >
               Close
             </Button>

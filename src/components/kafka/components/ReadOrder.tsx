@@ -186,11 +186,11 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
   };
 
   const inputClass =
-    'bg-surface border-edge text-slate-50 font-mono text-sm placeholder:text-dim h-9';
+    'bg-surface border-edge text-strong font-mono text-sm placeholder:text-dim h-9';
 
   return (
     <DropdownMenu open={open} onOpenChange={handleOpenChange}>
-      <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-center border-none outline-none cursor-pointer">
+      <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-strong bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-center border-none outline-none cursor-pointer">
         {mode === 'newest' && <ArrowDown className="size-3.5" />}
         {mode === 'oldest' && <ArrowUp className="size-3.5" />}
         {mode === 'offset' && <Hash className="size-3.5" />}
@@ -202,7 +202,7 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
       <DropdownMenuContent className="bg-surface border-edge w-56" align="end">
         <DropdownMenuItem
           className={`font-mono cursor-pointer ${
-            mode === 'newest' ? 'bg-edge text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
+            mode === 'newest' ? 'bg-edge text-strong' : 'text-soft hover:bg-edge hover:text-strong'
           }`}
           onClick={() => pick('newest')}
         >
@@ -211,7 +211,7 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
         </DropdownMenuItem>
         <DropdownMenuItem
           className={`font-mono cursor-pointer ${
-            mode === 'oldest' ? 'bg-edge text-slate-50' : 'text-soft hover:bg-edge hover:text-slate-50'
+            mode === 'oldest' ? 'bg-edge text-strong' : 'text-soft hover:bg-edge hover:text-strong'
           }`}
           onClick={() => pick('oldest')}
         >
@@ -224,7 +224,7 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
         <DropdownMenuSub>
           <DropdownMenuSubTrigger
             className={`font-mono flex items-center gap-2 ${
-              mode === 'timestamp' ? 'bg-edge text-slate-50' : 'text-soft'
+              mode === 'timestamp' ? 'bg-edge text-strong' : 'text-soft'
             }`}
           >
             <Clock className="size-4" />
@@ -282,7 +282,7 @@ export function ReadOrder({ mode, range, singlePartition, onChange }: ReadOrderP
           <DropdownMenuSubTrigger
             disabled={!singlePartition}
             className={`font-mono flex items-center gap-2 ${
-              mode === 'offset' ? 'bg-edge text-slate-50' : 'text-soft'
+              mode === 'offset' ? 'bg-edge text-strong' : 'text-soft'
             } data-[disabled]:text-dim`}
           >
             <Hash className="size-4" />

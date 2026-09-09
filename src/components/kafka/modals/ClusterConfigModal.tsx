@@ -56,7 +56,7 @@ function FileField({
         <Button
           type="button"
           variant="outline"
-          className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+          className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
           onClick={async () => {
             const selected = await openDialog({
               title,
@@ -74,12 +74,12 @@ function FileField({
         {value && (
           <>
             <div className="text-xs text-soft truncate max-w-[260px]" title={value}>
-              Selected: <span className="text-slate-50">{fileName(value)}</span>
+              Selected: <span className="text-strong">{fileName(value)}</span>
             </div>
             <button
               type="button"
               onClick={() => onChange('')}
-              className="font-mono text-xs text-dim hover:text-slate-50 bg-transparent border-none cursor-pointer"
+              className="font-mono text-xs text-dim hover:text-strong bg-transparent border-none cursor-pointer"
             >
               clear
             </button>
@@ -465,7 +465,7 @@ export function ClusterConfigModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-2xl max-h-[90vh] bg-surface border-edge text-slate-50 flex flex-col">
+      <DialogContentNoClose className="max-w-2xl max-h-[90vh] bg-surface border-edge text-strong flex flex-col">
         <DialogHeader className="border-b border-edge pb-4 flex-shrink-0">
           <div className="flex items-center gap-3">
             {onBack && (
@@ -500,7 +500,7 @@ export function ClusterConfigModal({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="My Kafka Cluster"
-                className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
               />
             </div>
 
@@ -513,7 +513,7 @@ export function ClusterConfigModal({
                 value={brokers}
                 onChange={(e) => setBrokers(e.target.value)}
                 placeholder="localhost:9092"
-                className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
               />
             </div>
 
@@ -523,14 +523,14 @@ export function ClusterConfigModal({
                 Security Protocol
               </Label>
               <Select value={securityProtocol} onValueChange={setSecurityProtocol}>
-                <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+                <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="bg-surface border-edge">
-                  <SelectItem value="PLAINTEXT" className="text-slate-50 font-mono focus:bg-edge">PLAINTEXT</SelectItem>
-                  <SelectItem value="SSL" className="text-slate-50 font-mono focus:bg-edge">SSL</SelectItem>
-                  <SelectItem value="SASL_PLAINTEXT" className="text-slate-50 font-mono focus:bg-edge">SASL_PLAINTEXT</SelectItem>
-                  <SelectItem value="SASL_SSL" className="text-slate-50 font-mono focus:bg-edge">SASL_SSL</SelectItem>
+                  <SelectItem value="PLAINTEXT" className="text-strong font-mono focus:bg-edge">PLAINTEXT</SelectItem>
+                  <SelectItem value="SSL" className="text-strong font-mono focus:bg-edge">SSL</SelectItem>
+                  <SelectItem value="SASL_PLAINTEXT" className="text-strong font-mono focus:bg-edge">SASL_PLAINTEXT</SelectItem>
+                  <SelectItem value="SASL_SSL" className="text-strong font-mono focus:bg-edge">SASL_SSL</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -545,7 +545,7 @@ export function ClusterConfigModal({
                     SASL Mechanism
                   </Label>
                   <Select value={saslMechanism} onValueChange={setSaslMechanism}>
-                    <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+                    <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent className="bg-surface border-edge">
@@ -553,7 +553,7 @@ export function ClusterConfigModal({
                         <SelectItem
                           key={mech}
                           value={mech}
-                          className="text-slate-50 font-mono focus:bg-edge"
+                          className="text-strong font-mono focus:bg-edge"
                         >
                           {mech}
                           {!SASL_MECHANISMS.includes(mech) && ' · not supported'}
@@ -572,7 +572,7 @@ export function ClusterConfigModal({
                   <div className="space-y-2">
                     <Label className="font-mono text-sm text-soft">Users</Label>
                     <div className="flex items-center justify-between gap-3">
-                      <div className="font-mono text-sm text-slate-50 truncate">
+                      <div className="font-mono text-sm text-strong truncate">
                         {cluster.users.length > 0 ? (
                           cluster.users.map((u) => u.username).join(', ')
                         ) : (
@@ -584,7 +584,7 @@ export function ClusterConfigModal({
                         variant="outline"
                         size="sm"
                         onClick={() => onManageUsers?.(cluster)}
-                        className="shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+                        className="shrink-0 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
                       >
                         <Users className="size-4 mr-2" />
                         Manage users
@@ -601,7 +601,7 @@ export function ClusterConfigModal({
                       <div className="space-y-2">
                         <Label className="font-mono text-sm text-soft">User</Label>
                         <Select value={userId ?? ''} onValueChange={selectUser}>
-                          <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+                          <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent className="bg-surface border-edge">
@@ -609,7 +609,7 @@ export function ClusterConfigModal({
                               <SelectItem
                                 key={user.id}
                                 value={user.id}
-                                className="text-slate-50 font-mono focus:bg-edge"
+                                className="text-strong font-mono focus:bg-edge"
                               >
                                 {user.username}
                                 {!user.has_password && ' · no password'}
@@ -626,7 +626,7 @@ export function ClusterConfigModal({
                           value={username}
                           onChange={(e) => setUsername(e.target.value)}
                           placeholder="Enter username"
-                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
                       <div className="space-y-2">
@@ -640,7 +640,7 @@ export function ClusterConfigModal({
                               ? 'Saved in keychain — leave blank to keep'
                               : 'Enter password'
                           }
-                          className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
                     </div>
@@ -713,7 +713,7 @@ export function ClusterConfigModal({
                             ? 'Saved in keychain — leave blank to keep'
                             : 'Only if the key is encrypted'
                         }
-                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                       />
                     </div>
                   </>
@@ -781,7 +781,7 @@ export function ClusterConfigModal({
                   value={registryUrl}
                   onChange={(e) => setRegistryUrl(e.target.value)}
                   placeholder="http://localhost:8081"
-                  className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                  className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                 />
                 <p className="font-mono text-xs text-dim">
                   Leave empty if there is none — Avro topics can also be read from local .avsc
@@ -798,7 +798,7 @@ export function ClusterConfigModal({
                         value={registryUser}
                         onChange={(e) => setRegistryUser(e.target.value)}
                         placeholder="Optional"
-                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                       />
                     </div>
                     <div className="space-y-1">
@@ -808,7 +808,7 @@ export function ClusterConfigModal({
                         value={registryPassword}
                         onChange={(e) => setRegistryPassword(e.target.value)}
                         placeholder={registryHasPassword ? 'Saved — leave empty to keep' : 'Optional'}
-                        className="bg-surface border-edge text-slate-50 font-mono placeholder:text-dim"
+                        className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                       />
                     </div>
                   </div>
@@ -829,7 +829,7 @@ export function ClusterConfigModal({
                     onClick={handleTestRegistry}
                     variant="outline"
                     disabled={isTestingRegistry}
-                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50"
+                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50"
                   >
                     {isTestingRegistry && <Loader2 className="size-4 animate-spin" />}
                     {isTestingRegistry ? 'Testing…' : 'Test registry'}
@@ -851,7 +851,7 @@ export function ClusterConfigModal({
               onClick={handleBack}
               variant="outline"
               disabled={isSaving}
-              className="bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+              className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
             >
               Cancel
             </Button>
@@ -860,7 +860,7 @@ export function ClusterConfigModal({
             onClick={handleTestConnection}
             variant="outline"
             disabled={isTesting || isConnecting || isSaving}
-            className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {isTesting && <Loader2 className="size-4 animate-spin" />}
             {isTesting ? 'Testing…' : 'Test'}
@@ -872,7 +872,7 @@ export function ClusterConfigModal({
               onClick={handleSave}
               variant="outline"
               disabled={isConnecting || isSaving}
-              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Save
             </Button>

@@ -59,7 +59,7 @@ export function LensSelect({ lens, onChange }: LensSelectProps) {
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-slate-50 bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
+      <DropdownMenuTrigger className="font-mono text-xs text-soft hover:text-strong bg-transparent hover:bg-transparent p-0 h-auto gap-1.5 flex items-start border-none outline-none cursor-pointer">
         {/* Два уровня, как у соседних селекторов: подпись сверху, значение под
             ней. */}
         <div className="flex flex-col items-start leading-tight">
@@ -75,8 +75,8 @@ export function LensSelect({ lens, onChange }: LensSelectProps) {
             title={hint}
             className={`font-mono cursor-pointer ${
               value === lens
-                ? 'bg-edge text-slate-50'
-                : 'text-soft hover:bg-edge hover:text-slate-50'
+                ? 'bg-edge text-strong'
+                : 'text-soft hover:bg-edge hover:text-strong'
             }`}
             onClick={() => onChange(value)}
           >

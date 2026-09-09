@@ -174,7 +174,7 @@ export function AvroSchema({ cluster, topic, avro, busy, onApply }: AvroSchemaPr
               <div key={file.name} className="flex items-center gap-2 p-2">
                 <FileJson className="size-3.5 shrink-0 text-dim" />
                 <div className="min-w-0 flex-1">
-                  <div className="font-mono text-xs text-slate-50 truncate">{file.name}</div>
+                  <div className="font-mono text-xs text-strong truncate">{file.name}</div>
                   <div className="font-mono text-[11px] text-dim truncate" title={file.source}>
                     {file.source}
                   </div>
@@ -192,7 +192,7 @@ export function AvroSchema({ cluster, topic, avro, busy, onApply }: AvroSchemaPr
                   type="button"
                   onClick={() => onApply(() => api.removeAvroFile(cluster, topic, file.name), `Removed ${file.name}`)}
                   disabled={busy}
-                  className="p-1 text-dim hover:text-slate-50 disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                  className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
                   title="Remove this file"
                 >
                   <X className="size-3.5" />
@@ -214,7 +214,7 @@ export function AvroSchema({ cluster, topic, avro, busy, onApply }: AvroSchemaPr
           onClick={handleLoadFiles}
           disabled={busy}
           variant="outline"
-          className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-slate-50 font-mono"
+          className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
         >
           <Upload className="size-4 mr-2" />
           {busy ? 'Working…' : 'Load .avsc Files'}
@@ -238,14 +238,14 @@ export function AvroSchema({ cluster, topic, avro, busy, onApply }: AvroSchemaPr
             }
             disabled={busy || records.length === 0}
           >
-            <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+            <SelectTrigger className="bg-surface border-edge text-strong font-mono">
               <SelectValue
                 placeholder={records.length === 0 ? 'Load an .avsc file first' : 'Choose a record'}
               />
             </SelectTrigger>
             <SelectContent className="bg-surface border-edge">
               {records.map((name) => (
-                <SelectItem key={name} value={name} className="text-slate-50 font-mono focus:bg-edge">
+                <SelectItem key={name} value={name} className="text-strong font-mono focus:bg-edge">
                   {name}
                 </SelectItem>
               ))}
@@ -323,7 +323,7 @@ export function SubjectPicker({
           role="combobox"
           disabled={disabled}
           title={disabled && !subject ? 'Remove the loaded .avsc files to bind a subject' : undefined}
-          className="w-full justify-between bg-surface border-edge text-slate-50 font-mono disabled:opacity-50"
+          className="w-full justify-between bg-surface border-edge text-strong font-mono disabled:opacity-50"
         >
           <span className={`truncate ${subject ? '' : 'text-dim'}`}>
             {subject ?? placeholder ?? 'Choose a subject'}
@@ -333,7 +333,7 @@ export function SubjectPicker({
       </PopoverTrigger>
       <PopoverContent className="w-(--radix-popover-trigger-width) p-0 bg-surface border-edge">
         <Command className="bg-surface">
-          <CommandInput placeholder="Search subjects…" className="font-mono text-slate-50" />
+          <CommandInput placeholder="Search subjects…" className="font-mono text-strong" />
           <CommandList>
             <CommandEmpty className="p-3 font-mono text-xs text-dim">
               {loading ? 'Asking the registry…' : (error ?? 'Nothing found')}
@@ -346,7 +346,7 @@ export function SubjectPicker({
                   setOpen(false);
                   if (name !== subject) onChange(name);
                 }}
-                className="font-mono text-xs text-slate-50 data-[selected=true]:bg-edge"
+                className="font-mono text-xs text-strong data-[selected=true]:bg-edge"
               >
                 <Check className={`size-3.5 ${name === subject ? 'opacity-100' : 'opacity-0'}`} />
                 <span className="truncate">{name}</span>
@@ -409,15 +409,15 @@ export function VersionSelect({
       onValueChange={(value) => onChange(value === LATEST ? null : Number(value))}
       disabled={disabled}
     >
-      <SelectTrigger className="bg-surface border-edge text-slate-50 font-mono">
+      <SelectTrigger className="bg-surface border-edge text-strong font-mono">
         <SelectValue />
       </SelectTrigger>
       <SelectContent className="bg-surface border-edge max-h-80">
-        <SelectItem value={LATEST} className="text-slate-50 font-mono focus:bg-edge">
+        <SelectItem value={LATEST} className="text-strong font-mono focus:bg-edge">
           latest
         </SelectItem>
         {versions.map((v) => (
-          <SelectItem key={v} value={String(v)} className="text-slate-50 font-mono focus:bg-edge">
+          <SelectItem key={v} value={String(v)} className="text-strong font-mono focus:bg-edge">
             version {v}
           </SelectItem>
         ))}
