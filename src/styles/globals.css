@@ -2,31 +2,135 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* mikui design tokens.
+   Имена намеренно не пересекаются с shadcn-токенами, с которыми они делят блок
+   `@theme inline` ниже (accent / muted / border / background / ... уже заняты
+   им).
+
+   Здесь остаётся только то, что от темы не зависит. Сами цвета живут ниже, в
+   `:root` и `.dark`, а имена им раздаёт `@theme inline`: значение утилиты вроде
+   `bg-surface` подставляется ссылкой на переменную, поэтому один и тот же класс
+   означает разный цвет по обе стороны переключателя. В обычном `@theme` цвет
+   попал бы в утилиту константой, и вторая тема ничего бы не изменила. */
+@theme {
+  /* "Fira Code VF" первым — тогда промежуточные веса вроде font-[450] (Retina,
+     тот самый вес из макета) берутся из вариативного файла, а не синтезируются. */
+  --font-mono: "Fira Code VF", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Проявление элемента, которого до этого в разметке не было — им
+     появляется кнопка информации в списке топиков. Именно анимация, а не
+     transition: переход нечему запускать, элемент монтируется уже видимым.
+     Длительность совпадает с REVEAL_SHIFT_MS в TopicsPanel — сдвиг имени и
+     проявление кнопки должны заканчиваться вместе. */
+  --animate-reveal: reveal 150ms ease-out;
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/**
+ * Светлая тема — редакция по умолчанию, `:root` без класса.
+ *
+ * Порядок именно такой, а не «светлая под `.light`»: класса на `<html>` может
+ * не оказаться вовсе — до того, как отработает загрузочный скрипт из
+ * `index.html`, или если из хранилища пришёл мусор. Тема, живущая в `:root`,
+ * в этот момент уже полная, а не пустая.
+ *
+ * Тёмная остаётся выбором по умолчанию для ПРИЛОЖЕНИЯ (см. `theme.ts`) — здесь
+ * речь только о том, какая из двух записана без класса-условия.
+ *
+ * Светлые значения — та же шкала slate, что и тёмные, отражённая: где в тёмной
+ * стоит slate-900, в светлой стоит белый, и так далее. Текстовые токены при
+ * этом не отражаются механически (slate-400 на белом даёт 2.4:1 и читаться
+ * перестаёт) — они взяты на два шага темнее, по контрасту к фону.
+ */
 :root {
+  /* --- mikui: поверхности -----------------------------------------------
+     «Приподнятого» в светлой теме не бывает: поверхность уже белая, выше
+     некуда, и подсветка строки под курсором может быть только темнее. Поэтому
+     `sunken` и `elevated` здесь оба темнее `surface`, а не по обе стороны от
+     него. Различает их роль, а не глубина: `sunken` — большие блоки с телом
+     сообщения, `elevated` — узкая подсветка строки, которая обязана быть
+     заметной. */
+  --sunken: #f1f5f9;   /* блоки с телом сообщения */
+  --surface: #ffffff;  /* основной фон приложения */
+  --elevated: #e2e8f0; /* hover по строке/карточке */
+  --edge: #cad5e2;     /* границы и активный фон пунктов меню */
+
+  /* --- mikui: текст ---
+     `dim` один и тот же в обеих темах: slate-500 держит 4.7:1 и к белому, и к
+     slate-900 — редкий цвет, которому отражение не нужно. */
+  --dim: #62748e;      /* плейсхолдеры, третичный текст */
+  --soft: #45556c;     /* вторичный текст, основной для интерфейса */
+  --strong: #0f172b;   /* заголовки, значения, поля ввода */
+
+  /* --- mikui: акцент ---
+     Светлый апельсин тёмной темы на белом даёт 1.6:1 — как акцент он там
+     перестаёт существовать, а на кнопках `bg-brand text-surface` ещё и уносит
+     с собой подпись. Взят тот же тон, опущенный до amber-700: 5.3:1 к белому,
+     столько же — белым по нему. Hover уходит вглубь, а не в свет: в тёмной
+     теме он гаснет, здесь он темнеет — в обоих случаях это шаг ОТ фона. */
+  --brand: #b45309;
+  --brand-hover: #92400e;
+
+  /* --- mikui: состояния ---
+     `ok` — «подключено» и «активная учётка», то есть точка размером 8 пикселей
+     без подписи. Тёмная тема носит здесь green-500, но на белом он даёт 2.2:1 и
+     точку приходится искать; светлой досталась green-700 — 5.0:1. */
+  --ok: oklch(0.527 0.154 150.069);
+  --ok-glow: rgba(0, 130, 54, 0.45);
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+
+  /* --- mikui: подсветка JSON в просмотре сообщения ---
+     Те же пять тонов на 700-м шаге: 400-е шаги тёмной темы на светлом блоке
+     превращаются в пастель поверх пастели. */
+  --syntax-brace: #7e22ce;
+  --syntax-bracket: #4338ca;
+  --syntax-string: #0f766e;
+  --syntax-boolean: #be123c;
+  --syntax-enum: #0e7490;
+
+  /* Тень выноса имени топика. Непрозрачность у светлой темы своя: 0.55 чёрного
+     на белом читается грязью, а не приподнятым слоем. Геометрия общая и
+     объяснена в `TopicPeek`. */
+  --peek-shadow: 8px 4px 16px -4px rgba(15, 23, 43, 0.2);
+
+  /* --- shadcn ---
+     Приведены к той же шкале slate, что и токены mikui выше: до появления
+     светлой темы эти значения не показывались никогда, и нейтральные серые из
+     поставки shadcn спорили бы с синеватыми поверхностями приложения на всех
+     границах, попапах и полях. */
   --font-size: 14px;
   --background: #ffffff;
-  --foreground: oklch(0.145 0 0);
+  --foreground: #0f172b;
   --card: #ffffff;
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: #030213;
-  --primary-foreground: oklch(1 0 0);
-  --secondary: oklch(0.95 0.0058 264.53);
-  --secondary-foreground: #030213;
-  --muted: #ececf0;
-  --muted-foreground: #717182;
-  --accent: #e9ebef;
-  --accent-foreground: #030213;
-  --destructive: #d4183d;
+  --card-foreground: #0f172b;
+  --popover: #ffffff;
+  --popover-foreground: #0f172b;
+  --primary: #0f172b;
+  --primary-foreground: #ffffff;
+  --secondary: #f1f5f9;
+  --secondary-foreground: #0f172b;
+  --muted: #f1f5f9;
+  --muted-foreground: #62748e;
+  --accent: #e2e8f0;
+  --accent-foreground: #0f172b;
+  --destructive: #dc2626;
   --destructive-foreground: #ffffff;
-  --border: rgba(0, 0, 0, 0.1);
-  --input: transparent;
-  --input-background: #f3f3f5;
-  --switch-background: #cbced4;
+  --border: #cad5e2;
+  --input: #cad5e2;
+  --input-background: #f8fafc;
+  --switch-background: #cad5e2;
   --font-weight-medium: 500;
   --font-weight-normal: 400;
-  --ring: oklch(0.708 0 0);
+  --ring: #90a1b9;
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
@@ -43,7 +147,40 @@
   --sidebar-ring: oklch(0.708 0 0);
 }
 
+/** Тёмная тема. Значения — те, с которыми приложение жило до появления
+ *  переключателя, и менять их появление светлой не должно. */
 .dark {
+  /* --- mikui: поверхности, от самой глубокой к приподнятой --- */
+  --sunken: #020618;   /* блоки с телом сообщения */
+  --surface: #0f172b;  /* основной фон приложения */
+  --elevated: #1e293b; /* hover по строке/карточке */
+  --edge: #314158;     /* границы и активный фон пунктов меню */
+
+  /* --- mikui: текст --- */
+  --dim: #62748e;      /* плейсхолдеры, третичный текст */
+  --soft: #90a1b9;     /* вторичный текст, основной для интерфейса */
+  --strong: #f8fafc;   /* заголовки, значения, поля ввода */
+
+  /* --- mikui: акцент --- */
+  --brand: #ffb86a;
+  --brand-hover: #e5a860;
+
+  /* --- mikui: состояния --- */
+  --ok: oklch(0.723 0.219 149.579);
+  --ok-glow: rgba(34, 197, 94, 0.6);
+  --danger: #ef4444;
+  --danger-hover: #f87171;
+
+  /* --- mikui: подсветка JSON в просмотре сообщения --- */
+  --syntax-brace: #c27aff;
+  --syntax-bracket: #615fff;
+  --syntax-string: #2dd4bf;
+  --syntax-boolean: #fb7185;
+  --syntax-enum: #22d3ee;
+
+  --peek-shadow: 8px 4px 16px -4px rgba(0, 0, 0, 0.55);
+
+  /* --- shadcn --- */
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.145 0 0);
@@ -62,6 +199,11 @@
   --destructive-foreground: oklch(0.637 0.237 25.331);
   --border: oklch(0.269 0 0);
   --input: oklch(0.269 0 0);
+  /* Эти два до появления светлой темы стояли только в `:root` и потому
+     действовали в обеих. Теперь у светлой свои, а прежние значения переехали
+     сюда — иначе тёмная тема поменялась бы заодно со вводом светлой. */
+  --input-background: #f3f3f5;
+  --switch-background: #cbced4;
   --ring: oklch(0.439 0 0);
   --font-weight-medium: 500;
   --font-weight-normal: 400;
@@ -81,6 +223,27 @@
 }
 
 @theme inline {
+  /* --- mikui --- */
+  --color-sunken: var(--sunken);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-edge: var(--edge);
+  --color-dim: var(--dim);
+  --color-soft: var(--soft);
+  --color-strong: var(--strong);
+  --color-brand: var(--brand);
+  --color-brand-hover: var(--brand-hover);
+  --color-ok: var(--ok);
+  --color-danger: var(--danger);
+  --color-danger-hover: var(--danger-hover);
+  --color-syntax-brace: var(--syntax-brace);
+  --color-syntax-bracket: var(--syntax-bracket);
+  --color-syntax-string: var(--syntax-string);
+  --color-syntax-boolean: var(--syntax-boolean);
+  --color-syntax-enum: var(--syntax-enum);
+  --shadow-peek: var(--peek-shadow);
+
+  /* --- shadcn --- */
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -188,6 +351,32 @@
 
 html {
   font-size: var(--font-size);
+}
+
+/**
+ * Оболочка приложения занимает окно целиком.
+ *
+ * Раньше это делал `h-screen` (`100vh`) на корневом div, и в полноэкранном
+ * режиме нижняя треть окна оставалась чёрной: WKWebView пересчитывал ширину,
+ * а высоту в `vh` отдавал прежнюю, от оконного размера. Единиц окна здесь
+ * больше нет вовсе — `position: fixed` c `inset: 0` не вычисляет длину,
+ * а растягивается по вьюпорту, который раскладывается заново на каждый resize.
+ *
+ * Размеры хвоста цепочки (`html`/`body`/`#root`) заданы здесь, а не
+ * присваиванием стилей в рендере компонента: побочный эффект в теле рендера
+ * выполнялся на каждую отрисовку и до первой не выполнялся вовсе.
+ */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+#root {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
 }
 
 /* Hide close button in specific dialogs */

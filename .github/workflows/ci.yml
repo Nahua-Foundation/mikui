@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Матричных фич здесь нет и быть не должно.
+        #
+        # Раньше Linux собирался с `--features gssapi` — с тех времён, когда в
+        # меню подключения стояли GSSAPI и OAUTHBEARER. Их убрали (см.
+        # `helpers::SASL_MECHANISMS`: PLAIN и два SCRAM, больше ничего), потому
+        # что Kerberos тянет Cyrus SASL, а он не собирается под Windows.
+        # Различие платформ ушло вместе с ними, а строка осталась — и не
+        # «включала Kerberos», а просто валила сборку: фичи `gssapi` пакет
+        # `mikui` не объявляет вовсе.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Только то, что нужно самому Tauri: webkit2gtk даёт webview, librsvg —
+      # иконки, patchelf правит rpath при бандлинге. Autoconf, automake,
+      # libtool, bison и flex стояли здесь ровно для одного — собрать из
+      # исходников Cyrus SASL под GSSAPI, — и ушли вместе с ним. OpenSSL
+      # собирается вендоренным (`ssl-vendored`), ему хватает perl и make,
+      # которые на раннере есть.
+      - name: Системные зависимости Tauri (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+
+      - run: npm ci
+
+      # tsc + vite. Обязательно до cargo: generate_context! вкомпилирует
+      # содержимое ../dist, и без него сборка бэкенда не пройдёт.
+      - run: npm run build
+
+      - name: cargo build
+        if: runner.os != 'Windows'
+        run: cargo build --manifest-path src-tauri/Cargo.toml --locked
+
+      # Windows собирается отдельным шагом, и обе особенности здесь
+      # вынужденные.
+      #
+      # `CMAKE_GENERATOR` задан ЯВНО, чтобы crate `cmake` не пытался вывести
+      # генератор сам. Его автовыбор идёт через `cc::windows_registry::
+      # find_vs_version`, а тот перечисляет установленные инстансы Visual
+      # Studio и сопоставляет их с зашитым списком: 14, 15, 16, 17. На раннере
+      # с более новой Visual Studio ни одна проба не совпадает, и сборка
+      # rdkafka-sys падает с «couldn't determine visual studio generator».
+      # Совет из самой ошибки — «запустите vcvars» — здесь не помогает: vcvars
+      # выставит `VisualStudioVersion` новой версии, и та же функция упрётся во
+      # второй тупик, «unsupported or unknown VisualStudio version». Заданный
+      # генератор эту ветку не выполняет вовсе, поэтому от версии VS сборка
+      # больше не зависит.
+      #
+      # vcvars при этом всё равно нужен, но по другой причине: генератору Ninja
+      # компилятор ищет сам CMake, и cl.exe он берёт из PATH. Путь к vcvars
+      # добывается через vswhere, а не зашит: у vswhere фиксированное место
+      # (это гарантия Microsoft), и он одинаково находит и 2019, и 2026, и
+      # любую редакцию — Community, Enterprise, BuildTools.
+      #
+      # Всё одним шагом, потому что vcvars правит окружение процесса, а каждый
+      # `run` в Actions — свой процесс.
+      - name: cargo build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          if not defined VSDIR (echo vswhere не нашёл установку с тулчейном VC++ & exit /b 1)
+          echo Visual Studio: %VSDIR%
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cargo build --manifest-path src-tauri/Cargo.toml --locked
