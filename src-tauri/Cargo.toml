@@ -136,6 +136,14 @@ rdkafka = { version = "0.36", default-features = false, features = ["libz", "zst
 # Под Windows librdkafka собирается только через CMake: дефолтный build.rs
 # запускает ./configure (POSIX-скрипт), под MSVC это не работает.
 # Требует установленный cmake на машине сборки.
+#
+# И ещё одно требование, которое проще нарушить, чем заметить: генератор CMake
+# надо задать явно (`CMAKE_GENERATOR`). Сам crate `cmake` выводит его через
+# `cc::windows_registry::find_vs_version`, а тот сверяет установленные инстансы
+# Visual Studio с зашитым списком версий (14, 15, 16, 17) — на машине с более
+# новой VS не совпадает ни одна, и сборка падает с «couldn't determine visual
+# studio generator». Как это сделано в CI и почему vcvars сам по себе от этого
+# не спасает — в `.github/workflows/ci.yml`.
 [target.'cfg(windows)'.dependencies]
 rdkafka = { version = "0.36", default-features = false, features = ["libz", "zstd", "ssl-vendored", "cmake-build"] }
 
