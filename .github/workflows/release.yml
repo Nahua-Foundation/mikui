@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Релиз создаётся ДО матрицы сборок, а не внутри неё: без этого четыре
+  # параллельных job'а наперегонки создают один и тот же релиз, и часть
+  # падает на «already exists». Собирающим job'ам отдаётся готовый
+  # release_id — они только заливают в него файлы.
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - name: Create GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # Повторный запуск после упавшей сборки: релиз уже существует,
+          # создавать второй нельзя — только прочитать его id.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "mikui $tag" --verify-tag --generate-notes
+          fi
+          id=$(gh release view "$tag" --json id --jq '.id')
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and Upload (${{ matrix.label }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-13 — последний Intel-раннер GitHub — выведен из эксплуатации,
+        # поэтому обе macOS-сборки идут с arm-раннера macos-latest: x86_64
+        # получается кросс-компиляцией, для тулчейна Apple это штатный путь.
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: macos-latest
+            label: macos-arm64
+            rust_targets: "aarch64-apple-darwin"
+            tauri_args: "--target aarch64-apple-darwin -b dmg"
+          - os: macos-latest
+            label: macos-x86_64
+            rust_targets: "x86_64-apple-darwin"
+            tauri_args: "--target x86_64-apple-darwin -b dmg"
+          - os: windows-latest
+            label: windows-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Версия приложения берётся из тега, а не из коммита: тег — единственный
+      # источник правды о релизе, и рассинхрона «забыл поправить версию в
+      # конфиге» не бывает. Правки живут только внутри запуска и никуда не
+      # коммитятся. Cargo.lock при этом обновится сам при первой же
+      # cargo-команде — `--locked` в этом workflow не используется.
+      - name: Update versions from tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          export VERSION
+          echo "Release tag: '${TAG}'"
+          echo "Computed version: '${VERSION}'"
+          if [ -z "${VERSION}" ]; then
+            echo "VERSION is empty; aborting" >&2
+            exit 1
+          fi
+          if ! echo "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "Tag '${TAG}' does not contain a semver prefix like X.Y.Z" >&2
+            exit 1
+          fi
+
+          node <<'NODE'
+          const fs = require('fs');
+          const version = process.env.VERSION;
+          const tauriPath = 'src-tauri/tauri.conf.json';
+          let tj = JSON.parse(fs.readFileSync(tauriPath, 'utf8'));
+          tj.version = version;
+          fs.writeFileSync(tauriPath, JSON.stringify(tj, null, 2) + '\n');
+          console.log(`Updated ${tauriPath} to version ${version}`);
+
+          const cargoPath = 'src-tauri/Cargo.toml';
+          let toml = fs.readFileSync(cargoPath, 'utf8');
+          const pkgStart = toml.indexOf('[package]');
+          if (pkgStart === -1) {
+            throw new Error('No [package] section found in Cargo.toml');
+          }
+          const rest = toml.slice(pkgStart + '[package]'.length);
+          const nextSectionRel = rest.indexOf('\n[');
+          const sectionEnd = nextSectionRel === -1 ? toml.length : (pkgStart + '[package]'.length + nextSectionRel);
+          const before = toml.slice(0, pkgStart);
+          let section = toml.slice(pkgStart, sectionEnd);
+
+          if (/^([\s\S]*?)(\nversion\s*=\s*"[^"]+")/m.test(section)) {
+            section = section.replace(/(\n)version\s*=\s*"[^"]+"/, `$1version = "${version}"`);
+          } else {
+            section = section.replace(/\[package\][^\n]*\n/, (m) => m + `version = "${version}"\n`);
+          }
+          const after = toml.slice(sectionEnd);
+          fs.writeFileSync(cargoPath, before + section + after);
+          console.log(`Updated ${cargoPath} to version ${version}`);
+          NODE
+
+          echo "--- Diff after version bump ---"
+          git diff -- src-tauri/tauri.conf.json src-tauri/Cargo.toml || true
+
+      # Набор шире CI: там собирается только бинарник (webkit, rsvg,
+      # patchelf), а здесь ещё deb/rpm/AppImage — им нужны gtk и appindicator.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Rust
+        if: runner.os != 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust (macOS)
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Linux и macOS идут через tauri-action: он собирает бандлы и сам
+      # заливает их в релиз по release_id. Фронтенд соберётся
+      # beforeBuildCommand'ом из tauri.conf.json, отдельный шаг не нужен.
+      - name: Build and upload with Tauri
+        if: runner.os != 'Windows'
+        uses: tauri-apps/tauri-action@v0
+        timeout-minutes: 60
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_TERM_COLOR: always
+          RUST_BACKTRACE: 1
+          CARGO_INCREMENTAL: 0
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: "${{ matrix.tauri_args }}"
+
+      # Windows собирается руками, а не через tauri-action, и это вынужденно:
+      # rdkafka под Windows собирается через CMake (`cmake-build`), генератор
+      # задан явно Ninja, и cl.exe должен быть на PATH — то есть нужен
+      # vcvars64. tauri-action — это `uses:`-шаг, его в shell-обёртку не
+      # завернёшь, поэтому build идёт своим шагом, а файлы в релиз заливает
+      # softprops. Почему CMAKE_GENERATOR задан явно и почему vcvars ищется
+      # через vswhere — см. ci.yml, там тот же приём и его разбор.
+      - name: Build with Tauri (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        timeout-minutes: 60
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          if not defined VSDIR (echo vswhere не нашёл установку с тулчейном VC++ & exit /b 1)
+          echo Visual Studio: %VSDIR%
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          npm run tauri -- build -b nsis || exit /b 1
+
+      # NSIS-инсталлятор, а не портативный exe как в rkui: он не только
+      # «установочный файл», но и регистрирует схему mikui:// в реестре —
+      # deep-link на Windows работает только у установленного приложения.
+      - name: Upload Windows installer to Release
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/nsis/*.exe
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
