@@ -141,6 +141,22 @@ jobs:
         with:
           targets: ${{ matrix.rust_targets }}
 
+      # Кросс-сборка x86_64 на arm-раннере ломается на librdkafka, и вот
+      # почему. librdkafka собирается не cargo, а своим ./configure (mklove):
+      # он пробными компиляциями ищет ssl/zlib/zstd, а арх-флаги берёт только
+      # из CFLAGS/LDFLAGS (см. build.rs rdkafka-sys). Без них и пробы, и сам
+      # librdkafka компилируются под хостовый arm64, тогда как вендоренный
+      # zstd-sys уже собран под x86_64 — линковщик отбрасывает чужую арку, и
+      # проба падает с «Undefined symbols for architecture arm64». Флаг ниже
+      # выравнивает всё нативное в этом job'е под x86_64. openssl-src и
+      # zstd-sys арку выводят сами из cargo-таргета, продублированный флаг им
+      # не мешает.
+      - name: Set cross-compile flags (macOS x86_64)
+        if: runner.os == 'macOS' && matrix.rust_targets == 'x86_64-apple-darwin'
+        run: |
+          echo "CFLAGS=-arch x86_64 ${CFLAGS}" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-arch x86_64 ${LDFLAGS}" >> "$GITHUB_ENV"
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
