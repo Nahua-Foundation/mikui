@@ -8,6 +8,20 @@ Built with [Tauri 2](https://v2.tauri.app): a Rust backend that talks to Kafka
 and owns the data, and a React frontend that only ever sees the visible
 viewport.
 
+![A protobuf topic open in mikui, with one message expanded on its decoded payload](demo/screenshots/watermarked/proto_preview.png)
+
+*Protobuf bodies decoded against the topic's `.proto`, with one message opened
+on its payload tab.*
+
+Every screenshot on this page was taken against the throwaway local cluster in
+[`demo/`](demo/README.md): the topics, the names and the payments in them are
+generated, and none of it comes from a real cluster.
+
+|     |     |
+| --- | --- |
+| [![An Avro topic read from all six partitions, merged newest first](demo/screenshots/watermarked/avro_preview.png)](demo/screenshots/watermarked/avro_preview.png)<br>**Avro from the registry.** Six partitions merged into one log by timestamp, and the schema fetched by the id in the message itself. | [![A Debezium envelope shown as a before/after diff](demo/screenshots/watermarked/json_debezium_preview.png)](demo/screenshots/watermarked/json_debezium_preview.png)<br>**The Debezium lens.** The `change` tab diffs `before` against `after`, names the operation and counts the fields that moved. |
+| [![A JSON Schema topic filtered down to a single key](demo/screenshots/watermarked/jsonschema_preview.png)](demo/screenshots/watermarked/jsonschema_preview.png)<br>**JSON Schema, and a search that runs in Rust.** One message left of the whole topic after filtering — which happens on the Kafka worker thread, before anything crosses into the UI. | [![The producer editor refusing a body that does not match the schema](demo/screenshots/watermarked/produce_jsonschema_preview.png)](demo/screenshots/watermarked/produce_jsonschema_preview.png)<br>**Producing against a contract.** The editor says in human terms why the body does not fit the schema — before the message is written, not after. |
+
 ## Features
 
 ### Clusters
@@ -113,6 +127,18 @@ Useful extras:
 npm run build                                  # frontend only (tsc + vite)
 cargo test --manifest-path src-tauri/Cargo.toml  # backend unit tests
 npm run icons                                  # regenerate app icons (python3)
+```
+
+### Demo cluster
+
+A one-command local cluster — a broker, a Schema Registry and topics with
+generated protobuf, Avro, JSON Schema and Debezium data — lives in
+[`demo/`](demo/README.md). It is what the screenshots above were taken against,
+and it needs nothing but Docker and `python3`:
+
+```sh
+./demo/mikui-demo.sh up    # brokers on localhost:19092, registry on :18081
+./demo/mikui-demo.sh down
 ```
 
 ### Where things live
