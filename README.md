@@ -150,6 +150,75 @@ cluster definitions, `favorites.json` plus a bodies directory for saved
 messages. Passwords and key passphrases never touch those files — they go to
 the OS keychain.
 
+## Installing a release build
+
+Prebuilt installers are attached to every [GitHub release](../../releases).
+None of them are code-signed — that needs a paid Apple Developer account for
+macOS and a code-signing certificate for Windows, which this project doesn't
+have — so the OS will warn on first run. See below for how to get past that.
+
+| File | Platform | Notes |
+| --- | --- | --- |
+| `mikui_<version>_x64-setup.exe` | Windows x64 | NSIS installer |
+| `mikui_<version>_aarch64.dmg` | macOS, Apple Silicon (M1 and later) | won't run on an Intel Mac |
+| `mikui_<version>_x64.dmg` | macOS, Intel | also runs on Apple Silicon via Rosetta 2, just slower than the native build |
+| `mikui_<version>_amd64.deb` | Linux, Debian/Ubuntu-based (x86_64) | |
+| `mikui-<version>-1.x86_64.rpm` | Linux, Fedora/RHEL/openSUSE-based (x86_64) | |
+| `mikui_<version>_amd64.AppImage` | Linux, any x86_64 distro | no installation needed, but needs FUSE |
+
+### macOS
+
+The app isn't notarized, so Gatekeeper marks the downloaded `.dmg`/`.app` as
+quarantined and refuses to open it ("app is damaged and can't be opened" or
+similar). Two ways around it:
+
+- Right-click (or Control-click) the app in `Applications` → **Open** →
+  confirm in the dialog that appears. One-time step per app.
+- Or clear the quarantine flag from the terminal:
+  ```sh
+  xattr -cr /Applications/mikui.app
+  ```
+
+Pick the `.dmg` that matches your Mac's chip (Apple menu → *About This Mac*):
+the `aarch64` build won't run at all on an Intel Mac, while the `x64` build
+runs on Apple Silicon too, through Rosetta 2.
+
+### Windows
+
+The installer isn't signed with a code-signing certificate, so **Windows
+SmartScreen** will show "Windows protected your PC" on first run — click
+**More info** → **Run anyway** to proceed. A fresh, unsigned executable with
+no download history may also get flagged by some antivirus products as a
+reputation-based false positive rather than an actual detection. Installing
+may prompt for administrator elevation (UAC), since it registers the
+`mikui://` link handler in the registry.
+
+### Linux
+
+- **`.deb` / `.rpm`** — install through your package manager rather than raw
+  `dpkg -i` / `rpm -i`, so missing shared-library dependencies (mainly
+  `webkit2gtk`) get resolved automatically:
+  ```sh
+  sudo apt install ./mikui_<version>_amd64.deb      # Debian/Ubuntu
+  sudo dnf install ./mikui-<version>-1.x86_64.rpm   # Fedora
+  ```
+  These packages need a fairly recent `webkit2gtk` (the `4.1` series, i.e.
+  Ubuntu 22.04+/Debian 12+ or equivalent); older distros only ship
+  `webkit2gtk-4.0` and won't satisfy the dependency.
+- **`.AppImage`** — make it executable, then run it directly:
+  ```sh
+  chmod +x mikui_<version>_amd64.AppImage
+  ./mikui_<version>_amd64.AppImage
+  ```
+  Recent distros (Ubuntu 22.04+ and others) don't ship `libfuse2` by default,
+  which AppImage needs to mount itself. If you get a FUSE error, either
+  install it (`sudo apt install libfuse2`) or run with
+  `--appimage-extract-and-run`.
+
+None of the release artifacts are checksummed either, so there's currently no
+way to verify a download wasn't tampered with in transit beyond GitHub's own
+TLS/hosting guarantees.
+
 ## Architecture
 
 Rust owns the data, JS owns the viewport. Messages live in the backend in a
