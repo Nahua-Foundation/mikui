@@ -25,16 +25,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          set -x
           tag="${GITHUB_REF_NAME}"
           # Повторный запуск после упавшей сборки: релиз уже существует,
           # создавать второй нельзя — только прочитать его id.
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --title "mikui $tag" --verify-tag --generate-notes
           fi
-          id=$(gh release view "$tag" --json id --jq '.id')
+          # `gh release view --json id` отдаёт GraphQL node id (строка вида
+          # "RE_..."), а tauri-action дёргает REST-эндпоинт, которому нужен
+          # числовой id релиза — берём его напрямую через `gh api`.
+          id=$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.id')
           echo "id=$id" >> "$GITHUB_OUTPUT"
-          echo "::notice::computed release id = [$id]"
 
   build:
     name: Build and Upload (${{ matrix.label }})
@@ -172,9 +173,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Debug release_id input
-        run: echo "::notice::needs.create-release.outputs.release_id = [${{ needs.create-release.outputs.release_id }}]"
 
       # Linux и macOS идут через tauri-action: он собирает бандлы и сам
       # заливает их в релиз по release_id. Фронтенд соберётся
