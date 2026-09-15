@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, Search } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, X } from 'lucide-react';
 import { Input } from '../ui/input';
 import { Topic } from './types';
 import { Virtuoso } from 'react-virtuoso';
 import { TopicRow } from './components/TopicRow';
 import { TopicPeek, PeekAnchor } from './components/TopicPeek';
+import { FilterHelp } from './components/FilterHelp';
+import { TopicQuery, matchesQuery, narrowsToMatch, parseTopicQuery } from './topicFilter';
 
 const DEFAULT_WIDTH = 220;
 const MIN_WIDTH = 160;
@@ -55,16 +57,14 @@ const COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'bas
 
 /** Отбор и порядок — общие для обоих списков: избранное отличается только тем,
  *  из чего выбирает, и поиск обязан просеивать их одинаково. */
-function arrange(topics: Topic[], needle: string): Topic[] {
-  if (!needle) {
-    return [...topics].sort((a, b) => COLLATOR.compare(a.name, b.name));
-  }
-  return (
-    topics
-      .filter((topic) => topic.name.toLowerCase().includes(needle))
-      // При активном поиске короткие совпадения обычно релевантнее.
-      .sort((a, b) => a.name.length - b.name.length || COLLATOR.compare(a.name, b.name))
-  );
+function arrange(topics: Topic[], query: TopicQuery): Topic[] {
+  const kept = query.groups.length > 0 ? topics.filter((t) => matchesQuery(t.name, query)) : [...topics];
+  // Короткие совпадения обычно релевантнее — но только когда что-то ищут.
+  // Фильтр из одних исключений ничего не ищет: это тот же полный список без
+  // лишнего, и пересборка по длине перетасовала бы привычный алфавит ни за чем.
+  return narrowsToMatch(query)
+    ? kept.sort((a, b) => a.name.length - b.name.length || COLLATOR.compare(a.name, b.name))
+    : kept.sort((a, b) => COLLATOR.compare(a.name, b.name));
 }
 
 export function TopicsPanel({
@@ -238,15 +238,15 @@ export function TopicsPanel({
   // useMemo: раньше фильтрация и сортировка гонялись на каждый рендер —
   // включая рендеры, вызванные подгрузкой сообщений в соседней панели.
   // И `topics.sort()` мутировал пропс на месте.
-  const needle = useMemo(() => topicFilter.trim().toLowerCase(), [topicFilter]);
-  const filteredTopics = useMemo(() => arrange(topics, needle), [topics, needle]);
+  const query = useMemo(() => parseTopicQuery(topicFilter), [topicFilter]);
+  const filteredTopics = useMemo(() => arrange(topics, query), [topics, query]);
   /** Избранное — из того же списка, что и всё остальное: отмеченного топика
    *  может уже не быть на кластере, и рисовать строку, за которой ничего нет,
    *  значило бы предлагать открыть несуществующее. Из настроек имя при этом не
    *  вычёркивается: топик мог уехать вместе с временно недоступным кластером. */
   const favoriteRows = useMemo(
-    () => arrange(topics.filter((topic) => favoriteTopics.has(topic.name)), needle),
-    [topics, favoriteTopics, needle],
+    () => arrange(topics.filter((topic) => favoriteTopics.has(topic.name)), query),
+    [topics, favoriteTopics, query],
   );
 
   const closePeek = useCallback(() => setPeek(null), []);
@@ -392,7 +392,10 @@ export function TopicsPanel({
       className="relative shrink-0 flex flex-col h-full border-r border-edge"
       style={{ width }}
     >
-      {/* Topics Filter */}
+      {/* Topics Filter.
+          Обе кнопки живут ВНУТРИ поля, а не рядом с ним: панель бывает шириной
+          в 160 пикселей, и вынесенные наружу они отъедали бы у ввода треть
+          именно тогда, когда его и так не хватает. */}
       <div className="p-2 border-b border-edge">
         <div className="relative">
           <Search className="absolute left-2 top-1/2 transform -translate-y-1/2 size-4 text-dim" />
@@ -400,8 +403,23 @@ export function TopicsPanel({
             value={topicFilter}
             onChange={(e) => setTopicFilter(e.target.value)}
             placeholder="Filter topics..."
-            className="bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8"
+            // Место под крестик освобождается только когда он есть: пустому
+            // полю лишний отступ ни к чему.
+            className={`bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8 ${
+              topicFilter ? 'pr-14' : 'pr-8'
+            }`}
           />
+          {topicFilter && (
+            <button
+              type="button"
+              onClick={() => setTopicFilter('')}
+              title="Clear filter"
+              className="absolute right-[26px] top-1/2 -translate-y-1/2 flex items-center text-dim hover:text-strong transition-colors cursor-pointer p-0 border-none bg-transparent"
+            >
+              <X className="size-4" />
+            </button>
+          )}
+          <FilterHelp />
         </div>
       </div>
 
