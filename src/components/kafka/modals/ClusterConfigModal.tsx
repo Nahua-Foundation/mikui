@@ -98,10 +98,14 @@ interface ClusterConfigModalProps {
   mode: 'create' | 'edit';
   onBack?: () => void;
   onSaved?: (cluster: KafkaCluster) => void;
-  /** Возвращённый список топиков форме не нужен — она только ждёт, чем
-   *  кончилось подключение. Тип его не прячет: сузить `Promise<Topic[]>` до
-   *  `Promise<void>` TypeScript не даёт, а заводить ради этого обёртку
-   *  значило бы прятать, что за кнопкой стоит тот же самый `connect`. */
+  /**
+   * Подключиться только что созданным кластером. Ошибку показывает он сам.
+   *
+   * Возвращённый список топиков форме не нужен — к этому моменту она уже
+   * закрыта. Тип его не прячет: сузить `Promise<Topic[]>` до `Promise<void>`
+   * TypeScript не даёт, а заводить ради этого обёртку значило бы прятать, что
+   * за кнопкой стоит тот же самый `connect`.
+   */
   onConnect?: (payload: ClusterConnectPayload, name: string) => Promise<unknown>;
   /** Открыть список Kafka-пользователей этого кластера. */
   onManageUsers?: (cluster: KafkaCluster) => void;
@@ -152,7 +156,6 @@ export function ClusterConfigModal({
    *  «оставить», а не «стереть», — как и у пароля учётки. */
   const [registryHasPassword, setRegistryHasPassword] = useState<boolean>(false);
 
-  const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
   const [isTestingRegistry, setIsTestingRegistry] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
@@ -315,22 +318,6 @@ export function ClusterConfigModal({
     return null;
   };
 
-  const handleConnect = async () => {
-    if (!onConnect) return;
-    const complaint = validate();
-    if (complaint) {
-      toast.error(complaint);
-      return;
-    }
-    try {
-      setIsConnecting(true);
-      await onConnect(buildPayload(), name || brokers);
-      onOpenChange(false);
-    } finally {
-      setIsConnecting(false);
-    }
-  };
-
   const handleTestConnection = async () => {
     const complaint = validate();
     if (complaint) {
@@ -443,7 +430,18 @@ export function ClusterConfigModal({
       // Настройки сохранены — применяем их. Ошибку подключения показывает сам
       // `connect`, и превращать её здесь во второй тост про неудачное
       // сохранение нельзя: сохранение как раз удалось.
-      onApply?.(saved).catch(() => {});
+      if (mode === 'create') {
+        // Новая запись — подключаемся ЕЮ, а не тем, что набрано в форме:
+        // payload из формы не знает выданного id, а по нему бэкенд достаёт из
+        // keychain и пароль учётки, и пароль ключа. И безусловно, в отличие от
+        // `onApply`: тот бережёт чужое живое подключение, а здесь человек
+        // только что попросил подключиться к новому кластеру.
+        onConnect?.(api.clusterToPayload(saved, api.activeUser(saved)), saved.name).catch(
+          () => {},
+        );
+      } else {
+        onApply?.(saved).catch(() => {});
+      }
     } catch (e) {
       console.error(e);
       toast.error(`Failed to save cluster: ${e}`);
@@ -859,43 +857,25 @@ export function ClusterConfigModal({
           <Button
             onClick={handleTestConnection}
             variant="outline"
-            disabled={isTesting || isConnecting || isSaving}
+            disabled={isTesting || isSaving}
             className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {isTesting && <Loader2 className="size-4 animate-spin" />}
             {isTesting ? 'Testing…' : 'Test'}
           </Button>
-          {/* В режиме правки Save сам применяет настройки, и отдельный Connect
-              рядом с ним делал бы почти то же самое — только не сохраняя. */}
-          {mode === 'create' && (
-            <Button
-              onClick={handleSave}
-              variant="outline"
-              disabled={isConnecting || isSaving}
-              className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Save
-            </Button>
-          )}
-          {mode === 'create' ? (
-            <Button
-              onClick={handleConnect}
-              disabled={isConnecting || isTesting || isSaving}
-              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
-            >
-              {isConnecting && <Loader2 className="size-4 animate-spin" />}
-              {isConnecting ? 'Connecting…' : 'Connect'}
-            </Button>
-          ) : (
-            <Button
-              onClick={handleSave}
-              disabled={isSaving || isTesting}
-              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
-            >
-              {isSaving && <Loader2 className="size-4 animate-spin" />}
-              {isSaving ? 'Saving…' : 'Save & connect'}
-            </Button>
-          )}
+          {/* Одна кнопка на оба действия — и в создании, и в правке.
+              Отдельный Connect рядом с Save подключался бы НЕ СОХРАНЯЯ:
+              случай редкий, а путались на нём постоянно — оранжевая кнопка
+              выглядит главной, после неё кластер работает, но в списке
+              известных его нет. */}
+          <Button
+            onClick={handleSave}
+            disabled={isSaving || isTesting}
+            className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
+          >
+            {isSaving && <Loader2 className="size-4 animate-spin" />}
+            {isSaving ? 'Saving…' : 'Save & connect'}
+          </Button>
         </div>
       </DialogContentNoClose>
     </Dialog>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   BodyFormat,
@@ -8,6 +8,7 @@ import {
   ClusterUser,
   FavoriteInfo,
   FavoritesView,
+  FavoriteTopics,
   FullMessage,
   MessageFilter,
   MessageLinkTarget,
@@ -140,6 +141,9 @@ export function KafkaExplorerPortfolio() {
   /** Архив сохранённых сообщений вместе с занятым местом. Живёт на диске;
    *  здесь только последний отданный бэкендом снимок. */
   const [favorites, setFavorites] = useState<FavoritesView>(EMPTY_FAVORITES);
+  /** Избранные топики ВСЕХ кластеров — так они и лежат в settings.json.
+   *  Панели уходит только набор текущего. */
+  const [favoriteTopics, setFavoriteTopics] = useState<FavoriteTopics>({});
   const [topics, setTopics] = useState<Topic[]>([]);
 
   const [total, setTotal] = useState(0);
@@ -311,11 +315,61 @@ export function KafkaExplorerPortfolio() {
   // нужно, сообщения лежат у нас.
   useEffect(loadFavorites, [loadFavorites]);
 
+  // Избранные топики — тоже с диска и тоже при старте: отметка, живущая до
+  // закрытия окна, не стоила бы того, чтобы её ставить.
+  useEffect(() => {
+    api
+      .loadFavoriteTopics()
+      .then(setFavoriteTopics)
+      .catch((e) => console.error('Failed to load favorite topics', e));
+  }, []);
+
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
 
-  /** Под каким ключом искать схемы топиков этого подключения. */
+  /** Под каким ключом искать схемы топиков этого подключения. Им же
+   *  ключуется избранное: вопрос «тот ли это топик» у них общий. */
   const schemaCluster = clusterKey(connectedClusterId, connectedName);
+
+  /** Избранное текущего подключения — только имена, панели больше не нужно. */
+  const favoriteTopicNames = useMemo(
+    () => new Set(schemaCluster ? (favoriteTopics[schemaCluster] ?? []) : []),
+    [favoriteTopics, schemaCluster],
+  );
+
+  // Через ref, чтобы обработчик не пересоздавался на каждую поставленную
+  // звезду: он висит на каждой строке списка, а строк тысячи.
+  const favoriteTopicsRef = useRef(favoriteTopics);
+  favoriteTopicsRef.current = favoriteTopics;
+
+  /**
+   * Поставить или снять звезду. Диск — сразу: отметка ставится одним кликом
+   * между делом, и подтверждать её было бы не к месту, а терять при выходе
+   * тем более.
+   */
+  const handleToggleFavoriteTopic = useCallback(
+    (topic: Topic) => {
+      // Ключа нет только без подключения, а тогда нет и списка топиков.
+      if (!schemaCluster) return;
+      const current = favoriteTopicsRef.current[schemaCluster] ?? [];
+      const next = current.includes(topic.name)
+        ? current.filter((name) => name !== topic.name)
+        : [...current, topic.name];
+      const updated = { ...favoriteTopicsRef.current, [schemaCluster]: next };
+      // Пустой список — это отсутствие отметок, а не отметка «ничего»: иначе
+      // файл копил бы по записи на каждый кластер, где звезду поставили и тут
+      // же сняли.
+      if (next.length === 0) delete updated[schemaCluster];
+
+      favoriteTopicsRef.current = updated;
+      setFavoriteTopics(updated);
+      api.saveFavoriteTopics(updated).catch((e) => {
+        console.error('Failed to save favorite topics', e);
+        toast.error(`Failed to save favorites: ${describeError(e)}`);
+      });
+    },
+    [schemaCluster],
+  );
 
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
@@ -1395,6 +1449,8 @@ export function KafkaExplorerPortfolio() {
           selectedTopic={selectedTopic}
           onTopicSelect={handleSelectTopic}
           onTopicInfo={handleTopicInfo}
+          favoriteTopics={favoriteTopicNames}
+          onToggleFavorite={handleToggleFavoriteTopic}
         />
 
         <div className="flex-1 min-h-0 flex flex-col h-full">

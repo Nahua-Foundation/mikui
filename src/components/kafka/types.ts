@@ -712,10 +712,40 @@ export interface PayloadIssue {
   message: string;
 }
 
-/** Файл настроек. Своих полей пока нет — see config/types.rs. */
+/** Файл настроек. Rust о его содержимом ничего не знает и возвращает
+ *  незнакомые ключи нетронутыми — see config/types.rs. */
 export interface Settings {
   version: number;
   [key: string]: unknown;
+}
+
+/** Ключ в settings.json, под которым лежит избранное. */
+export const FAVORITE_TOPICS_KEY = 'favorite_topics';
+
+/**
+ * Избранные топики: ключ кластера (`clusterKey`) → имена топиков.
+ *
+ * По кластерам, а не общим списком: одноимённые топики в dev и prod — разные
+ * топики, и отметка на одном не имеет отношения к другому. Тот же довод, что
+ * и у привязки схем.
+ */
+export type FavoriteTopics = Record<string, string[]>;
+
+/**
+ * Разбирает избранное из настроек, отбрасывая всё, что не похоже на список
+ * имён.
+ *
+ * Файл лежит на диске рядом с подключениями, его правят руками, и одна
+ * испорченная запись не должна лишать избранного остальные кластеры.
+ */
+export function parseFavoriteTopics(value: unknown): FavoriteTopics {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const parsed: FavoriteTopics = {};
+  for (const [cluster, names] of Object.entries(value as Record<string, unknown>)) {
+    if (!Array.isArray(names)) continue;
+    parsed[cluster] = names.filter((name): name is string => typeof name === 'string');
+  }
+  return parsed;
 }
 
 // --- Ссылка на сообщение -------------------------------------------------------
