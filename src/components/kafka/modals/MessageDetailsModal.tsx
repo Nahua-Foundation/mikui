@@ -17,6 +17,22 @@ const MAX_RENDERED_LINES = 2000;
 /** Вкладки окна. `envelope` появляется только у тела в конверте CDC/Connect. */
 type Tab = 'payload' | 'envelope' | 'headers';
 
+/** `isJson` решает, переносить ли строки: у форматированного JSON перенос
+ *  сбил бы нумерацию, а у чего угодно другого одна строка на всё тело
+ *  растянулась бы в бесконечную полосу. */
+function formatJson(jsonString: string, format: BodyFormat): { text: string; isJson: boolean } {
+  // Явно выбранные text и hex просят показать как есть — раскладывать их по
+  // строкам значило бы решать за пользователя. У hex это ещё и единственный
+  // верный ответ: тело из одних цифр (`12345678`) разобралось бы как число и
+  // уехало в JSON-ветку, где его покрасили бы как число.
+  if (showsRawBody(format)) return { text: jsonString, isJson: false };
+  try {
+    return { text: JSON.stringify(JSON.parse(jsonString), null, 2), isJson: true };
+  } catch {
+    return { text: jsonString, isJson: false };
+  }
+}
+
 /** Соседняя вкладка по кругу. Список приходит аргументом: его состав зависит
  *  от сообщения. */
 function step(current: Tab, delta: 1 | -1, tabs: Tab[]): Tab {
@@ -99,6 +115,17 @@ export function MessageDetailsModal({
    */
   const envelope = useMemo(
     () => (message && !showsRawBody(format) ? detectEnvelope(message.value) : null),
+    [message, format],
+  );
+
+  /**
+   * Тело в том виде, в каком его видит пользователь.
+   *
+   * Считается здесь, а не при отрисовке, потому что этот же текст уходит в
+   * буфер: копируется ровно то, что на экране, вплоть до отступов.
+   */
+  const { text: formatted, isJson } = useMemo(
+    () => (message ? formatJson(message.value, format) : { text: '', isJson: false }),
     [message, format],
   );
 
@@ -192,22 +219,6 @@ export function MessageDetailsModal({
     copyToClipboard(headers.map((h) => `${h.key}: ${h.value}`).join('\n'));
   };
 
-  /** `isJson` решает, переносить ли строки: у форматированного JSON перенос
-   *  сбил бы нумерацию, а у чего угодно другого одна строка на всё тело
-   *  растянулась бы в бесконечную полосу. */
-  const formatJson = (jsonString: string): { text: string; isJson: boolean } => {
-    // Явно выбранные text и hex просят показать как есть — раскладывать их по
-    // строкам значило бы решать за пользователя. У hex это ещё и единственный
-    // верный ответ: тело из одних цифр (`12345678`) разобралось бы как число и
-    // уехало в JSON-ветку, где его покрасили бы как число.
-    if (showsRawBody(format)) return { text: jsonString, isJson: false };
-    try {
-      return { text: JSON.stringify(JSON.parse(jsonString), null, 2), isJson: true };
-    } catch {
-      return { text: jsonString, isJson: false };
-    }
-  };
-
   const handleCopy = () => {
     // С вкладки конверта копируется ПОЛНОЕ тело, а не диф: копируют, чтобы
     // переслать или воспроизвести, а диф — представление, которого в топике
@@ -215,13 +226,17 @@ export function MessageDetailsModal({
     if (activeTab === 'headers') {
       copyHeadersToClipboard(message!.headers);
     } else {
-      copyToClipboard(message!.value);
+      // Разложенное по строкам тело, а не `message.value` с провода: на экране
+      // отступы, и получить в буфере простыню в одну строку — неожиданность.
+      // На сам JSON это не влияет (пробелы между токенами незначимы), а text и
+      // hex здесь и так лежат нетронутыми. Копируется тело ЦЕЛИКОМ — потолок
+      // `MAX_RENDERED_LINES` режет только отрисовку.
+      copyToClipboard(formatted);
     }
   };
 
   if (!message) return null;
 
-  const { text: formatted, isJson } = formatJson(message.value);
   const allLines = formatted.split('\n');
   const lines = allLines.slice(0, MAX_RENDERED_LINES);
   const hiddenLines = allLines.length - lines.length;
