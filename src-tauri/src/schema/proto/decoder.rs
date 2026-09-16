@@ -206,6 +206,7 @@ mod tests {
         let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
+            auto: false,
         };
         let linked = linked::parse(&dir, &[file]).unwrap();
         let md = linked.message(message).unwrap();
@@ -247,7 +248,10 @@ mod tests {
         let json = decoder.decode(&encoded_event()).unwrap();
 
         // Ни одного переноса строки: строка таблицы обязана остаться одной строкой.
-        assert!(!json.contains('\n'), "ожидался компактный JSON, получено: {json}");
+        assert!(
+            !json.contains('\n'),
+            "ожидался компактный JSON, получено: {json}"
+        );
         // Имена полей — из .proto, а не lowerCamelCase.
         assert!(json.contains("\"event_id\""), "{json}");
         assert!(!json.contains("eventId"), "{json}");
@@ -298,6 +302,7 @@ mod tests {
         let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
+            auto: false,
         };
         let linked = linked::parse(&dir, &[file]).unwrap();
         let decoder = ProtoDecoder::new(linked.message("demo.Order").unwrap());
@@ -420,6 +425,7 @@ mod tests {
         let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
+            auto: false,
         };
         let linked = linked::parse(&dir, &[file]).unwrap();
         let decoder = ProtoDecoder::new(linked.message("demo.Outer.Second").unwrap());

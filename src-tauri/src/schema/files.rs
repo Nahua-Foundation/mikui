@@ -13,11 +13,39 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use super::types::SchemaFile;
+
 /// Файл, готовый лечь в каталог схемы.
 pub struct Pending {
     pub name: String,
     pub source: String,
     pub bytes: Vec<u8>,
+    /// Файл не выбирали, его нашли по импорту. См. `SchemaFile::auto` — здесь
+    /// признак едет транзитом, раскладку он не касается никак: и выбранное, и
+    /// найденное ложится в каталог одинаково.
+    pub auto: bool,
+}
+
+impl Pending {
+    /// Выбранный пользователем файл.
+    pub fn picked(name: String, source: String, bytes: Vec<u8>) -> Self {
+        Self {
+            name,
+            source,
+            bytes,
+            auto: false,
+        }
+    }
+}
+
+impl From<&Pending> for SchemaFile {
+    fn from(pending: &Pending) -> Self {
+        SchemaFile {
+            name: pending.name.clone(),
+            source: pending.source.clone(),
+            auto: pending.auto,
+        }
+    }
 }
 
 /// Отвергает имена, которые увели бы запись за пределы каталога схемы.
@@ -26,7 +54,9 @@ pub struct Pending {
 /// не должен превращаться в запись куда угодно по файловой системе.
 fn is_safe_name(name: &str) -> bool {
     !name.is_empty()
-        && Path::new(name).components().all(|c| matches!(c, Component::Normal(_)))
+        && Path::new(name)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// Заново раскладывает каталог схемы под указанный набор файлов.

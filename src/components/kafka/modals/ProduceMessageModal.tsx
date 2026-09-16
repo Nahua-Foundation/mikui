@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { highlightLine, NO_ENUM_VALUES } from '../syntax';
 import { SubjectPicker } from '../components/AvroSchema';
+import { ProtoMessageSelect } from '../components/ProtoMessageSelect';
 import * as api from '../api';
 import { describeError } from '../api';
 import {
@@ -213,8 +214,11 @@ export function ProduceMessageModal({
     setSchemaForm(null);
     setOfferedFor(null);
     // Тип по умолчанию — тот, которым топик читают: раз им смотрят, им скорее
-    // всего и отправляют.
-    setProtoMessage(current?.message ?? null);
+    // всего и отправляют. А если топику тип не назначен, но в загруженных
+    // .proto он всего один — берём его: выбирать не из чего, и предлагать
+    // выбор было бы формальностью.
+    const declared = current?.messages ?? [];
+    setProtoMessage(current?.message ?? (declared.length === 1 ? declared[0] : null));
     setSubjectChoice(null);
     // Формат тоже: у топика со схемой начинать с текста значило бы предлагать
     // положить в него заведомо нечитаемое тело.
@@ -721,51 +725,16 @@ export function ProduceMessageModal({
                       template
                     </Button>
                   )}
-                  <Select
-                    value={protoMessage ?? ''}
-                    onValueChange={setProtoMessage}
-                    disabled={messages.length === 0}
-                  >
-                    {/* Три правки, и все три обязательны — имя message это
-                        одно слово с точками, переносить его негде, и без любой
-                        из них оно снова распирает вёрстку:
-
-                        `min-w-0` НА ТРИГГЕРЕ — главное. Триггер стоит
-                        flex-элементом в строке с кнопками форматов, и его
-                        автоминимум по умолчанию равен `w-72`: строка целиком
-                        в окно не влезает, сжаться триггеру нечем, и он
-                        выезжает из неё вправе вместе со стрелкой и рамкой.
-
-                        `block` на значении — вместо `flex` из shadcn.
-                        В блочной раскладке ширина обрезаемого span равна
-                        ширине значения без всяких переговоров о сжатии; во
-                        flex она зависела бы ещё и от `flex-shrink`.
-
-                        `min-w-0` на значении — оно само тоже flex-элемент,
-                        теперь уже внутри триггера, и та же история. */}
-                    <SelectTrigger
-                      className="w-72 min-w-0 bg-surface border-edge text-strong font-mono text-xs *:data-[slot=select-value]:block *:data-[slot=select-value]:min-w-0"
-                      title={protoMessage ?? undefined}
-                    >
-                      <SelectValue placeholder="Choose a message">
-                        {/* Своим span-ом, а не текстом от Radix: многоточие
-                            ставится элементу, а не текстовому узлу. Полное имя
-                            остаётся доступным подсказкой на триггере. */}
-                        <span className="block truncate">{protoMessage}</span>
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectContent className="bg-surface border-edge max-h-80">
-                      {messages.map((name) => (
-                        <SelectItem
-                          key={name}
-                          value={name}
-                          className="text-strong font-mono focus:bg-edge"
-                        >
-                          {name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  {/* Обрезка длинного имени, подсказка с полным и `min-w-0`
+                      против выезда триггера из строки — всё это теперь внутри
+                      `ProtoMessageSelect`: то же самое понадобилось и в окне
+                      схемы топика, а расходиться этим правкам нельзя. */}
+                  <ProtoMessageSelect
+                    messages={messages}
+                    value={protoMessage}
+                    onChange={setProtoMessage}
+                    className="w-72 text-xs"
+                  />
                 </div>
               )}
 

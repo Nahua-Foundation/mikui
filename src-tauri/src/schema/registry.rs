@@ -144,8 +144,9 @@ impl Registry {
             // TLS-инспектор подписывает свой сертификат внутренним CA, которого
             // в webpki-roots нет и не будет, а в систему его ставят
             // централизованно.
-            None => ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier),
+            None => {
+                ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            }
         };
 
         let config = ureq::Agent::config_builder()
@@ -159,9 +160,12 @@ impl Registry {
 
         Ok(Self {
             url,
-            auth: username
-                .filter(|u| !u.is_empty())
-                .map(|u| format!("Basic {}", base64(&format!("{u}:{}", password.unwrap_or(""))))),
+            auth: username.filter(|u| !u.is_empty()).map(|u| {
+                format!(
+                    "Basic {}",
+                    base64(&format!("{u}:{}", password.unwrap_or("")))
+                )
+            }),
             agent: config.into(),
         })
     }
@@ -220,10 +224,7 @@ impl Registry {
         version: Option<i32>,
     ) -> Result<RegisteredSchema, String> {
         let which = version.map_or_else(|| "latest".to_string(), |v| v.to_string());
-        let body = self.call(&format!(
-            "/subjects/{}/versions/{which}",
-            escape(subject)
-        ))?;
+        let body = self.call(&format!("/subjects/{}/versions/{which}", escape(subject)))?;
         let parsed = parse_schema(&body)
             .map_err(|e| format!("unexpected response for subject {subject}: {e}"))?;
         self.assemble(parsed, 0)
@@ -334,7 +335,10 @@ impl Registry {
             .get(&url)
             // Вежливость к реализациям, которые по умолчанию отдают старый
             // формат. Confluent понимает и без него, Karapace с Apicurio — тоже.
-            .header("Accept", "application/vnd.schemaregistry.v1+json, application/json");
+            .header(
+                "Accept",
+                "application/vnd.schemaregistry.v1+json, application/json",
+            );
         if let Some(auth) = &self.auth {
             request = request.header("Authorization", auth);
         }
@@ -416,8 +420,7 @@ fn escape(segment: &str) -> String {
 /// Своя реализация вместо крейта: единственное место применения, двадцать
 /// строк, и никакого выбора алфавита — basic auth знает ровно один.
 fn base64(input: &str) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
 
@@ -466,7 +469,10 @@ mod tests {
 
     #[test]
     fn basic_auth_matches_the_rfc_examples() {
-        assert_eq!(base64("Aladdin:open sesame"), "QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        assert_eq!(
+            base64("Aladdin:open sesame"),
+            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
         assert_eq!(base64(""), "");
         assert_eq!(base64("a"), "YQ==");
         assert_eq!(base64("ab"), "YWI=");
@@ -515,7 +521,10 @@ mod tests {
     #[test]
     fn a_non_avro_schema_type_is_visible_in_the_parsed_response() {
         let body = r#"{"id": 1, "schemaType": "PROTOBUF", "schema": "syntax = \"proto3\";"}"#;
-        assert_eq!(parse_schema(body).unwrap().schema_type.as_deref(), Some("PROTOBUF"));
+        assert_eq!(
+            parse_schema(body).unwrap().schema_type.as_deref(),
+            Some("PROTOBUF")
+        );
     }
 
     #[test]
@@ -554,7 +563,10 @@ mod tests {
 
     /// Поднимает сервер, отвечающий по таблице «путь → тело», и отдаёт его
     /// адрес вместе с каналом, куда падают полученные запросы.
-    fn serve(routes: Vec<(&'static str, &'static str)>, count: usize) -> (String, mpsc::Receiver<Seen>) {
+    fn serve(
+        routes: Vec<(&'static str, &'static str)>,
+        count: usize,
+    ) -> (String, mpsc::Receiver<Seen>) {
         // Порт 0 — «любой свободный»: занимать фиксированный в тестах нельзя.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -614,7 +626,10 @@ mod tests {
         let (url, seen) = serve(vec![("/subjects", r#"["orders-value","money-value"]"#)], 1);
         let registry = Registry::new(&url, Some("alice"), Some("secret"), None).unwrap();
 
-        assert_eq!(registry.subjects().unwrap(), ["orders-value", "money-value"]);
+        assert_eq!(
+            registry.subjects().unwrap(),
+            ["orders-value", "money-value"]
+        );
 
         let (path, auth) = seen.recv().unwrap();
         assert_eq!(path, "/subjects");
@@ -662,11 +677,9 @@ mod tests {
 
         // И собранного хватает, чтобы схема связалась: ради этого ссылки и
         // догружались.
-        let linked = crate::schema::avro::Linked::parse_with_refs(
-            &fetched.schema,
-            &fetched.references,
-        )
-        .unwrap();
+        let linked =
+            crate::schema::avro::Linked::parse_with_refs(&fetched.schema, &fetched.references)
+                .unwrap();
         assert_eq!(linked.root_name().as_deref(), Some("orders.Order"));
     }
 
@@ -674,7 +687,10 @@ mod tests {
     /// confluent-формате разбирается схемой, добытой по id из его заголовка.
     #[test]
     fn a_confluent_message_is_decoded_through_the_registry() {
-        let body = format!(r#"{{"id":11,"schema":{}}}"#, serde_json::to_string(MONEY).unwrap());
+        let body = format!(
+            r#"{{"id":11,"schema":{}}}"#,
+            serde_json::to_string(MONEY).unwrap()
+        );
         let body: &'static str = Box::leak(body.into_boxed_str());
         let (url, _seen) = serve(vec![("/schemas/ids/11", body)], 1);
 

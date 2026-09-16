@@ -25,9 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::types::{
-    FavoriteRecord, FavoriteView, FavoritesView, SaveFavoriteResult, SavedMessage,
-};
+use super::types::{FavoriteRecord, FavoriteView, FavoritesView, SaveFavoriteResult, SavedMessage};
 use crate::config;
 use crate::kafka::{text, FullMessage, RawBody};
 use crate::schema::{self, Decoder};
@@ -342,9 +340,15 @@ mod tests {
         }
 
         fn save(&self, topic: &str, partition: i32, offset: i64, value: &[u8]) -> String {
-            super::save(&self.root, CLUSTER, "prod", topic, &raw(partition, offset, value))
-                .unwrap()
-                .id
+            super::save(
+                &self.root,
+                CLUSTER,
+                "prod",
+                topic,
+                &raw(partition, offset, value),
+            )
+            .unwrap()
+            .id
         }
 
         fn list(&self) -> FavoritesView {
@@ -434,7 +438,10 @@ mod tests {
 
         let view = sandbox.list();
         assert_eq!(view.items.len(), 1);
-        assert_eq!(message(&sandbox.root, &first).unwrap().message.value, "after");
+        assert_eq!(
+            message(&sandbox.root, &first).unwrap().message.value,
+            "after"
+        );
     }
 
     /// Регрессия: удаление раньше шло по паре партиция-офсет без учёта топика и
@@ -461,7 +468,14 @@ mod tests {
     fn the_same_topic_in_two_clusters_gives_two_records() {
         let sandbox = Sandbox::new("clusters");
         sandbox.save("orders", 0, 7, b"prod body");
-        super::save(&sandbox.root, "dev", "dev", "orders", &raw(0, 7, b"dev body")).unwrap();
+        super::save(
+            &sandbox.root,
+            "dev",
+            "dev",
+            "orders",
+            &raw(0, 7, b"dev body"),
+        )
+        .unwrap();
 
         assert_eq!(sandbox.list().items.len(), 2);
     }
@@ -473,7 +487,10 @@ mod tests {
         let id = sandbox.save("orders", 0, 1, &heavy);
         let view = sandbox.list();
         assert_eq!(view.items[0].bytes, 50_000);
-        assert!(view.total_bytes > view.items[0].bytes, "индекс тоже занимает место");
+        assert!(
+            view.total_bytes > view.items[0].bytes,
+            "индекс тоже занимает место"
+        );
 
         let after = delete(&sandbox.root, &id).unwrap();
         assert!(after.items.is_empty());
@@ -529,9 +546,18 @@ mod tests {
     #[test]
     fn identifiers_separate_messages_that_only_look_alike() {
         // Разделитель не даёт склейке «c1» + «x.orders» совпасть с «c1x» + «orders».
-        assert_ne!(new_id(1, "c1", "x.orders", 0, 0), new_id(1, "c1x", "orders", 0, 0));
-        assert_ne!(new_id(1, "c1", "orders", 0, 1), new_id(1, "c1", "orders", 1, 0));
-        assert_eq!(new_id(1, "c1", "orders", 0, 1), new_id(1, "c1", "orders", 0, 1));
+        assert_ne!(
+            new_id(1, "c1", "x.orders", 0, 0),
+            new_id(1, "c1x", "orders", 0, 0)
+        );
+        assert_ne!(
+            new_id(1, "c1", "orders", 0, 1),
+            new_id(1, "c1", "orders", 1, 0)
+        );
+        assert_eq!(
+            new_id(1, "c1", "orders", 0, 1),
+            new_id(1, "c1", "orders", 0, 1)
+        );
     }
 
     // --- Схема, загруженная после сохранения ---------------------------------
@@ -574,7 +600,11 @@ mod tests {
         // Пока схемы нет — это просто байты, показанные как есть.
         let before = sandbox.list();
         assert!(!before.items[0].record.with_schema);
-        assert!(!message(&sandbox.root, &id).unwrap().message.value.contains("\"id\""));
+        assert!(!message(&sandbox.root, &id)
+            .unwrap()
+            .message
+            .value
+            .contains("\"id\""));
 
         attach_schema(&sandbox.root, "orders");
 
@@ -606,7 +636,10 @@ mod tests {
         schema::store::remove_file(&sandbox.root, CLUSTER, "orders", "event.proto").unwrap();
 
         let view = sandbox.list();
-        assert!(!view.items[0].record.preview.contains("\"id\""), "разбор должен был уйти");
+        assert!(
+            !view.items[0].record.preview.contains("\"id\""),
+            "разбор должен был уйти"
+        );
         assert!(!view.items[0].record.with_schema);
     }
 
@@ -623,8 +656,7 @@ mod tests {
 
     /// Кодирует `Event { id }` в голый avro-datum.
     fn avro_bytes(id: &str) -> Vec<u8> {
-        let linked =
-            crate::schema::avro::Linked::parse_files(&[AVSC.to_string()], None).unwrap();
+        let linked = crate::schema::avro::Linked::parse_files(&[AVSC.to_string()], None).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&format!(r#"{{"id": "{id}"}}"#)).unwrap();
         linked.encode(json).unwrap()

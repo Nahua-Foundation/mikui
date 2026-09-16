@@ -16,8 +16,7 @@ pub fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_config_dir()
         .map_err(|e| format!("can't resolve config directory: {e}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     Ok(dir)
 }
 

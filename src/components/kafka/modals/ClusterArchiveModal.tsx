@@ -1,5 +1,5 @@
 import { Button } from '../../ui/button';
-import { Plus, Settings, Trash2 } from 'lucide-react';
+import { Plus, PowerOff, Settings, Trash2 } from 'lucide-react';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { KafkaCluster } from '../types';
@@ -14,6 +14,9 @@ interface ClusterArchiveModalProps {
   onCreateNew: () => void;
   onEditCluster: (cluster: KafkaCluster) => void;
   onConnectToCluster: (cluster: KafkaCluster) => void;
+  /** Разорвать текущее подключение. Приложение возвращается к тому же пустому
+   *  виду, с которого начинается сеанс. */
+  onDisconnect: () => void;
 }
 
 export function ClusterArchiveModal({
@@ -25,9 +28,17 @@ export function ClusterArchiveModal({
   onCreateNew,
   onEditCluster,
   onConnectToCluster,
+  onDisconnect,
 }: ClusterArchiveModalProps) {
   const handleConnectAndClose = (cluster: KafkaCluster) => {
     onConnectToCluster(cluster);
+    onOpenChange(false);
+  };
+
+  // Модалку закрываем: отключение оставляет приложение пустым, и смотреть на
+  // список кластеров поверх этой пустоты незачем — решение уже принято.
+  const handleDisconnectAndClose = () => {
+    onDisconnect();
     onOpenChange(false);
   };
 
@@ -70,6 +81,7 @@ export function ClusterArchiveModal({
               // Под кем откроется этот кластер по клику — то же, что решит
               // и сам обработчик подключения.
               const user = api.activeUser(cluster);
+              const isConnected = cluster.id === connectedClusterId;
               const details = [
                 cluster.brokers,
                 cluster.security_protocol,
@@ -86,7 +98,7 @@ export function ClusterArchiveModal({
                 >
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      {cluster.id === connectedClusterId && (
+                      {isConnected && (
                         <span
                           className="size-2 rounded-full bg-ok shrink-0"
                           title="Connected"
@@ -102,6 +114,21 @@ export function ClusterArchiveModal({
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0">
+                    {/* Только у подключённого: отключаться больше не от чего,
+                        а кнопка на каждой строке читалась бы как «отключить
+                        этот кластер», которого никто не подключал. */}
+                    {isConnected && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDisconnectAndClose();
+                        }}
+                        className="p-1 text-dim hover:text-danger-hover transition-colors duration-200 cursor-pointer border-none bg-transparent outline-none"
+                        title="Disconnect from this cluster"
+                      >
+                        <PowerOff className="size-4" />
+                      </button>
+                    )}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();

@@ -91,7 +91,9 @@ mod tests {
     #[test]
     fn reads_the_shapes_dumps_actually_print() {
         let expected = vec![0x1a, 0x2b, 0x3c];
-        for text in ["1a2b3c", "1a 2b 3c", "1a:2b:3c", "1a-2b-3c", "0x1a2b3c", " 1A2B3C "] {
+        for text in [
+            "1a2b3c", "1a 2b 3c", "1a:2b:3c", "1a-2b-3c", "0x1a2b3c", " 1A2B3C ",
+        ] {
             assert_eq!(decode(text).unwrap(), expected, "не разобрано: {text:?}");
         }
     }

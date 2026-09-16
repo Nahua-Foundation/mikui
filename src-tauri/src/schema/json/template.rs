@@ -239,7 +239,9 @@ mod tests {
     /// такого поля именно null.
     #[test]
     fn a_nullable_type_gets_null() {
-        let text = skeleton_of(r#"{"type": "object", "properties": {"a": {"type": ["null", "integer"]}}}"#);
+        let text = skeleton_of(
+            r#"{"type": "object", "properties": {"a": {"type": ["null", "integer"]}}}"#,
+        );
         assert!(text.contains("\"a\": null"), "{text}");
     }
 

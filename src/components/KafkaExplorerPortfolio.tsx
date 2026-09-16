@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   BodyFormat,
@@ -8,6 +8,7 @@ import {
   ClusterUser,
   FavoriteInfo,
   FavoritesView,
+  FavoriteTopics,
   FullMessage,
   MessageFilter,
   MessageLinkTarget,
@@ -23,6 +24,7 @@ import {
   EMPTY_FILTER,
   EMPTY_RANGE,
   clusterKey,
+  hasQuery,
 } from './kafka';
 import * as api from './kafka/api';
 import { HeaderDesktop } from './kafka';
@@ -78,6 +80,9 @@ const LINK_CONTEXT = 50;
 
 /** Звонок в дверь из бэкенда: система принесла ссылку — см. lib.rs. */
 const LINK_EVENT = 'mikui://link';
+
+/** Воркер упал и поднят заново: подключения больше нет — см. worker.rs. */
+const WORKER_RESTARTED = 'mikui://worker-restarted';
 
 const isSuperseded = (e: unknown) => String(e).includes(READ_SUPERSEDED);
 const isStopped = (e: unknown) => String(e).includes(SEARCH_STOPPED);
@@ -140,6 +145,11 @@ export function KafkaExplorerPortfolio() {
   /** Архив сохранённых сообщений вместе с занятым местом. Живёт на диске;
    *  здесь только последний отданный бэкендом снимок. */
   const [favorites, setFavorites] = useState<FavoritesView>(EMPTY_FAVORITES);
+  /** Избранные топики ВСЕХ кластеров — так они и лежат в settings.json.
+   *  Панели уходит только набор текущего. */
+  const [favoriteTopics, setFavoriteTopics] = useState<FavoriteTopics>({});
+  /** Путь к журналу паник, если приложение когда-нибудь падало. */
+  const [crashLog, setCrashLog] = useState<string | null>(null);
   const [topics, setTopics] = useState<Topic[]>([]);
 
   const [total, setTotal] = useState(0);
@@ -311,11 +321,73 @@ export function KafkaExplorerPortfolio() {
   // нужно, сообщения лежат у нас.
   useEffect(loadFavorites, [loadFavorites]);
 
+  // Избранные топики — тоже с диска и тоже при старте: отметка, живущая до
+  // закрытия окна, не стоила бы того, чтобы её ставить.
+  useEffect(() => {
+    api
+      .loadFavoriteTopics()
+      .then(setFavoriteTopics)
+      .catch((e) => console.error('Failed to load favorite topics', e));
+  }, []);
+
+  // Падал ли бэкенд когда-нибудь. Спрашивается один раз при старте и НЕ
+  // перечитывается: свежая паника и так приезжает своим сообщением, а вот
+  // записанная в прошлый запуск иначе осталась бы незамеченной — именно её
+  // обычно и просят прислать.
+  useEffect(() => {
+    api
+      .panicLog()
+      .then(setCrashLog)
+      .catch((e) => console.error('Failed to check the panic log', e));
+  }, []);
+
+
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
 
-  /** Под каким ключом искать схемы топиков этого подключения. */
+  /** Под каким ключом искать схемы топиков этого подключения. Им же
+   *  ключуется избранное: вопрос «тот ли это топик» у них общий. */
   const schemaCluster = clusterKey(connectedClusterId, connectedName);
+
+  /** Избранное текущего подключения — только имена, панели больше не нужно. */
+  const favoriteTopicNames = useMemo(
+    () => new Set(schemaCluster ? (favoriteTopics[schemaCluster] ?? []) : []),
+    [favoriteTopics, schemaCluster],
+  );
+
+  // Через ref, чтобы обработчик не пересоздавался на каждую поставленную
+  // звезду: он висит на каждой строке списка, а строк тысячи.
+  const favoriteTopicsRef = useRef(favoriteTopics);
+  favoriteTopicsRef.current = favoriteTopics;
+
+  /**
+   * Поставить или снять звезду. Диск — сразу: отметка ставится одним кликом
+   * между делом, и подтверждать её было бы не к месту, а терять при выходе
+   * тем более.
+   */
+  const handleToggleFavoriteTopic = useCallback(
+    (topic: Topic) => {
+      // Ключа нет только без подключения, а тогда нет и списка топиков.
+      if (!schemaCluster) return;
+      const current = favoriteTopicsRef.current[schemaCluster] ?? [];
+      const next = current.includes(topic.name)
+        ? current.filter((name) => name !== topic.name)
+        : [...current, topic.name];
+      const updated = { ...favoriteTopicsRef.current, [schemaCluster]: next };
+      // Пустой список — это отсутствие отметок, а не отметка «ничего»: иначе
+      // файл копил бы по записи на каждый кластер, где звезду поставили и тут
+      // же сняли.
+      if (next.length === 0) delete updated[schemaCluster];
+
+      favoriteTopicsRef.current = updated;
+      setFavoriteTopics(updated);
+      api.saveFavoriteTopics(updated).catch((e) => {
+        console.error('Failed to save favorite topics', e);
+        toast.error(`Failed to save favorites: ${describeError(e)}`);
+      });
+    },
+    [schemaCluster],
+  );
 
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
@@ -1098,14 +1170,56 @@ export function KafkaExplorerPortfolio() {
    * Состояние UI обязано это отразить целиком: и шапка, и список топиков, и
    * открытая таблица — иначе останется картинка живого сеанса, которого нет.
    */
-  const disconnect = useCallback(async () => {
-    await api.clusterDisconnect().catch((e) => console.error('Disconnect failed', e));
+  /**
+   * Забыть подключение. Бэкенду при этом ничего не говорится.
+   *
+   * Отдельно от `disconnect` ради перезапуска воркера: там отключаться уже не
+   * от чего — подключение ушло вместе с упавшим потоком, — а состояние на
+   * фронте осталось и показывает кластер живым.
+   */
+  const forgetConnection = useCallback(() => {
     setConnectedClusterId(null);
     setConnectedUserId(null);
     setConnectedName(null);
     setTopics([]);
     setSelectedTopic(null);
   }, []);
+
+  const disconnect = useCallback(async () => {
+    await api.clusterDisconnect().catch((e) => console.error('Disconnect failed', e));
+    forgetConnection();
+  }, [forgetConnection]);
+
+  /**
+   * Воркер упал и поднят заново.
+   *
+   * Сообщение об этом приезжает и ответом на команду, но ответ достаётся ровно
+   * тому вызову, который заметил смерть, — а подключения нет уже ни у кого.
+   * Поэтому состояние сбрасывается по событию: иначе шапка показывала бы
+   * кластер подключённым, а список — топики, которых на новом воркере нет.
+   *
+   * Заодно перечитываем путь к журналу: до этой паники его могло не быть
+   * вовсе, а кнопка «прислать трейс» нужна именно сейчас.
+   */
+  useEffect(() => {
+    const listener = listen(WORKER_RESTARTED, () => {
+      forgetConnection();
+      api
+        .panicLog()
+        .then(setCrashLog)
+        .catch((e) => console.error('Failed to check the panic log', e));
+      // Дольше обычного: это не «не получилось», а «состояние потеряно, надо
+      // переподключиться», и прочитать это человек обязан успеть.
+      toast.error(
+        'The Kafka worker crashed and was restarted. Reconnect to the cluster to continue — ' +
+          'the crash log is in the header, please send it over.',
+        { duration: 15000 },
+      );
+    });
+    return () => {
+      listener.then((stop) => stop()).catch(() => {});
+    };
+  }, [forgetConnection]);
 
   /** `fromConfig` — пришли из настроек кластера, значит есть куда вернуться. */
   const handleManageUsers = useCallback((cluster: KafkaCluster, fromConfig = false) => {
@@ -1196,6 +1310,13 @@ export function KafkaExplorerPortfolio() {
   const handleOpenLink = useCallback(() => {
     setIncomingLink(null);
     setIsOpenLinkOpen(true);
+  }, []);
+
+  const handleRevealCrashLog = useCallback(() => {
+    api.revealPanicLog().catch((e) => {
+      console.error('Failed to reveal the panic log', e);
+      toast.error(describeError(e));
+    });
   }, []);
 
   /**
@@ -1387,14 +1508,22 @@ export function KafkaExplorerPortfolio() {
         onOpenFavorites={handleOpenFavorites}
         onProduce={handleOpenProduce}
         onOpenLink={handleOpenLink}
+        crashLog={crashLog}
+        onRevealCrashLog={handleRevealCrashLog}
       />
 
       <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">
         <TopicsPanel
           topics={topics}
+          // Чьи это топики. Сменилась учётка — сменился и список: под другими
+          // ACL видно другое, и прежний запрос в поле поиска относится уже не
+          // к тому, что в нём лежит.
+          scope={connectedClusterId && `${connectedClusterId}:${connectedUserId ?? ''}`}
           selectedTopic={selectedTopic}
           onTopicSelect={handleSelectTopic}
           onTopicInfo={handleTopicInfo}
+          favoriteTopics={favoriteTopicNames}
+          onToggleFavorite={handleToggleFavoriteTopic}
         />
 
         <div className="flex-1 min-h-0 flex flex-col h-full">
@@ -1417,7 +1546,7 @@ export function KafkaExplorerPortfolio() {
                 // is already in progress") — кнопку не предлагаем вовсе.
                 isLoadingMore={isLoadingMore || isLoadingMessages || isSearching}
                 onLoadMore={handleLoadMore}
-                hasFilter={filters.key.trim() !== '' || filters.value.trim() !== ''}
+                hasFilter={hasQuery(filters)}
                 isSearching={isSearching}
                 searchedBuffer={searchedBuffer}
                 scope={stats}
@@ -1534,6 +1663,9 @@ export function KafkaExplorerPortfolio() {
         onCreateNew={handleCreateNewCluster}
         onEditCluster={handleEditCluster}
         onConnectToCluster={handleConnectToCluster}
+        onDisconnect={() => {
+          disconnect().then(() => toast.info('Disconnected'));
+        }}
       />
 
       <ClusterConfigModal

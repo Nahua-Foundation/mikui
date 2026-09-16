@@ -59,8 +59,7 @@ impl Linked {
     /// Собирает схему из реестра: корень плюс тексты схем, на которые он
     /// ссылается через `references`.
     pub fn parse_with_refs(text: &str, refs: &[String]) -> Result<Self, String> {
-        let (root, rest) =
-            Schema::parse_str_with_list(text, refs).map_err(|e| format!("{e}"))?;
+        let (root, rest) = Schema::parse_str_with_list(text, refs).map_err(|e| format!("{e}"))?;
         let mut schemas = Vec::with_capacity(rest.len() + 1);
         schemas.push(root);
         schemas.extend(rest);
@@ -254,7 +253,10 @@ fn collect_enum_values(
         // ветки enum за ссылкой остался бы неизвестен.
         Schema::Ref { name } => {
             let wanted = name.fullname(None);
-            if let Some(target) = all.iter().find(|s| full_name(s).is_some_and(|n| n == wanted)) {
+            if let Some(target) = all
+                .iter()
+                .find(|s| full_name(s).is_some_and(|n| n == wanted))
+            {
                 collect_enum_values(target, all, seen, out);
             }
         }
@@ -339,7 +341,10 @@ mod tests {
             "fields": [{"name": "total", "type": "common.Money"}]
         }"#;
         let error = Linked::parse_files(&[order.to_string()], None).unwrap_err();
-        assert!(error.contains("Money"), "ошибка должна называть недостающий тип: {error}");
+        assert!(
+            error.contains("Money"),
+            "ошибка должна называть недостающий тип: {error}"
+        );
     }
 
     #[test]
@@ -373,7 +378,10 @@ mod tests {
                 .unwrap();
         let bytes = linked.encode(json).unwrap();
         let text = linked.decode(&bytes).unwrap().to_string();
-        assert!(text.starts_with(r#"{"id":"a","kind":"CLICK","tags":[]"#), "{text}");
+        assert!(
+            text.starts_with(r#"{"id":"a","kind":"CLICK","tags":[]"#),
+            "{text}"
+        );
     }
 
     /// Enum печатается обычной строкой в кавычках, и отличить его от значения
@@ -390,9 +398,11 @@ mod tests {
             "type": "record", "name": "Customer", "namespace": "demo",
             "fields": [{"name": "tier", "type": "demo.Tier"}]
         }"#;
-        let linked =
-            Linked::parse_files(&[customer.to_string(), tier.to_string()], Some("demo.Customer"))
-                .unwrap();
+        let linked = Linked::parse_files(
+            &[customer.to_string(), tier.to_string()],
+            Some("demo.Customer"),
+        )
+        .unwrap();
         assert_eq!(linked.enum_values(), ["BASIC", "GOLD"]);
     }
 

@@ -11,6 +11,8 @@ import {
   ClusterConnectPayload,
   ClusterUser,
   FavoritesView,
+  FavoriteTopics,
+  FAVORITE_TOPICS_KEY,
   FullMessage,
   KafkaCluster,
   LoadMoreParams,
@@ -29,6 +31,7 @@ import {
   SchemaRegistryConfig,
   SaveFavoriteResult,
   Settings,
+  parseFavoriteTopics,
   ShareRequest,
   Topic,
   TopicDetails,
@@ -128,6 +131,44 @@ export const deleteClusterUser = (clusterId: string, userId: string) =>
 
 export const getSettings = () => invoke<Settings>('get_settings');
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
+
+// --- Диагностика ------------------------------------------------------------
+
+/** Путь к журналу паник, если приложение когда-нибудь падало. */
+export const panicLog = () => invoke<string | null>('panic_log');
+
+/** Показать журнал паник в файловом менеджере, чтобы его можно было прислать. */
+export const revealPanicLog = () => invoke<void>('reveal_panic_log');
+
+export const loadFavoriteTopics = async (): Promise<FavoriteTopics> =>
+  parseFavoriteTopics((await getSettings())[FAVORITE_TOPICS_KEY]);
+
+/**
+ * Очередь записей избранного. Каждая запись — это «прочитать файл, подменить
+ * один ключ, записать обратно», и две таких внахлёст разъезжаются: звезду
+ * ставят кликом, клики идут подряд, а какая из двух записей ляжет на диск
+ * последней, порядок кликов не решает. Вторая ждёт первую, и читает уже
+ * записанное ею.
+ */
+let favoritesWrite: Promise<void> = Promise.resolve();
+
+/**
+ * Записывает избранное, сохраняя остальные настройки.
+ *
+ * Файл перечитывается прямо перед записью, а не берётся из того, что фронт
+ * прочитал при старте: `save_settings` пишет файл целиком, и снимок недельной
+ * давности затёр бы всё, что появилось в нём после.
+ */
+export const saveFavoriteTopics = (favorites: FavoriteTopics): Promise<void> => {
+  // Хвост очереди — всегда успешный: неудача одной записи не должна ронять
+  // следующую, у той свои данные и своя причина не получиться.
+  const write = favoritesWrite.then(async () => {
+    const settings = await getSettings();
+    await saveSettings({ ...settings, [FAVORITE_TOPICS_KEY]: favorites });
+  });
+  favoritesWrite = write.catch(() => {});
+  return write;
+};
 
 // --- Топики и сообщения -----------------------------------------------------
 

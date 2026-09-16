@@ -237,8 +237,7 @@ fn sniff(body: &[u8]) -> Option<Lens> {
     if contains(body, b"\"payload\"") && contains(body, b"\"schema\"") {
         return Some(Lens::Connect);
     }
-    if contains(body, b"\"op\"")
-        && (contains(body, b"\"before\"") || contains(body, b"\"after\""))
+    if contains(body, b"\"op\"") && (contains(body, b"\"before\"") || contains(body, b"\"after\""))
     {
         return Some(Lens::Debezium);
     }
@@ -299,9 +298,8 @@ mod tests {
     /// видна только под ним.
     #[test]
     fn debezium_inside_a_connect_envelope_is_still_debezium() {
-        let body = format!(
-            r#"{{"schema": {{"type": "struct", "fields": []}}, "payload": {DEBEZIUM}}}"#
-        );
+        let body =
+            format!(r#"{{"schema": {{"type": "struct", "fields": []}}, "payload": {DEBEZIUM}}}"#);
         let out = auto(&body);
         assert_eq!(out.tag.as_deref(), Some("c"));
         assert_eq!(out.preview.as_deref(), Some(r#"{"id":1,"name":"first"}"#));

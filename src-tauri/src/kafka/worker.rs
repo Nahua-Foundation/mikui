@@ -66,13 +66,13 @@ use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
 use rdkafka::client::ClientContext;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{BaseProducer, BaseRecord, DeliveryResult, ProducerContext};
-use rdkafka::topic_partition_list::TopicPartitionList;
-use rdkafka::Offset;
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::statistics::Statistics;
+use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::types::RDKafkaRespErr;
+use rdkafka::Offset;
 use tokio::sync::oneshot;
 
 use super::filter::Needle;
@@ -617,21 +617,98 @@ pub enum Command {
     CloseTopic(Reply<()>),
 }
 
-/// Ручка воркера. Кладётся в Tauri state; `Sender` начиная с Rust 1.72
-/// является `Sync`, поэтому обёртка в мьютекс не нужна.
-pub struct WorkerHandle {
+/// Воркер упал и поднят заново.
+///
+/// Событием, а не только ответом на команду: ответ достаётся ровно тому
+/// вызову, который заметил смерть, а подключение потеряно у ВСЕГО приложения.
+/// Без этого шапка продолжала бы показывать кластер подключённым, а список
+/// топиков — топики, которых на новом воркере нет.
+pub const WORKER_RESTARTED: &str = "mikui://worker-restarted";
+
+/// Сколько ждать завершения потока, прежде чем считать его живым.
+/// Зачем это нужно — в `explain_missing_reply`.
+const DEATH_GRACE: Duration = Duration::from_millis(50);
+
+/// Что отвечаем, когда воркер упал и поднят заново.
+///
+/// Состояние с ним ушло целиком — подключение, открытый топик, арена, — и
+/// делать вид, что команда просто не удалась, нельзя: фронт повторил бы её на
+/// чистом воркере и получил бы пустую таблицу вместо объяснения. Поэтому текст
+/// говорит и что случилось, и что делать.
+fn worker_restarted() -> String {
+    // Именно свежий файл, а не папка: под рукой у человека оказывается ровно
+    // то, что нужно прислать, без выбора между двумя десятками падений.
+    match crate::diag::latest_crash() {
+        Some(path) => format!(
+            "kafka worker crashed and was restarted — reconnect to the cluster to continue. \
+             The stack trace is in {}; send it over and it will be fixed",
+            path.display()
+        ),
+        None => "kafka worker crashed and was restarted — reconnect to the cluster to continue"
+            .to_string(),
+    }
+}
+
+/// Живой воркер: канал к нему, его поток и номер поколения.
+struct Live {
+    /// Растёт на каждый перезапуск. По нему `restart` понимает, не поднял ли
+    /// воркер кто-то другой, пока мы обнаруживали смерть этого.
+    generation: u64,
     tx: Sender<Command>,
+    /// Только ради `is_finished`: по нему видно, воркер упал или ответ уронили
+    /// намеренно. Присоединяться к потоку мы не собираемся.
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn spawn_worker() -> Live {
+    let (tx, rx) = mpsc::channel();
+    let worker_tx = tx.clone();
+    let thread = std::thread::Builder::new()
+        .name("kafka-worker".into())
+        .spawn(move || Worker::new(worker_tx).run(rx))
+        .expect("failed to spawn kafka worker thread");
+    Live {
+        generation: 0,
+        tx,
+        thread,
+    }
+}
+
+/// Ручка воркера. Кладётся в Tauri state.
+///
+/// Мьютекс — не из-за `Sender` (он `Sync` начиная с Rust 1.72), а потому что
+/// воркер приходится ЗАМЕНЯТЬ: паника в его потоке оставляла приложение без
+/// воркера навсегда, и помогал только перезапуск.
+pub struct WorkerHandle {
+    live: Mutex<Live>,
+    /// Через что оповестить фронт о перезапуске.
+    ///
+    /// `OnceLock`, потому что ручка кладётся в state ДО того, как у приложения
+    /// появляется `AppHandle`: `manage` вызывается на билдере, `setup` — уже
+    /// после. Пока он не проставлен, перезапуск просто пройдёт молча — это
+    /// возможно только до первого кадра, когда и сообщать ещё некому.
+    app: std::sync::OnceLock<tauri::AppHandle>,
 }
 
 impl WorkerHandle {
     pub fn spawn() -> Self {
-        let (tx, rx) = mpsc::channel();
-        let worker_tx = tx.clone();
-        std::thread::Builder::new()
-            .name("kafka-worker".into())
-            .spawn(move || Worker::new(worker_tx).run(rx))
-            .expect("failed to spawn kafka worker thread");
-        Self { tx }
+        Self {
+            live: Mutex::new(spawn_worker()),
+            app: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Даёт ручке связь с окном. Зовётся из `setup`, один раз.
+    pub fn attach(&self, app: tauri::AppHandle) {
+        let _ = self.app.set(app);
+    }
+
+    /// Отравленный мьютекс здесь ничего не значит: под ним лежат счётчик,
+    /// канал и хендл потока, и паника, случившаяся у кого-то под локом, их не
+    /// портит. А отказ работать из-за чужой паники — ровно та беда, от которой
+    /// этот тип и заведён.
+    fn live(&self) -> std::sync::MutexGuard<'_, Live> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Отправляет команду и ждёт ответ, не занимая поток исполнителя.
@@ -640,12 +717,91 @@ impl WorkerHandle {
         F: FnOnce(Reply<T>) -> Command,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(make(reply_tx))
-            .map_err(|_| "kafka worker is gone".to_string())?;
-        reply_rx
-            .await
-            .map_err(|_| "kafka worker dropped the reply".to_string())
+        let (generation, tx) = {
+            let live = self.live();
+            (live.generation, live.tx.clone())
+        };
+
+        // Канал закрыт — поток воркера уже завершился.
+        if tx.send(make(reply_tx)).is_err() {
+            return Err(self.restart(generation));
+        }
+
+        match reply_rx.await {
+            Ok(value) => Ok(value),
+            Err(_) => Err(self.explain_missing_reply(generation).await),
+        }
+    }
+
+    /// Ответ не пришёл — надо понять, паника это или намеренная отмена.
+    ///
+    /// Различать обязательно. Живой воркер роняет `reply` сам, когда чтение
+    /// стало ненужным, — так отменяется предыдущее чтение при смене топика
+    /// (см. `READ_SUPERSEDED`). Считать это падением значило бы убивать
+    /// здорового воркера на каждом переключении.
+    ///
+    /// Отсрочка — из-за порядка событий при панике. `reply` уносится на ПЕРВЫХ
+    /// кадрах раскрутки, а `is_finished` становится истиной только после
+    /// последнего; между этими моментами микросекунды, но ждущая задача успевает
+    /// проснуться внутри них. Без ожидания падение иногда читалось бы как
+    /// намеренная отмена, и воркер поднимался бы только со следующей командой —
+    /// то есть ровно в случае «нажал кнопку и смотрю» выглядело бы поломкой.
+    ///
+    /// Ждём уступая процессор, а не занимая его: поток тут не при чём, ждём мы
+    /// ЧУЖОЙ поток, и ему как раз надо дать досчитать. Полную отсрочку
+    /// выбирает только намеренная отмена, которой в сегодняшнем коде нет ни
+    /// одной — все ветки отвечают явно.
+    async fn explain_missing_reply(&self, generation: u64) -> String {
+        let deadline = Instant::now() + DEATH_GRACE;
+        loop {
+            {
+                let live = self.live();
+                // Сменившееся поколение — это «его уже подняли без нас»: наш
+                // ответ унесло вместе с прежним потоком.
+                if live.generation != generation || live.thread.is_finished() {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                return "the worker dropped the reply".to_string();
+            }
+            tokio::task::yield_now().await;
+        }
+        // Лок здесь уже отпущен: `restart` берёт его сам.
+        self.restart(generation)
+    }
+
+    /// Поднимает воркер заново — но только если умерший всё ещё числится
+    /// текущим.
+    ///
+    /// Сверка поколений не педантизм: команды идут параллельно, и на одну
+    /// панику смерть обнаружат сразу несколько. Без неё каждая поднимала бы
+    /// своего воркера, а лишние остались бы висеть навсегда — поток воркера
+    /// держит копию собственного `Sender`, поэтому сам по себе из `recv` он не
+    /// выйдет никогда.
+    fn restart(&self, dead: u64) -> String {
+        let replaced = {
+            let mut live = self.live();
+            let mine = live.generation == dead;
+            if mine {
+                eprintln!("[worker] kafka worker died, starting a new one");
+                let next = live.generation.wrapping_add(1);
+                *live = spawn_worker();
+                live.generation = next;
+            }
+            mine
+        };
+
+        // Оповещаем один раз на перезапуск, а не на каждого заметившего: лок к
+        // этому моменту отпущен, и обработчик на фронте сбрасывает состояние
+        // подключения, не гоняя его туда-обратно на каждую упавшую команду.
+        if replaced {
+            if let Some(app) = self.app.get() {
+                use tauri::Emitter;
+                let _ = app.emit(WORKER_RESTARTED, ());
+            }
+        }
+        worker_restarted()
     }
 }
 
@@ -805,9 +961,10 @@ fn next_window(
         }
         None => ceiling,
     };
-    target
-        .min(ceiling)
-        .clamp(floor.clamp(MIN_ROUND_CHUNK, MAX_WINDOW_FLOOR), MAX_ROUND_CHUNK)
+    target.min(ceiling).clamp(
+        floor.clamp(MIN_ROUND_CHUNK, MAX_WINDOW_FLOOR),
+        MAX_ROUND_CHUNK,
+    )
 }
 
 /// Ниже какого окна ужиматься не просто бесполезно, а ВРЕДНО.
@@ -845,7 +1002,10 @@ fn window_floor(kept_per_offset: Option<f64>) -> i64 {
 /// Дубликаты убираются: одна и та же партиция, прицепленная к очереди дважды,
 /// — это `consume_start` поверх уже открытой, то есть ошибка librdkafka на
 /// ровном месте.
-fn selected_partitions(selected: Option<&[i32]>, partition_count: usize) -> Result<Vec<i32>, String> {
+fn selected_partitions(
+    selected: Option<&[i32]>,
+    partition_count: usize,
+) -> Result<Vec<i32>, String> {
     let all = || (0..partition_count as i32).collect::<Vec<i32>>();
     let Some(selected) = selected.filter(|s| !s.is_empty()) else {
         return Ok(all());
@@ -1046,6 +1206,36 @@ struct Worker {
     /// Что делать с конвертом Debezium/Connect в строке таблицы. Приезжает той
     /// же командой и живёт по тем же правилам.
     lens: LensMode,
+}
+
+/// Разбирает воркер в порядке, обратном зависимости: сначала чтение, потом
+/// клиент.
+///
+/// Поля дропаются в порядке объявления, а объявлен `consumer` вторым —
+/// задолго до `pending_read`. Для сырых указателей внутри чтения этот порядок
+/// ровно обратный нужному: `RawTopic` и `RawQueue` выданы `rd_kafka_t*` этого
+/// самого консьюмера, и после `rd_kafka_destroy` их собственные
+/// `rd_kafka_topic_destroy`/`rd_kafka_queue_destroy` уходят в освобождённую
+/// память. Процесс на этом умирает целиком — не паникой, которую можно
+/// поймать и пережить, а сигналом.
+///
+/// В `connect` и `disconnect` тот же порядок выставлен руками (см. комментарий
+/// там), но есть путь, где руками его не выставить: РАСКРУТКА СТЕКА. Паника
+/// воркера обязана оставаться в его потоке — на этом держится всё
+/// пересоздание, — а до этой правки паника посреди чтения уносила приложение:
+/// журнал падения успевал записаться (хук зовётся до раскрутки), и сразу за
+/// ним процесс получал сигнал уже в чужом коде. Без открытого топика
+/// (`pending_read: None`) висеть нечему, поэтому на пустом воркере паника
+/// вела себя правильно — из-за этого и выглядело, будто дело в самой панике.
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // `consume_stop` здесь, в отличие от `close_topic`, нарочно не
+        // зовётся: он ждёт подтверждения от брокерского потока и под квотой
+        // стоит секундами, а сюда мы приходим в том числе посреди раскрутки
+        // паники. Незакрытые партиции снимет `rd_kafka_destroy` — он на то и
+        // есть, чтобы снести клиент со всем, что на нём открыто.
+        drop(self.pending_read.take());
+    }
 }
 
 impl Worker {
@@ -2102,7 +2292,12 @@ impl Worker {
             // раньше запрошенного момента в партиции нет. Значение отбрасываем,
             // а что оно означает, решает вызывающий: для нижней границы это
             // «брать нечего», для верхней — «читать до конца».
-            .filter_map(|e| e.offset().to_raw().filter(|o| *o >= 0).map(|o| (e.partition(), o)))
+            .filter_map(|e| {
+                e.offset()
+                    .to_raw()
+                    .filter(|o| *o >= 0)
+                    .map(|o| (e.partition(), o))
+            })
             .collect())
     }
 
@@ -2332,19 +2527,24 @@ impl Worker {
                     // Сито стоит ПОСЛЕ учёта и ДО арены: непопавшее в топике
                     // было, а в буфере его не будет.
                     if let Some(sieve) = &sieve {
-                        if !sieve.filter.matches(key, value, sieve.decoder.as_deref()) {
+                        // Уже разобранные заголовки, разложенные в ту же
+                        // последовательность кусков, что отдаёт арена
+                        // (`MessageStore::header_chunks`): имя, значение, имя…
+                        // Сито и просев буфера обязаны видеть одно и то же.
+                        let chunks = headers
+                            .iter()
+                            .flat_map(|(name, value)| [name.as_bytes(), *value]);
+                        if !sieve
+                            .filter
+                            .matches(key, value, chunks, sieve.decoder.as_deref())
+                        {
                             continue;
                         }
                     }
 
-                    let stored = self.store.push(
-                        msg.partition(),
-                        msg.offset(),
-                        ts,
-                        key,
-                        value,
-                        &headers,
-                    );
+                    let stored =
+                        self.store
+                            .push(msg.partition(), msg.offset(), ts, key, value, &headers);
                     if !stored {
                         eprintln!(
                             "[step_reading] {} buffer budget hit at {} messages",
@@ -2926,7 +3126,10 @@ impl Worker {
 /// Разобранный запрос: иглы готовятся один раз на проход по буферу, а не на
 /// каждое сообщение.
 struct PreparedFilter {
+    /// Запрос «где угодно»: подходит совпадение в любом из полей.
+    anywhere: Needle,
     key: Needle,
+    headers: Needle,
     value: Needle,
     /// Разбирать ли тело перед поиском. Флаг фронта сам по себе ничего не
     /// значит — без схемы разбирать нечем.
@@ -2936,42 +3139,74 @@ struct PreparedFilter {
 impl PreparedFilter {
     fn new(filter: &MessageFilter, has_decoder: bool) -> Self {
         Self {
+            anywhere: Needle::new(&filter.anywhere, filter.case_sensitive),
             key: Needle::new(&filter.key, filter.case_sensitive),
+            headers: Needle::new(&filter.headers, filter.case_sensitive),
             value: Needle::new(&filter.value, filter.case_sensitive),
             decode_value: filter.search_decoded && has_decoder,
         }
     }
 
-    /// Пусты ли обе иглы, то есть «не фильтровать».
+    /// Пусты ли все иглы, то есть «не фильтровать».
     ///
     /// `search_decoded` сюда намеренно не входит: он задаёт, ГДЕ искать, а не
     /// ЧТО. Учитывать его значило бы на голом флаге с пустыми иглами уйти в
     /// медленный путь по всему буферу с запросом, который и так совпадает со
     /// всем подряд.
     fn is_empty(&self) -> bool {
-        self.key.is_empty() && self.value.is_empty()
+        self.anywhere.is_empty()
+            && self.key.is_empty()
+            && self.headers.is_empty()
+            && self.value.is_empty()
     }
 
-    fn matches(&self, key: &[u8], value: &[u8], decoder: Option<&Decoder>) -> bool {
+    /// Подходит ли сообщение. Заполненные поля соединяются И: каждое из них —
+    /// отдельное требование, и сузить отбор вторым полем должно быть можно.
+    fn matches<'a>(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        mut headers: impl Iterator<Item = &'a [u8]> + Clone,
+        decoder: Option<&Decoder>,
+    ) -> bool {
         // Ключ ищем только по сырым байтам: он не protobuf, разбирать нечего.
         if !self.key.matches(key) {
             return false;
         }
-        if self.value.matches(value) {
+        if !self.headers.is_empty() && !headers.clone().any(|c| self.headers.matches(c)) {
+            return false;
+        }
+        if !self.value.is_empty() && !self.body_matches(&self.value, value, decoder) {
+            return false;
+        }
+        if self.anywhere.is_empty() {
             return true;
         }
-        // Сначала сырые байты, декодирование — только на промахе. Строковые
-        // поля protobuf лежат на проводе непрерывным UTF-8 и находятся без
-        // разбора, поэтому обычный запрос по содержимому не платит за декодер
-        // вовсе; платит только настоящий промах или запрос по имени поля.
-        //
-        // Это важно: `SetFilter` пересобирает представление на каждое нажатие
-        // клавиши, и полный разбор буфера там встал бы поперёк того же потока,
-        // который отдаёт окна на экран.
+        // Порядок здесь — от дешёвого к дорогому: ключ короткий, заголовков
+        // единицы, тело может оказаться мегабайтом, а декодирование его же
+        // стоит дороже всего остального вместе.
+        self.anywhere.matches(key)
+            || headers.any(|chunk| self.anywhere.matches(chunk))
+            || self.body_matches(&self.anywhere, value, decoder)
+    }
+
+    /// Поиск по телу: сначала по сырым байтам, разбор — только на промахе.
+    ///
+    /// Строковые поля protobuf лежат на проводе непрерывным UTF-8 и находятся
+    /// без разбора, поэтому обычный запрос по содержимому не платит за декодер
+    /// вовсе; платит только настоящий промах или запрос по имени поля.
+    ///
+    /// Это важно: `SetFilter` пересобирает представление на каждое нажатие
+    /// клавиши, и полный разбор буфера там встал бы поперёк того же потока,
+    /// который отдаёт окна на экран.
+    fn body_matches(&self, needle: &Needle, value: &[u8], decoder: Option<&Decoder>) -> bool {
+        if needle.matches(value) {
+            return true;
+        }
         self.decode_value
             && decoder.is_some_and(|d| {
                 d.decode(value)
-                    .is_ok_and(|json| self.value.matches(json.as_bytes()))
+                    .is_ok_and(|json| needle.matches(json.as_bytes()))
             })
     }
 }
@@ -3017,7 +3252,12 @@ fn append_view(
     view: &mut Vec<u32>,
 ) {
     for i in from..store.committed_len() {
-        if prepared.matches(store.key(i), store.value(i), decoder) {
+        if prepared.matches(
+            store.key(i),
+            store.value(i),
+            store.header_chunks(i),
+            decoder,
+        ) {
             view.push(i as u32);
         }
     }
@@ -3290,7 +3530,10 @@ mod tests {
         // Начало раньше retention — читаем с реального начала.
         assert_eq!(intersect(100, 1000, Some(0), None), (100, 1000));
         // Конец за горизонтом — читаем до реального конца.
-        assert_eq!(intersect(100, 1000, None, exclusive(Some(i64::MAX))), (100, 1000));
+        assert_eq!(
+            intersect(100, 1000, None, exclusive(Some(i64::MAX))),
+            (100, 1000)
+        );
         // Диапазон целиком мимо партиции — пусто, но без паники и переполнений.
         assert_eq!(intersect(100, 1000, Some(5000), None), (5000, 5000));
         assert_eq!(intersect(100, 1000, None, exclusive(Some(10))), (100, 100));
@@ -3480,7 +3723,10 @@ mod tests {
     #[test]
     fn window_splits_the_quota_across_partitions() {
         let est = estimate(2_000_000.0, 1_000.0);
-        assert!(next_window(10_000, est, 16, QUICK, NO_FLOOR) < next_window(10_000, est, 4, QUICK, NO_FLOOR));
+        assert!(
+            next_window(10_000, est, 16, QUICK, NO_FLOOR)
+                < next_window(10_000, est, 4, QUICK, NO_FLOOR)
+        );
     }
 
     /// Именно это и сломалось на кластере с квотой: пока измеритель не набрал
@@ -3564,7 +3810,10 @@ mod tests {
         let floor = window_floor(Some(8_000.0));
 
         let unbounded = next_window(10, collapsed, 8, QUICK, NO_FLOOR);
-        assert_eq!(unbounded, MIN_ROUND_CHUNK, "формула сама по себе схлопывается");
+        assert_eq!(
+            unbounded, MIN_ROUND_CHUNK,
+            "формула сама по себе схлопывается"
+        );
 
         let bounded = next_window(10, collapsed, 8, QUICK, floor);
         assert_eq!(bounded, floor);
@@ -3660,9 +3909,28 @@ mod tests {
         MessageFilter {
             key: key.to_string(),
             value: value.to_string(),
-            case_sensitive: false,
-            search_decoded: false,
+            ..MessageFilter::default()
         }
+    }
+
+    /// Ключ, тело и заголовки одного сообщения.
+    type HeaderRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a [u8])]);
+
+    /// Стор с заголовками — для запросов по ним и по «где угодно».
+    fn store_with_headers(rows: &[HeaderRow]) -> MessageStore {
+        let mut store = MessageStore::new(1 << 20);
+        for (i, (key, value, headers)) in rows.iter().enumerate() {
+            assert!(store.push(
+                0,
+                i as i64,
+                i as i64,
+                key.as_bytes(),
+                value.as_bytes(),
+                headers
+            ));
+        }
+        store.commit_all();
+        store
     }
 
     fn view_of(
@@ -3711,6 +3979,80 @@ mod tests {
         assert_eq!(view_of(&store, &filter_of("КЛИЕНТ", ""), None), vec![0, 1]);
         assert_eq!(view_of(&store, &filter_of("", "сбербанк"), None), vec![0]);
         assert_eq!(view_of(&store, &filter_of("", "газпром"), None), vec![1]);
+    }
+
+    // --- Заголовки и «где угодно» --------------------------------------------
+
+    /// Строки для обоих тестов ниже: у каждого сообщения своё место, где
+    /// лежит слово `trace` — в ключе, в имени заголовка, в его значении и в
+    /// теле. Так видно, что поиск смотрит именно туда, куда обещает.
+    fn headers_rows() -> Vec<HeaderRow<'static>> {
+        vec![
+            ("trace-in-key", "body-0", &[]),
+            ("k1", "body-1", &[("x-trace-id", b"abc")]),
+            ("k2", "body-2", &[("x-request-id", b"trace-42")]),
+            ("k3", "body-3-trace", &[("content-type", b"json")]),
+            ("k4", "body-4", &[("content-type", b"json")]),
+        ]
+    }
+
+    fn headers_filter(query: &str) -> MessageFilter {
+        MessageFilter {
+            headers: query.to_string(),
+            ..MessageFilter::default()
+        }
+    }
+
+    fn anywhere_filter(query: &str) -> MessageFilter {
+        MessageFilter {
+            anywhere: query.to_string(),
+            ..MessageFilter::default()
+        }
+    }
+
+    #[test]
+    fn the_headers_needle_matches_a_name_or_a_value() {
+        let store = store_with_headers(&headers_rows());
+
+        // Имя у первого, значение у второго. Ни ключ, ни тело здесь не
+        // считаются — для них свои поля.
+        let found = view_of(&store, &headers_filter("trace"), None);
+        assert_eq!(found, vec![1, 2]);
+
+        let found = view_of(&store, &headers_filter("content-type"), None);
+        assert_eq!(found, vec![3, 4]);
+
+        // Заголовков нет вовсе — совпасть нечему, но и падать не на чем.
+        assert!(view_of(&store, &headers_filter("anything"), None).is_empty());
+    }
+
+    #[test]
+    fn the_anywhere_needle_looks_at_key_headers_and_body() {
+        let store = store_with_headers(&headers_rows());
+
+        // Ключ, имя заголовка, значение заголовка, тело — все четыре места.
+        let found = view_of(&store, &anywhere_filter("trace"), None);
+        assert_eq!(found, vec![0, 1, 2, 3]);
+
+        assert!(view_of(&store, &anywhere_filter("нет-такого"), None).is_empty());
+    }
+
+    /// Заполненные поля соединяются И: второе поле обязано СУЖАТЬ отбор, иначе
+    /// прицельный поиск поверх общего не имел бы смысла.
+    #[test]
+    fn anywhere_and_the_aimed_needles_narrow_each_other() {
+        let store = store_with_headers(&headers_rows());
+
+        let mut filter = anywhere_filter("trace");
+        filter.key = "k3".to_string();
+        // Под «где угодно» подходили четыре строки; ключ оставил одну — ту, у
+        // которой `trace` в теле. Остальные три отпали, включая ту, у которой
+        // совпадение было как раз в ключе.
+        assert_eq!(view_of(&store, &filter, None), vec![3]);
+
+        filter.key = String::new();
+        filter.headers = "x-request-id".to_string();
+        assert_eq!(view_of(&store, &filter, None), vec![2]);
     }
 
     #[test]
@@ -3847,7 +4189,11 @@ mod tests {
         ];
         let directions = [SortDirection::Asc, SortDirection::Desc];
 
-        for filter in [filter_of("", ""), filter_of("", "alpha"), filter_of("КЛЮЧ-A", "")] {
+        for filter in [
+            filter_of("", ""),
+            filter_of("", "alpha"),
+            filter_of("КЛЮЧ-A", ""),
+        ] {
             for column in columns {
                 for direction in directions {
                     let sort = column.map(|column| SortSpec { column, direction });
@@ -3879,5 +4225,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Воркер с подключением и открытым чтением — но БЕЗ кластера.
+    ///
+    /// Кластер тут и не нужен: проверяется ниже одно — в каком порядке
+    /// освобождаются объекты клиента, и от брокера это не зависит вообще.
+    /// Список брокеров поэтому пустой: так librdkafka никуда и не пойдёт, а
+    /// её жалобы на недоступный адрес не осядут в выводе теста.
+    fn worker_mid_read() -> Worker {
+        let consumer: BaseConsumer<MeteredContext> = ClientConfig::new()
+            .set("bootstrap.servers", "")
+            // Своё «брокеров не задано» librdkafka печатает сама, ещё до
+            // того, как у клиента появится очередь событий, — порогом её и
+            // унимаем, иначе она будет в выводе каждого прогона.
+            .set("log_level", "3")
+            .create_with_context(MeteredContext {
+                meter: Arc::new(QuotaMeter::new()),
+                fatal: Arc::new(FatalError::default()),
+            })
+            .expect("клиент создаётся и без кластера");
+
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(tx);
+        worker.consumer = Some(consumer);
+
+        // Через тот же `open_handles`, которым их берёт настоящее чтение:
+        // указатели обязаны быть выданы именно этим консьюмером, иначе
+        // проверять нечего.
+        let (topic, queue) = worker.open_handles("mid-read").expect("хендлы топика");
+        // Партиция именно ЗАПУЩЕНА, и `consume_stop` для неё дальше не будет
+        // — так же, как при панике посреди чтения. Брокер для этого не нужен:
+        // `consume_start_queue` только ставит операцию в очередь партиции.
+        topic
+            .consume_start_queue(0, 0, &queue)
+            .expect("чтение партиции запускается и без брокера");
+        let (reply, _receiver) = oneshot::channel();
+        worker.pending_read = Some(PendingRead {
+            topic,
+            queue,
+            open_partitions: HashSet::from([0]),
+            phase: ReadPhase::Reading(HashMap::new()),
+            started: Instant::now(),
+            round_started: Instant::now(),
+            bytes_at_start: 0,
+            reply,
+            topic_name: "mid-read".to_string(),
+            round_mark: 0,
+            round_mark_bytes: 0,
+            budget: 1,
+            range: ReadRange::default(),
+            depth: ReadDepth::Window,
+            sieve: None,
+            round_scanned_bytes: 0,
+            round_scanned: 0,
+        });
+        worker
+    }
+
+    /// Воркер, разобранный посреди чтения, обязан пережить сам себя — см.
+    /// `Drop for Worker`.
+    ///
+    /// Сюда же приходит и паника воркера: раскрутка стека дропает `self` в
+    /// `run` ровно этим путём. Именно так приложение и умирало целиком —
+    /// журнал падения записывался, а следом процесс получал сигнал в
+    /// `rd_kafka_topic_destroy_final`, которая пишет в `rkt->rkt_rk` (снимает
+    /// топик со списка клиента), а клиента к тому моменту уже не было:
+    /// обратные указатели на `rd_kafka_t` в librdkafka не считаются ссылками
+    /// (`rkt_rk`/`rkq_rk` проставляются без `rd_kafka_keep`), так что клиент
+    /// уходит первым, ничего об открытых на нём хендлах не зная.
+    ///
+    /// Проверка тут грубая, тоньше не выйдет: неверный порядок — не ошибка,
+    /// которую можно вернуть и сравнить, а обращение в освобождённую память.
+    /// Тест либо доходит до конца, либо роняет весь тестовый бинарник —
+    /// проверено снятием `Drop`, падает так:
+    ///
+    /// ```text
+    /// Assertion failed: (r == 0), function rwlock_wrlock,
+    ///     file tinycthread_extra.c, line 181
+    /// (signal: 6, SIGABRT)
+    /// ```
+    ///
+    /// То есть тот самый симптом, только в CI, а не у пользователя.
+    #[test]
+    fn a_worker_torn_down_mid_read_outlives_its_client() {
+        let worker = worker_mid_read();
+        assert!(
+            worker.pending_read.is_some() && worker.consumer.is_some(),
+            "фикстура без чтения на живом клиенте ничего не проверяет"
+        );
+
+        drop(worker);
+
+        // Дожили — значит хендлы ушли раньше клиента. Заодно повторяем всё
+        // ещё раз: порча кучи первым проходом часто остаётся незамеченной, а
+        // на втором уже нет.
+        drop(worker_mid_read());
     }
 }

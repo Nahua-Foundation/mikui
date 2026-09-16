@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Label } from '../../ui/label';
 import { AvroSchema } from '../components/AvroSchema';
 import { JsonSchemaSettings } from '../components/JsonSchemaSettings';
+import { ProtoMessageSelect } from '../components/ProtoMessageSelect';
 import * as api from '../api';
 import { describeError } from '../api';
 import { BodyFormat, Topic, TopicSchema } from '../types';
@@ -39,6 +40,27 @@ const FORMATS: { value: BodyFormat; label: string }[] = [
   { value: 'hex', label: 'Hex' },
 ];
 
+/**
+ * Какой тип message показать, когда схема приехала с бэкенда.
+ *
+ * Сохранённый выбор — как есть. Если его нет, а в загруженных .proto объявлен
+ * ровно один тип, подставляется он: выбирать там не из чего, а без выбора тела
+ * не декодируются вовсе. Когда типов несколько, угадать нельзя — поле остаётся
+ * пустым, и тогда его требует `handleSave`.
+ */
+function chooseMessage(schema: TopicSchema | null): string | null {
+  const messages = schema?.messages ?? [];
+  if (schema?.message) {
+    // Пустой список — это «файлов нет вовсе», и судить по нему не о чем:
+    // сохранённый выбор остаётся, иначе открытие окна у топика с временно
+    // недоступными .proto стирало бы привязку. А вот если список есть и
+    // выбора в нём НЕТ, то тип из файла уехал — и держать имя, которого
+    // больше не существует, значит обещать декодирование, которого не будет.
+    if (messages.length === 0 || messages.includes(schema.message)) return schema.message;
+  }
+  return messages.length === 1 ? messages[0] : null;
+}
+
 export function TopicConfigModal({
   topic,
   cluster,
@@ -68,7 +90,7 @@ export function TopicConfigModal({
         if (cancelled) return;
         setSchema(loaded);
         setFormat(loaded?.format ?? 'json');
-        setMessage(loaded?.message ?? null);
+        setMessage(chooseMessage(loaded));
         if (loaded?.error) {
           toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
         }
@@ -90,16 +112,23 @@ export function TopicConfigModal({
    * не применил.
    */
   const applySchema = useCallback(
-    async (action: () => Promise<TopicSchema | null>, success: string) => {
+    async (
+      action: () => Promise<TopicSchema | null>,
+      // Функцией, а не строкой, ради одного случая: загрузка .proto может
+      // подтянуть файлы, которых пользователь не выбирал, и сказать об этом
+      // можно только по результату.
+      success: string | ((updated: TopicSchema | null) => string),
+    ) => {
       if (!cluster || !topicName) return;
       setBusy(true);
       try {
         const updated = await action();
         setSchema(updated);
         setFormat(updated?.format ?? 'json');
-        setMessage(updated?.message ?? null);
+        // Файл только что загрузили — если тип в нём один, он и выбран.
+        setMessage(chooseMessage(updated));
         onSchemaChanged?.(topicName, updated);
-        toast.success(success);
+        toast.success(typeof success === 'string' ? success : success(updated));
       } catch (e) {
         console.error('Schema operation failed', e);
         toast.error(describeError(e));
@@ -129,7 +158,15 @@ export function TopicConfigModal({
 
     await applySchema(
       () => api.addProtoFiles(cluster, topicName, paths),
-      `Loaded ${paths.length} .proto file${paths.length > 1 ? 's' : ''}`,
+      (updated) => {
+        const loaded = `Loaded ${paths.length} .proto file${paths.length > 1 ? 's' : ''}`;
+        // Подтянутое по импорту стоит назвать числом: пользователь выбрал один
+        // файл, а в списке их стало шесть, и молчать об этом незачем.
+        const pulled = (updated?.files ?? []).filter((f) => f.auto).length;
+        return pulled > 0
+          ? `${loaded}, ${pulled} more pulled in by imports`
+          : loaded;
+      },
     );
   }, [cluster, topicName, applySchema]);
 
@@ -172,6 +209,20 @@ export function TopicConfigModal({
 
   const files = schema?.files ?? [];
   const messages = schema?.messages ?? [];
+
+  /**
+   * Типов объявлено несколько, а выбор не сделан.
+   *
+   * Сохранять такую настройку незачем: без типа protobuf-тело не разобрать —
+   * в .proto нет ничего, что сказало бы, каким из объявленных сообщений
+   * записан топик. Раньше это сохранялось молча, и топик потом показывался
+   * текстом без внятной причины.
+   *
+   * Про «несколько» — потому что единственный тип подставляет `chooseMessage`,
+   * и пустым поле в этом случае не остаётся. Пустой список .proto тоже не
+   * повод запрещать: файлы можно добавить и позже, а формат назначить сейчас.
+   */
+  const needsMessage = format === 'proto' && messages.length > 1 && !message;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -235,10 +286,28 @@ export function TopicConfigModal({
                   <div className="max-h-40 overflow-auto rounded border border-edge divide-y divide-edge">
                     {files.map((file) => (
                       <div key={file.name} className="flex items-center gap-2 p-2">
-                        <FileText className="size-3.5 shrink-0 text-dim" />
+                        <FileText
+                          className={`size-3.5 shrink-0 ${file.auto ? 'text-dim/60' : 'text-dim'}`}
+                        />
                         <div className="min-w-0 flex-1">
-                          <div className="font-mono text-xs text-strong truncate">
-                            {file.name}
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <div
+                              className={`font-mono text-xs truncate ${file.auto ? 'text-soft' : 'text-strong'}`}
+                            >
+                              {file.name}
+                            </div>
+                            {/* Файл не выбирали — его нашли по import.
+                                Сказать об этом надо: иначе в списке появляются
+                                файлы, которых пользователь туда не кладл, и
+                                непонятно, откуда они и почему без кнопок. */}
+                            {file.auto && (
+                              <span
+                                className="shrink-0 font-mono text-[10px] text-dim border border-edge rounded px-1"
+                                title="Found by an import in the selected files"
+                              >
+                                import
+                              </span>
+                            )}
                           </div>
                           {/* Исходный путь: по нему работает «обновить», и
                               именно он отличает два одноимённых контракта. */}
@@ -246,24 +315,32 @@ export function TopicConfigModal({
                             {file.source}
                           </div>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleRefresh(file.name)}
-                          disabled={busy}
-                          className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                          title="Re-read this file from disk"
-                        >
-                          <RotateCw className="size-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleRemove(file.name)}
-                          disabled={busy}
-                          className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                          title="Remove this file"
-                        >
-                          <X className="size-3.5" />
-                        </button>
+                        {/* У зависимости кнопок нет. Перечитывать её отдельно
+                            незачем — она читается с диска заново при каждом
+                            изменении набора, — а удалить её нельзя: она
+                            держится импортом и уйдёт вместе с ним. */}
+                        {!file.auto && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleRefresh(file.name)}
+                              disabled={busy}
+                              className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                              title="Re-read this file from disk"
+                            >
+                              <RotateCw className="size-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRemove(file.name)}
+                              disabled={busy}
+                              className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                              title="Remove this file"
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -290,35 +367,20 @@ export function TopicConfigModal({
 
               <div className="space-y-2">
                 <Label className="font-mono text-sm text-soft">Message</Label>
-                <Select
-                  value={message ?? ''}
-                  onValueChange={setMessage}
-                  disabled={busy || messages.length === 0}
-                >
-                  <SelectTrigger className="bg-surface border-edge text-strong font-mono">
-                    <SelectValue
-                      placeholder={
-                        messages.length === 0 ? 'Load a .proto file first' : 'Choose a message'
-                      }
-                    />
-                  </SelectTrigger>
-                  <SelectContent className="bg-surface border-edge">
-                    {messages.map((name) => (
-                      <SelectItem
-                        key={name}
-                        value={name}
-                        className="text-strong font-mono focus:bg-edge"
-                      >
-                        {name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                {/* Без выбранного типа декодировать нечем, и тела поедут
-                    текстом — сказать об этом дешевле, чем дать гадать. */}
-                {messages.length > 1 && !message && (
+                <ProtoMessageSelect
+                  messages={messages}
+                  value={message}
+                  onChange={setMessage}
+                  disabled={busy}
+                />
+                {/* Незаполненное обязательное поле, а не совет: без типа
+                    декодировать нечем, и Save заблокирован. Сказать об этом
+                    здесь, у самого поля, дешевле, чем дать гадать, почему
+                    кнопка внизу не нажимается. */}
+                {needsMessage && (
                   <div className="font-mono text-xs text-dim">
-                    Pick the message this topic carries — bodies stay undecoded until you do.
+                    The loaded files declare {messages.length} messages — pick the one this topic
+                    carries. Saving is blocked until you do.
                   </div>
                 )}
               </div>
@@ -369,10 +431,15 @@ export function TopicConfigModal({
             >
               Cancel
             </Button>
+            {/* `disabled:pointer-events-auto` — ради подсказки: базовый класс
+                кнопки глушит выключенной события, а вместе с ними и `title`.
+                Нажатие от этого не появляется, выключенная кнопка событий
+                click не отдаёт. */}
             <Button
               onClick={handleSave}
-              disabled={busy || !cluster}
-              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono"
+              disabled={busy || !cluster || needsMessage}
+              title={needsMessage ? 'Pick the message type this topic carries first' : undefined}
+              className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:pointer-events-auto disabled:cursor-not-allowed"
             >
               Save
             </Button>

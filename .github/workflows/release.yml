@@ -165,14 +165,35 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # node 24 ради npm 11: на npm 10.9.8 из node 22 `npm ci` падал с
+      # «Exit handler never called!». Разбор — в ci.yml, там то же место и те
+      # же доводы.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
 
+      # С теми же оговорками, что в ci.yml: без похода за отчётом об
+      # уязвимостях и с повтором. Здесь это важнее вдвойне — упавший на
+      # установке зависимостей job оставляет релиз без файла для своей
+      # платформы, а тег уже опубликован.
       - name: Install frontend dependencies
-        run: npm ci
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --no-audit --no-fund \
+                 --fetch-retries 5 \
+                 --fetch-retry-mintimeout 20000 \
+                 --fetch-retry-maxtimeout 120000; then
+              exit 0
+            fi
+            echo "::warning::npm ci не удался (попытка ${attempt} из 3)"
+            rm -rf node_modules
+            sleep $((attempt * 10))
+          done
+          echo "::error::npm ci не удался три раза подряд"
+          exit 1
 
       # Linux и macOS идут через tauri-action: он собирает бандлы и сам
       # заливает их в релиз по release_id. Фронтенд соберётся

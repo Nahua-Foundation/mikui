@@ -1,6 +1,10 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 mod config;
+// Публичный ради интеграционного теста: обработчик паники глобальный и
+// ставится один раз на процесс, поэтому проверить его можно только в отдельном
+// тестовом бинарнике (`tests/panic_log.rs`), а тот видит лишь публичное.
+pub mod diag;
 mod favorites;
 mod helpers;
 mod kafka;
@@ -314,6 +318,33 @@ async fn delete_cluster_user(
     Ok(updated)
 }
 
+/// Самое свежее записанное падение, если оно было.
+///
+/// `None` — падений не было, и показывать пользователю нечего. Именно по
+/// файлам, а не по флагу в памяти: упавшее в прошлый запуск важно не меньше, а
+/// обычно больше — как раз его и просят прислать.
+#[tauri::command]
+async fn panic_log() -> Option<String> {
+    diag::latest_crash().map(|path| path.display().to_string())
+}
+
+/// Показывает журнал паник в файловом менеджере.
+///
+/// Открывается КАТАЛОГ с выделенным файлом, а не сам файл: `.log` в системе
+/// обычно ни на что не назначен, и «открыть» его — это либо диалог выбора
+/// программы, либо ничего. А из каталога файл можно перетащить в переписку —
+/// и заодно видно остальные падения, если пригодятся.
+#[tauri::command]
+async fn reveal_panic_log(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let path =
+        diag::latest_crash().ok_or("nothing has crashed yet — there is no log".to_string())?;
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("can't open the folder with the log: {e}"))
+}
+
 #[tauri::command]
 async fn get_settings(app: tauri::AppHandle) -> Result<Settings, String> {
     config::load_settings(&app)
@@ -557,10 +588,7 @@ fn schema_hint(view: TopicSchemaView) -> (Option<String>, Option<String>) {
 /// Куда ведёт ссылка на этой машине. Ошибка отсюда показывается человеку как
 /// есть — см. `link::no_such_connection`.
 #[tauri::command]
-async fn resolve_message_link(
-    app: tauri::AppHandle,
-    url: String,
-) -> Result<link::Target, String> {
+async fn resolve_message_link(app: tauri::AppHandle, url: String) -> Result<link::Target, String> {
     blocking(move || link::resolve(&url, &config::load_clusters(&app)?)).await
 }
 
@@ -898,10 +926,8 @@ async fn test_schema_registry(
     registry: SchemaRegistry,
     password: Option<String>,
 ) -> Result<usize, String> {
-    blocking(move || {
-        schema::test_registry(cluster_id.as_deref(), &registry, password.as_deref())
-    })
-    .await
+    blocking(move || schema::test_registry(cluster_id.as_deref(), &registry, password.as_deref()))
+        .await
 }
 
 #[tauri::command]
@@ -1071,13 +1097,13 @@ async fn produce_message(
         partition: request.partition,
         // Пустой ключ — это ОТСУТСТВИЕ ключа, а не ключ нулевой длины: от
         // разницы зависит и партиционирование, и compaction.
-        key: Some(request.key).filter(|k| !k.is_empty()).map(String::into_bytes),
+        key: Some(request.key)
+            .filter(|k| !k.is_empty())
+            .map(String::into_bytes),
         headers: request.headers,
         payload,
     };
-    worker
-        .call(|reply| Command::Produce(record, reply))
-        .await?
+    worker.call(|reply| Command::Produce(record, reply)).await?
 }
 
 // --- Сохранённые сообщения ----------------------------------------------------
@@ -1220,6 +1246,19 @@ pub fn run() {
             use tauri::{Emitter, Manager};
             use tauri_plugin_deep_link::DeepLinkExt;
 
+            // Первым делом: до этой строки паника уходит только в stderr,
+            // которого у собранного бандла нет. Раньше, чем здесь, поставить
+            // обработчик не получится — каталог настроек разрешает `app`.
+            match config::config_dir(app.handle()) {
+                Ok(dir) => diag::install(&dir),
+                Err(e) => eprintln!("can't set up the panic log: {e}"),
+            }
+
+            // Ручка воркера живёт в state с момента сборки билдера, то есть
+            // раньше, чем появляется `AppHandle`. Отдаём его сюда, чтобы
+            // перезапуск воркера мог позвать фронт.
+            app.state::<WorkerHandle>().attach(app.handle().clone());
+
             // Схему регистрирует система, а не приложение: на macOS — по
             // Info.plist собранного бандла, на Windows и Linux — установщик.
             // В отладочной сборке ни того, ни другого нет, поэтому под
@@ -1265,6 +1304,8 @@ pub fn run() {
             delete_cluster_user,
             get_settings,
             save_settings,
+            panic_log,
+            reveal_panic_log,
             get_topics,
             describe_topic,
             open_topic,

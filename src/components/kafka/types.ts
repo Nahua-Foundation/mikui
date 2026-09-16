@@ -197,7 +197,18 @@ export interface SavedMessage extends FullMessage {
 
 /** Применяется в Rust по сырым байтам, до пересечения границы IPC. */
 export interface MessageFilter {
+  /**
+   * Запрос из поля в шапке: совпадение где угодно — в ключе, в имени или
+   * значении заголовка, в теле.
+   *
+   * Отдельно от `value` затем, что поле в шапке одно, стоит на виду и читается
+   * как «найди это в сообщениях». Раньше оно искало только по телу и об этом
+   * молчало. Прицельные поля остались в панели фильтров.
+   */
+  anywhere: string;
   key: string;
+  /** Запрос по заголовкам: совпадением считается и имя, и значение. */
+  headers: string;
   value: string;
   case_sensitive: boolean;
   /** Искать ли по разобранному телу, а не только по сырым байтам. Осмысленно
@@ -207,11 +218,21 @@ export interface MessageFilter {
 }
 
 export const EMPTY_FILTER: MessageFilter = {
+  anywhere: '',
   key: '',
+  headers: '',
   value: '',
   case_sensitive: false,
   search_decoded: false,
 };
+
+/** Задан ли хоть один запрос. Флаги (регистр, разбор тела) сюда не входят: они
+ *  говорят, ГДЕ и КАК искать, а не ЧТО, и сами по себе ничего не отбирают. */
+export const hasQuery = (filter: MessageFilter): boolean =>
+  filter.anywhere.trim() !== '' ||
+  filter.key.trim() !== '' ||
+  filter.headers.trim() !== '' ||
+  filter.value.trim() !== '';
 
 /** Столбцы, по которым можно кликнуть заголовок и отсортировать таблицу. */
 export type SortColumn = 'partition' | 'offset' | 'key' | 'timestamp';
@@ -526,6 +547,15 @@ export interface SchemaFile {
   name: string;
   /** Откуда файл взяли. По нему работает «перечитать с диска». */
   source: string;
+  /**
+   * Файл не выбирали — его нашли по `import` в выбранном.
+   *
+   * Показывается отдельно от выбранного и без кнопок: удалять и перечитывать
+   * по одному можно то, что добавляли, а зависимости пересчитываются целиком
+   * при каждом изменении набора. Ключа может не быть — так выглядят схемы,
+   * сохранённые до появления поиска импортов, и там все файлы выбраны руками.
+   */
+  auto?: boolean;
 }
 
 /**
@@ -712,10 +742,40 @@ export interface PayloadIssue {
   message: string;
 }
 
-/** Файл настроек. Своих полей пока нет — see config/types.rs. */
+/** Файл настроек. Rust о его содержимом ничего не знает и возвращает
+ *  незнакомые ключи нетронутыми — see config/types.rs. */
 export interface Settings {
   version: number;
   [key: string]: unknown;
+}
+
+/** Ключ в settings.json, под которым лежит избранное. */
+export const FAVORITE_TOPICS_KEY = 'favorite_topics';
+
+/**
+ * Избранные топики: ключ кластера (`clusterKey`) → имена топиков.
+ *
+ * По кластерам, а не общим списком: одноимённые топики в dev и prod — разные
+ * топики, и отметка на одном не имеет отношения к другому. Тот же довод, что
+ * и у привязки схем.
+ */
+export type FavoriteTopics = Record<string, string[]>;
+
+/**
+ * Разбирает избранное из настроек, отбрасывая всё, что не похоже на список
+ * имён.
+ *
+ * Файл лежит на диске рядом с подключениями, его правят руками, и одна
+ * испорченная запись не должна лишать избранного остальные кластеры.
+ */
+export function parseFavoriteTopics(value: unknown): FavoriteTopics {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const parsed: FavoriteTopics = {};
+  for (const [cluster, names] of Object.entries(value as Record<string, unknown>)) {
+    if (!Array.isArray(names)) continue;
+    parsed[cluster] = names.filter((name): name is string => typeof name === 'string');
+  }
+  return parsed;
 }
 
 // --- Ссылка на сообщение -------------------------------------------------------
