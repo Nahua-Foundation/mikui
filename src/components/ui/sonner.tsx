@@ -3,7 +3,7 @@
 import { createPortal } from "react-dom";
 import { Toaster as Sonner, ToasterProps } from "sonner";
 import { useTheme } from "../../theme";
-import { useTrackpadToastSwipe } from "./toast-swipe";
+import { useToastGestures } from "./toast-gestures";
 
 /**
  * Тост берёт тему у приложения, а не держит свою.
@@ -52,8 +52,10 @@ import { useTrackpadToastSwipe } from "./toast-swipe";
  */
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme } = useTheme();
-  // Смахивание двумя пальцами по трекпаду — своего у sonner нет, см. хук.
-  useTrackpadToastSwipe();
+  // Смахивание двумя пальцами по трекпаду (своего у sonner нет), защита от
+  // того, чтобы жест по тосту читался приложением как «клик мимо», и развязка
+  // выделения текста со смахиванием мышью. См. хук.
+  useToastGestures();
   // В `body`, а не туда, где `<Toaster/>` стоит в дереве: внутри `#root` он
   // заперт в чужом контексте наложения — см. объяснение выше.
   return createPortal(
@@ -62,7 +64,15 @@ const Toaster = ({ ...props }: ToasterProps) => {
       className="toaster group"
       toastOptions={{
         classNames: {
-          toast: "pointer-events-auto",
+          // `grab` — только там, где за тост и правда можно взяться мышью:
+          // текст ниже забирает нажатие себе, а несмахиваемому тосту хватать
+          // себя нечем. `cursor` наследуется, поэтому у текста свой.
+          toast:
+            "pointer-events-auto data-[dismissible=true]:cursor-grab data-[swiping=true]:cursor-grabbing",
+          // Выделяется и копируется — ради сообщений об ошибках. Чтобы
+          // выделение не спорило со смахиванием, см. пункт 3 в `toast-gestures`.
+          title: "cursor-text select-text",
+          description: "cursor-text select-text",
           // `!` обязателен у обоих: базовое правило sonner задаёт `border`
           // одной строкой из двух атрибутных селекторов, и одиночному классу
           // Tailwind оно не уступает. Ширина и цвет — разные longhand-свойства,
@@ -83,7 +93,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
       {...props}
     />,
     // Узел важен не только для слоёв: в него React делегирует события портала,
-    // и на него же рассчитывает заслонка в `useTrackpadToastSwipe`. Менять —
+    // и на него же рассчитывает заслонка в `useToastGestures`. Менять —
     // вместе с ней.
     document.body,
   );
