@@ -146,19 +146,30 @@ impl MessageStore {
     /// случая: раунд чтения оборвался на середине (дедлайн, переполнение
     /// буфера), и его добыча — дырявое окно, которое нельзя ни опубликовать,
     /// ни докатить. Дешевле выбросить и перечитать окно целиком.
+    /// Новая длина арены считается как САМЫЙ ДАЛЬНИЙ конец среди уцелевших
+    /// записей, а не как конец записи `len - 1`.
+    ///
+    /// Разница не умозрительная, на ней всё и ломалось. Записи ложатся в арену
+    /// последовательно, но `sort_staged` переставляет ИНДЕКС, не двигая
+    /// байтов, — и после первой же публикации запись `len - 1` вовсе не та,
+    /// чьи байты лежат последними. Граница по ней уезжала в середину арены и
+    /// отрезала тела уже опубликованных сообщений; следующее обращение к ним
+    /// падало на выходе за арену, роняло поток воркера, и дальше любая команда
+    /// отвечала «kafka worker is gone» до перезапуска приложения.
+    ///
+    /// Проход по уцелевшим стоит O(len) и случается только на оборванном
+    /// раунде. Он же отвечает верно и без всяких предположений о том, как
+    /// разложены байты, — в отличие от порядка индекса, который здесь и не
+    /// обязан ни с чем совпадать.
     pub fn truncate(&mut self, len: usize) {
         if len >= self.index.len() {
             return;
         }
-        // Сообщения кладутся в blob последовательно, а заголовки — последними
-        // в записи, поэтому конец записи `len - 1` и есть новая длина blob.
-        let blob_len = match len.checked_sub(1) {
-            Some(last) => {
-                let meta = &self.index[last];
-                meta.headers.start as usize + meta.headers.len as usize
-            }
-            None => 0,
-        };
+        let blob_len = self.index[..len]
+            .iter()
+            .map(|m| m.headers.start as usize + m.headers.len as usize)
+            .max()
+            .unwrap_or(0);
         self.index.truncate(len);
         self.blob.truncate(blob_len);
         self.committed = self.committed.min(len);
@@ -536,6 +547,44 @@ mod tests {
         assert!(push_simple(&mut store, 0, 99, 99));
         assert_eq!(store.value(4), b"value-99");
         assert_eq!(store.value(0), b"value-0");
+    }
+
+    /// Регрессия: обрыв раунда ПОСЛЕ того, как отстойник отсортировали.
+    ///
+    /// `sort_staged` переставляет только индекс — байты в арене остаются на
+    /// своих местах. Значит запись `len - 1` больше не та, чьи байты лежат в
+    /// арене последними, и посчитанная по ней новая длина арены отрезает
+    /// данные УЦЕЛЕВШИХ записей. Тест падает паникой прямо в `value()` —
+    /// ровно той, что видит пользователь как «kafka worker is gone».
+    ///
+    /// Тест выше (`truncate_reclaims_blob_and_pulls_committed_back`) этого не
+    /// ловил: он кладёт сообщения по возрастанию времени и не сортирует, так
+    /// что порядок индекса там совпадает с порядком арены.
+    #[test]
+    fn truncate_keeps_payloads_of_survivors_after_sorting() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        // В арену они лягут в порядке 1, 2, 3, а в индексе после сортировки
+        // встанут как 2, 3, 1: последней окажется запись, чьи байты первые.
+        assert!(push_simple(&mut store, 0, 1, 100));
+        assert!(push_simple(&mut store, 0, 2, 300));
+        assert!(push_simple(&mut store, 0, 3, 200));
+        store.sort_staged(true);
+        store.commit_all();
+
+        // Следующий раунд успел взять сообщение и оборвался по дедлайну.
+        let mark = store.len();
+        assert!(push_simple(&mut store, 0, 4, 50));
+        store.truncate(mark);
+
+        assert_eq!(store.len(), 3);
+        for i in 0..store.len() {
+            let offset = store.get(i).unwrap().offset;
+            assert_eq!(
+                store.value(i),
+                format!("value-{offset}").as_bytes(),
+                "запись {i} (offset {offset}) потеряла тело"
+            );
+        }
     }
 
     #[test]
