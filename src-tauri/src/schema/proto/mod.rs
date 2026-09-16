@@ -7,6 +7,7 @@
 pub mod decoder;
 pub mod imports;
 pub mod linked;
+pub mod resolve;
 pub mod template;
 
 pub use decoder::ProtoDecoder;

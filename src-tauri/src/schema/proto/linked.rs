@@ -66,7 +66,12 @@ pub fn linked(dir: &Path, files: &[SchemaFile]) -> Result<Arc<Linked>, String> {
 /// Нужно ровно там, где результат ещё не имеет права стать общим: файлы лежат
 /// во временном каталоге и, если разбор не удастся, будут снесены.
 pub fn parse(dir: &Path, files: &[SchemaFile]) -> Result<Linked, String> {
-    if files.is_empty() {
+    // Входные файлы — только выбранные пользователем. Подтянутые по импорту
+    // лежат в том же каталоге и разрешаются как зависимости, но входными не
+    // становятся: `mine` ниже считается по входным, а типы зависимостей в
+    // списке «чем декодировать» — такой же мусор, как `google.protobuf.Any`.
+    let inputs: Vec<&SchemaFile> = files.iter().filter(|f| !f.auto).collect();
+    if inputs.is_empty() {
         return Err("no .proto files".to_string());
     }
 
@@ -74,7 +79,7 @@ pub fn parse(dir: &Path, files: &[SchemaFile]) -> Result<Linked, String> {
     parser
         .pure()
         .include(dir)
-        .inputs(files.iter().map(|f| dir.join(&f.name)));
+        .inputs(inputs.iter().map(|f| dir.join(&f.name)));
 
     let parsed = parser
         .parse_and_typecheck()
@@ -184,6 +189,7 @@ mod tests {
             SchemaFile {
                 name: name.to_string(),
                 source: path.to_string_lossy().into_owned(),
+                auto: false,
             }
         }
     }

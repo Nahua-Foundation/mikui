@@ -14,7 +14,7 @@ use super::avro::{self, AvroDecoder, Linked};
 use super::decoder::Decoder;
 use super::files::{Pending, Staged};
 use super::json::{self, Compiled, JsonDecoder};
-use super::proto::{imports, linked, ProtoDecoder};
+use super::proto::{imports, linked, resolve, ProtoDecoder};
 use super::registry::{Registry, SchemaKind, SubjectAnswer};
 use super::types::{
     AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, LensSetting, SchemaFile, TopicSchema,
@@ -369,6 +369,9 @@ pub fn message(
 /// Разбирается вся схема целиком, вместе с уже добавленным: файл, который сам
 /// по себе валиден, но конфликтует с соседом, — такая же поломка, и принимать
 /// его нельзя. Успех переводит топик в PROTO-формат: ради этого файл и грузили.
+///
+/// Импорты, которых в выбранном наборе нет, доискиваются на диске — см.
+/// `assemble`. Выбрать корневой файл достаточно; остальное подтянется.
 pub fn add_files(
     root: &Path,
     cluster: &str,
@@ -383,35 +386,15 @@ pub fn add_files(
     let index = ensure_record(&mut schemas, cluster, topic);
     let dir = dir_of(root, &schemas[index]);
 
-    let mut pending = keep_existing(&dir, &schemas[index].files)?;
-
-    // Байты новых файлов нужны раньше их имён: имя берётся из импортов, а те
-    // объявлены в тексте — и старых файлов, и новых.
-    let mut incoming = Vec::with_capacity(sources.len());
+    let mut picked = picked_bytes(&dir, &schemas[index].files, |_| false)?;
     for source in sources {
         let bytes = std::fs::read(source).map_err(|e| format!("can't read {source}: {e}"))?;
-        incoming.push((source.clone(), bytes));
-    }
-
-    let imports = imports::imports_in(
-        pending
-            .iter()
-            .map(|p| p.bytes.as_slice())
-            .chain(incoming.iter().map(|(_, b)| b.as_slice())),
-    );
-
-    for (source, bytes) in incoming {
-        let name = imports::layout(Path::new(&source), &imports);
         // Тот же файл, добавленный повторно, — это «перечитать», а не дубликат.
-        pending.retain(|p| p.name != name);
-        pending.push(Pending {
-            name,
-            source,
-            bytes,
-        });
+        picked.retain(|(have, _)| have != source);
+        picked.push((source.clone(), bytes));
     }
 
-    let messages = commit(&mut schemas[index], &dir, &pending)?;
+    let messages = assemble_and_commit(&mut schemas[index], &dir, picked)?;
     schemas[index].format = Some(BodyFormat::Proto);
     settle_message(&mut schemas[index], &messages);
 
@@ -421,6 +404,10 @@ pub fn add_files(
 }
 
 /// Перечитывает файлы с диска — по одному имени или все сразу.
+///
+/// Замыкание импортов пересобирается всегда, даже при перечитывании одного
+/// файла: в новой версии .proto мог появиться новый `import`, и оставить
+/// прежний набор зависимостей значило бы перечитать файл и не подключить его.
 pub fn refresh(
     root: &Path,
     cluster: &str,
@@ -438,23 +425,13 @@ pub fn refresh(
         }
     }
 
-    let mut pending = Vec::with_capacity(schemas[index].files.len());
-    for file in &schemas[index].files {
-        let stale = name.is_none_or(|wanted| wanted == file.name);
-        let bytes = if stale {
-            std::fs::read(&file.source)
-                .map_err(|e| format!("can't re-read {}: {e}", file.source))?
-        } else {
-            read_copy(&dir, file)?
-        };
-        pending.push(Pending {
-            name: file.name.clone(),
-            source: file.source.clone(),
-            bytes,
-        });
-    }
+    // Подтянутые по импорту в `picked` не попадают, и перечитывать их отдельно
+    // не нужно: они и так будут прочитаны с диска заново при поиске.
+    let picked = picked_bytes(&dir, &schemas[index].files, |file| {
+        name.is_none_or(|wanted| wanted == file.name)
+    })?;
 
-    let messages = commit(&mut schemas[index], &dir, &pending)?;
+    let messages = assemble_and_commit(&mut schemas[index], &dir, picked)?;
     settle_message(&mut schemas[index], &messages);
 
     let view = describe(root, &schemas[index])?;
@@ -477,18 +454,28 @@ pub fn remove_file(
     };
     let dir = dir_of(root, &schemas[index]);
 
-    let mut pending = keep_existing(&dir, &schemas[index].files)?;
-    let before = pending.len();
-    pending.retain(|p| p.name != name);
-    if pending.len() == before {
+    let Some(target) = schemas[index].files.iter().find(|f| f.name == name) else {
         return Err(format!("{name} is not part of this schema"));
+    };
+    // Зависимость удалить нельзя, и дело не в запрете: она держится импортом, и
+    // без неё схема просто не соберётся — отказ был бы тот же, но невнятный.
+    // Уйдёт она сама, вместе с файлом, который её импортирует.
+    if target.auto {
+        return Err(format!(
+            "{name} is a dependency pulled in automatically; \
+             remove the file that imports it"
+        ));
     }
+    let dropped = target.source.clone();
 
-    // Последний файл ушёл — вместе с ним уходят и каталог, и выбор message, и
-    // выбор формата: декодировать этой схемой больше нечем. Формат именно
-    // сбрасывается в «не выбран», а не выставляется в json — с этого момента
-    // топик снова вправе определиться сам.
-    if pending.is_empty() {
+    let mut picked = picked_bytes(&dir, &schemas[index].files, |_| false)?;
+    picked.retain(|(source, _)| *source != dropped);
+
+    // Последний выбранный файл ушёл — вместе с ним уходят и каталог, и выбор
+    // message, и выбор формата: декодировать этой схемой больше нечем. Формат
+    // именно сбрасывается в «не выбран», а не выставляется в json — с этого
+    // момента топик снова вправе определиться сам.
+    if picked.is_empty() {
         linked::invalidate(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         schemas[index].files.clear();
@@ -503,7 +490,7 @@ pub fn remove_file(
         return Ok(Some(view));
     }
 
-    let messages = commit(&mut schemas[index], &dir, &pending)?;
+    let messages = assemble_and_commit(&mut schemas[index], &dir, picked)?;
     settle_message(&mut schemas[index], &messages);
 
     let view = describe(root, &schemas[index])?;
@@ -931,22 +918,18 @@ pub fn add_avro_files(
 
     let mut pending = Vec::new();
     for file in &binding.files {
-        pending.push(Pending {
-            name: file.name.clone(),
-            source: file.source.clone(),
-            bytes: read_copy(&dir, file)?,
-        });
+        pending.push(Pending::picked(
+            file.name.clone(),
+            file.source.clone(),
+            read_copy(&dir, file)?,
+        ));
     }
     for source in sources {
         let bytes = std::fs::read(source).map_err(|e| format!("can't read {source}: {e}"))?;
         let name = base_name(source);
         // Тот же файл, добавленный повторно, — это «перечитать», а не дубликат.
         pending.retain(|p| p.name != name);
-        pending.push(Pending {
-            name,
-            source: source.clone(),
-            bytes,
-        });
+        pending.push(Pending::picked(name, source.clone(), bytes));
     }
 
     let listing = commit_avro(&dir, &pending)?;
@@ -1001,11 +984,11 @@ pub fn refresh_avro_files(
         } else {
             read_copy(&dir, file)?
         };
-        pending.push(Pending {
-            name: file.name.clone(),
-            source: file.source.clone(),
+        pending.push(Pending::picked(
+            file.name.clone(),
+            file.source.clone(),
             bytes,
-        });
+        ));
     }
 
     let (files, records) = commit_avro(&dir, &pending)?;
@@ -1040,11 +1023,11 @@ pub fn remove_avro_file(
         if file.name == name {
             continue;
         }
-        pending.push(Pending {
-            name: file.name.clone(),
-            source: file.source.clone(),
-            bytes: read_copy(&dir, file)?,
-        });
+        pending.push(Pending::picked(
+            file.name.clone(),
+            file.source.clone(),
+            read_copy(&dir, file)?,
+        ));
     }
     if pending.len() == binding.files.len() {
         return Err(format!("{name} is not part of this schema"));
@@ -1167,13 +1150,7 @@ fn commit_avro(dir: &Path, pending: &[Pending]) -> Result<(Vec<SchemaFile>, Vec<
     let names = names_of(&texts)?;
 
     staged.commit()?;
-    let files = pending
-        .iter()
-        .map(|p| SchemaFile {
-            name: p.name.clone(),
-            source: p.source.clone(),
-        })
-        .collect();
+    let files = pending.iter().map(SchemaFile::from).collect();
     Ok((files, names))
 }
 
@@ -1322,11 +1299,7 @@ pub fn add_json_files(
         let name = base_name(source);
         // Тот же файл, добавленный повторно, — это «перечитать», а не дубликат.
         pending.retain(|p| p.name != name);
-        pending.push(Pending {
-            name,
-            source: source.clone(),
-            bytes,
-        });
+        pending.push(Pending::picked(name, source.clone(), bytes));
     }
 
     let files = commit_json(&dir, &pending)?;
@@ -1377,11 +1350,11 @@ pub fn refresh_json_files(
         } else {
             read_copy(&dir, file)?
         };
-        pending.push(Pending {
-            name: file.name.clone(),
-            source: file.source.clone(),
+        pending.push(Pending::picked(
+            file.name.clone(),
+            file.source.clone(),
             bytes,
-        });
+        ));
     }
 
     binding.files = commit_json(&dir, &pending)?;
@@ -1493,13 +1466,7 @@ fn commit_json(dir: &Path, pending: &[Pending]) -> Result<Vec<SchemaFile>, Strin
     json_compile(&texts)?;
 
     staged.commit()?;
-    Ok(pending
-        .iter()
-        .map(|p| SchemaFile {
-            name: p.name.clone(),
-            source: p.source.clone(),
-        })
-        .collect())
+    Ok(pending.iter().map(SchemaFile::from).collect())
 }
 
 /// Схема для ОТПРАВКИ и id, который надо поставить в заголовок.
@@ -1593,6 +1560,7 @@ fn keep_existing(dir: &Path, files: &[SchemaFile]) -> Result<Vec<Pending>, Strin
                 name: file.name.clone(),
                 source: file.source.clone(),
                 bytes: read_copy(dir, file)?,
+                auto: file.auto,
             })
         })
         .collect()
@@ -1610,6 +1578,103 @@ fn read_copy(dir: &Path, file: &SchemaFile) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Байты файлов, ВЫБРАННЫХ пользователем, вместе с их исходными путями.
+///
+/// Подтянутые по импорту не возвращаются намеренно: они не часть выбора, а его
+/// следствие, и пересчитываются заново при каждом изменении набора. Иначе
+/// схема помнила бы зависимость от импорта, которого в ней больше нет.
+///
+/// `stale` решает, какие файлы перечитать с диска, а какие взять из своей
+/// копии в каталоге схемы.
+fn picked_bytes(
+    dir: &Path,
+    files: &[SchemaFile],
+    stale: impl Fn(&SchemaFile) -> bool,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut out = Vec::with_capacity(files.len());
+    for file in files.iter().filter(|f| !f.auto) {
+        let bytes = if stale(file) {
+            std::fs::read(&file.source)
+                .map_err(|e| format!("can't re-read {}: {e}", file.source))?
+        } else {
+            read_copy(dir, file)?
+        };
+        out.push((file.source.clone(), bytes));
+    }
+    Ok(out)
+}
+
+/// Собирает из выбранных файлов полный набор для каталога схемы.
+///
+/// Два шага, и порядок между ними обязателен. Сначала ИМЕНА: они назначаются
+/// всему набору сразу (`imports::layout`), потому что имя файла внутри
+/// каталога диктуется импортом, а импорты объявлены в соседях — считать имя по
+/// одному файлу за раз значит оставить уже лежащий файл под прежним именем,
+/// когда импорт на него только появился. Потом ПОИСК: импорты, которых в
+/// наборе всё равно нет, доискиваются на диске (`resolve::closure`).
+///
+/// Второе возвращаемое — объяснение, чего не нашлось. Не ошибка: разбор всё
+/// равно делает `commit`, и последнее слово за ним. Бывает, что импорт не
+/// нашёлся, а схема собралась — например, он объявлен в файле, который в набор
+/// не входит вовсе.
+fn assemble(picked: Vec<(String, Vec<u8>)>) -> (Vec<Pending>, Option<String>) {
+    let imports = imports::imports_in(picked.iter().map(|(_, bytes)| bytes.as_slice()));
+    let paths: Vec<&Path> = picked.iter().map(|(s, _)| Path::new(s.as_str())).collect();
+    let names = imports::layout(&paths, &imports);
+
+    // Два разных файла под одним именем — это один файл в каталоге, и второй
+    // молча съел бы первого. Побеждает последний: добавленное только что
+    // заменяет то, что лежало.
+    let mut seeds: Vec<resolve::Seed> = Vec::with_capacity(picked.len());
+    for (name, (source, bytes)) in names.into_iter().zip(picked) {
+        seeds.retain(|seed| seed.name != name);
+        seeds.push(resolve::Seed {
+            name,
+            source: PathBuf::from(source),
+            bytes,
+        });
+    }
+
+    let outcome = resolve::closure(&seeds, &[]);
+    let explained = outcome.explain();
+
+    let mut pending: Vec<Pending> = seeds
+        .into_iter()
+        .map(|seed| {
+            Pending::picked(
+                seed.name,
+                seed.source.to_string_lossy().into_owned(),
+                seed.bytes,
+            )
+        })
+        .collect();
+    pending.extend(outcome.found.into_iter().map(|found| Pending {
+        name: found.import,
+        source: found.source.to_string_lossy().into_owned(),
+        bytes: found.bytes,
+        auto: true,
+    }));
+    (pending, explained)
+}
+
+/// `assemble` + `commit` одним движением: так устроены все три операции над
+/// набором, и порядок шагов у них обязан быть одним и тем же.
+///
+/// Объяснение ненайденных импортов приписывается к ошибке разбора СПЕРЕДИ:
+/// «no such file: common.proto» от парсера — правда, но бесполезная, а вот
+/// «искал там-то и не нашёл» говорит, что делать.
+fn assemble_and_commit(
+    schema: &mut TopicSchema,
+    dir: &Path,
+    picked: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<String>, String> {
+    let (pending, explained) = assemble(picked);
+    commit(schema, dir, &pending).map_err(|e| match explained {
+        Some(why) => format!("{why}\n\n{e}"),
+        None => e,
+    })
+}
+
 /// Складывает набор файлов, проверяет его разбором и, только если он удался,
 /// ставит каталог на место и переписывает список файлов схемы.
 ///
@@ -1621,13 +1686,7 @@ fn commit(
 ) -> Result<Vec<String>, String> {
     let staged = Staged::write(dir.to_path_buf(), pending)?;
 
-    let listing: Vec<SchemaFile> = pending
-        .iter()
-        .map(|p| SchemaFile {
-            name: p.name.clone(),
-            source: p.source.clone(),
-        })
-        .collect();
+    let listing: Vec<SchemaFile> = pending.iter().map(SchemaFile::from).collect();
 
     // Разбираем ещё во временном каталоге: неудача не должна оставить следа.
     let linked = linked::parse(staged.path(), &listing)?;
@@ -1951,6 +2010,112 @@ mod tests {
         assert!(sandbox.schema_dir().join("common/types.proto").is_file());
     }
 
+    // Раскладка из настоящего Go-сервиса: импорт отсчитан от корня модуля, а
+    // сам файл лежит пятью каталогами ниже. Ради этого случая и заведён
+    // `proto::resolve` — все три теста ниже описывают ровно те три попытки
+    // подключить такую схему, каждая из которых раньше кончалась ошибкой.
+    const ODE_DEP: &str = "internal/common_proto/common_proto.proto";
+    const ODE_ROOT: &str = "internal/adapters/kafka/consumer/ode/ode_events.proto";
+
+    const ODE_COMMON: &str = r#"
+        syntax = "proto3";
+        package common_proto;
+        enum TradingMode { TRADING_MODE_UNKNOWN = 0; }
+    "#;
+
+    const ODE_EVENTS: &str = r#"
+        syntax = "proto3";
+        package ode;
+        import "google/protobuf/timestamp.proto";
+        import "internal/common_proto/common_proto.proto";
+        message OrderBookEvent {
+            string ticker = 1;
+            google.protobuf.Timestamp timestamp = 2;
+            common_proto.TradingMode trading_mode = 3;
+        }
+        message Level { string qty = 1; }
+    "#;
+
+    /// Выбран ОДИН корневой файл — зависимость доискивается на диске.
+    #[test]
+    fn a_single_root_file_pulls_its_import_from_the_project() {
+        let sandbox = Sandbox::new("closure");
+        sandbox.author(ODE_DEP, ODE_COMMON);
+        let root = sandbox.author(ODE_ROOT, ODE_EVENTS);
+
+        let view = sandbox.add(&[root]).unwrap();
+        assert_eq!(view.error, None);
+        // Типы зависимости в списке на выбор не попадают: декодировать топик
+        // `common_proto.TradingMode` никто не собирается.
+        assert_eq!(view.messages, ["ode.Level", "ode.OrderBookEvent"]);
+
+        let stored = &sandbox.stored()[0];
+        assert!(
+            stored
+                .files
+                .iter()
+                .any(|f| f.name == "ode_events.proto" && !f.auto),
+            "{:?}",
+            stored.files
+        );
+        let dep = stored
+            .files
+            .iter()
+            .find(|f| f.name == ODE_DEP)
+            .expect("зависимость обязана попасть в набор");
+        assert!(dep.auto, "её не выбирали, её нашли");
+        assert!(dep.source.ends_with(ODE_DEP), "{}", dep.source);
+        // И лечь она обязана по пути своего импорта, иначе разбор её не найдёт.
+        assert!(sandbox.schema_dir().join(ODE_DEP).is_file());
+    }
+
+    /// Добавление по одному: сперва зависимость, потом корневой файл.
+    ///
+    /// Диалог macOS не даёт выбрать файлы из разных каталогов за раз, так что
+    /// этот путь — единственный доступный руками. Ломался он на том, что имя
+    /// уже добавленного файла не пересчитывалось: `common_proto.proto` лёг
+    /// плоско в первый заход и оставался плоским во второй, когда импорт на
+    /// него наконец появлялся в наборе.
+    #[test]
+    fn a_file_added_earlier_is_relaid_out_when_an_import_points_at_it() {
+        let sandbox = Sandbox::new("relayout");
+        let dep = sandbox.author(ODE_DEP, ODE_COMMON);
+        let root = sandbox.author(ODE_ROOT, ODE_EVENTS);
+
+        // Сам по себе он никем не импортируется и ложится под своим basename.
+        let first = sandbox.add(&[dep]).unwrap();
+        let names: Vec<&str> = first.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["common_proto.proto"]);
+
+        let view = sandbox.add(&[root]).unwrap();
+        assert_eq!(view.error, None);
+        let mut names: Vec<&str> = view.files.iter().map(|f| f.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, [ODE_DEP, "ode_events.proto"]);
+        assert!(
+            view.files.iter().all(|f| !f.auto),
+            "оба файла выбраны руками, зависимостей тут нет"
+        );
+        assert!(sandbox.schema_dir().join(ODE_DEP).is_file());
+        assert!(
+            !sandbox.schema_dir().join("common_proto.proto").exists(),
+            "плоская копия должна была уехать вместе с переименованием"
+        );
+    }
+
+    /// Оба файла скопированы в одну папку: пути импорта на диске больше нет,
+    /// и назначить его можно только по имени файла.
+    #[test]
+    fn a_flat_copy_of_both_files_still_resolves_the_import() {
+        let sandbox = Sandbox::new("flat");
+        let dep = sandbox.author("flat/common_proto.proto", ODE_COMMON);
+        let root = sandbox.author("flat/ode_events.proto", ODE_EVENTS);
+
+        let view = sandbox.add(&[root, dep]).unwrap();
+        assert_eq!(view.error, None);
+        assert!(sandbox.schema_dir().join(ODE_DEP).is_file());
+    }
+
     /// Порядок выбора в диалоге пользователь не контролирует, и импорт должен
     /// разрешиться, даже когда зависимость названа раньше корневого файла.
     #[test]
@@ -2080,20 +2245,72 @@ mod tests {
         assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_none());
     }
 
-    /// Удалить файл, на который ссылается импорт, — это сломать схему. Такое
-    /// изменение не применяется, как и любое другое, ломающее разбор.
+    /// Файл, на который ссылается импорт, из схемы не уходит: он перестаёт быть
+    /// выбранным и становится зависимостью.
+    ///
+    /// Раньше такое удаление просто отвергалось — разбор без этого файла не
+    /// проходил. Теперь он находится на диске по своему импорту, и результат
+    /// честнее: из списка выбранного файл ушёл, схема работает, а в наборе он
+    /// остался с пометкой `auto`. Инвариант тот же, что и был: применяется
+    /// только то изменение, после которого схема разбирается.
     #[test]
-    fn removing_a_file_that_is_still_imported_is_refused() {
+    fn a_file_that_is_still_imported_comes_back_as_a_dependency() {
         let sandbox = Sandbox::new("remove-needed");
         let orders = sandbox.author("orders.proto", ORDERS);
         let money = sandbox.author("common/types.proto", MONEY);
         sandbox.add(&[orders, money]).unwrap();
+
+        let view = remove_file(&sandbox.root, CLUSTER, TOPIC, "common/types.proto")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.error, None);
+
+        let stored = &sandbox.stored()[0];
+        let money = stored
+            .files
+            .iter()
+            .find(|f| f.name == "common/types.proto")
+            .expect("файл нужен импортом и обязан остаться в наборе");
+        assert!(money.auto, "остаться он должен уже зависимостью");
+        assert!(
+            stored
+                .files
+                .iter()
+                .any(|f| f.name == "orders.proto" && !f.auto),
+            "выбранный файл выбранным и остаётся"
+        );
+        // Типы зависимости в списке на выбор не нужны — как и
+        // `google.protobuf.Timestamp`.
+        assert_eq!(view.messages, vec!["orders.Order"]);
+    }
+
+    /// А вот если файла на диске уже нет, найти его нечем — и удаление
+    /// отвергается, как отвергалось всегда: схема после него не разберётся.
+    #[test]
+    fn removing_a_needed_file_that_is_gone_from_disk_is_refused() {
+        let sandbox = Sandbox::new("remove-needed-gone");
+        let orders = sandbox.author("orders.proto", ORDERS);
+        let money = sandbox.author("common/types.proto", MONEY);
+        sandbox.add(&[orders, money.clone()]).unwrap();
+        std::fs::remove_file(&money).unwrap();
 
         assert!(remove_file(&sandbox.root, CLUSTER, TOPIC, "common/types.proto").is_err());
 
         let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
         assert_eq!(view.files.len(), 2);
         assert_eq!(view.error, None);
+    }
+
+    /// Зависимость удаляют не сама по себе, а вместе с тем, кто её импортирует.
+    #[test]
+    fn a_dependency_cannot_be_removed_on_its_own() {
+        let sandbox = Sandbox::new("remove-dep");
+        let orders = sandbox.author("orders.proto", ORDERS);
+        sandbox.author("common/types.proto", MONEY);
+        sandbox.add(&[orders]).unwrap();
+
+        let error = remove_file(&sandbox.root, CLUSTER, TOPIC, "common/types.proto").unwrap_err();
+        assert!(error.contains("dependency"), "{error}");
     }
 
     #[test]

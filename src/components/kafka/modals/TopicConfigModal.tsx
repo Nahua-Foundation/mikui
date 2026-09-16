@@ -112,7 +112,13 @@ export function TopicConfigModal({
    * не применил.
    */
   const applySchema = useCallback(
-    async (action: () => Promise<TopicSchema | null>, success: string) => {
+    async (
+      action: () => Promise<TopicSchema | null>,
+      // Функцией, а не строкой, ради одного случая: загрузка .proto может
+      // подтянуть файлы, которых пользователь не выбирал, и сказать об этом
+      // можно только по результату.
+      success: string | ((updated: TopicSchema | null) => string),
+    ) => {
       if (!cluster || !topicName) return;
       setBusy(true);
       try {
@@ -122,7 +128,7 @@ export function TopicConfigModal({
         // Файл только что загрузили — если тип в нём один, он и выбран.
         setMessage(chooseMessage(updated));
         onSchemaChanged?.(topicName, updated);
-        toast.success(success);
+        toast.success(typeof success === 'string' ? success : success(updated));
       } catch (e) {
         console.error('Schema operation failed', e);
         toast.error(describeError(e));
@@ -152,7 +158,15 @@ export function TopicConfigModal({
 
     await applySchema(
       () => api.addProtoFiles(cluster, topicName, paths),
-      `Loaded ${paths.length} .proto file${paths.length > 1 ? 's' : ''}`,
+      (updated) => {
+        const loaded = `Loaded ${paths.length} .proto file${paths.length > 1 ? 's' : ''}`;
+        // Подтянутое по импорту стоит назвать числом: пользователь выбрал один
+        // файл, а в списке их стало шесть, и молчать об этом незачем.
+        const pulled = (updated?.files ?? []).filter((f) => f.auto).length;
+        return pulled > 0
+          ? `${loaded}, ${pulled} more pulled in by imports`
+          : loaded;
+      },
     );
   }, [cluster, topicName, applySchema]);
 
@@ -272,10 +286,28 @@ export function TopicConfigModal({
                   <div className="max-h-40 overflow-auto rounded border border-edge divide-y divide-edge">
                     {files.map((file) => (
                       <div key={file.name} className="flex items-center gap-2 p-2">
-                        <FileText className="size-3.5 shrink-0 text-dim" />
+                        <FileText
+                          className={`size-3.5 shrink-0 ${file.auto ? 'text-dim/60' : 'text-dim'}`}
+                        />
                         <div className="min-w-0 flex-1">
-                          <div className="font-mono text-xs text-strong truncate">
-                            {file.name}
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <div
+                              className={`font-mono text-xs truncate ${file.auto ? 'text-soft' : 'text-strong'}`}
+                            >
+                              {file.name}
+                            </div>
+                            {/* Файл не выбирали — его нашли по import.
+                                Сказать об этом надо: иначе в списке появляются
+                                файлы, которых пользователь туда не кладл, и
+                                непонятно, откуда они и почему без кнопок. */}
+                            {file.auto && (
+                              <span
+                                className="shrink-0 font-mono text-[10px] text-dim border border-edge rounded px-1"
+                                title="Found by an import in the selected files"
+                              >
+                                import
+                              </span>
+                            )}
                           </div>
                           {/* Исходный путь: по нему работает «обновить», и
                               именно он отличает два одноимённых контракта. */}
@@ -283,24 +315,32 @@ export function TopicConfigModal({
                             {file.source}
                           </div>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleRefresh(file.name)}
-                          disabled={busy}
-                          className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                          title="Re-read this file from disk"
-                        >
-                          <RotateCw className="size-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleRemove(file.name)}
-                          disabled={busy}
-                          className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                          title="Remove this file"
-                        >
-                          <X className="size-3.5" />
-                        </button>
+                        {/* У зависимости кнопок нет. Перечитывать её отдельно
+                            незачем — она читается с диска заново при каждом
+                            изменении набора, — а удалить её нельзя: она
+                            держится импортом и уйдёт вместе с ним. */}
+                        {!file.auto && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleRefresh(file.name)}
+                              disabled={busy}
+                              className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                              title="Re-read this file from disk"
+                            >
+                              <RotateCw className="size-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRemove(file.name)}
+                              disabled={busy}
+                              className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                              title="Remove this file"
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </>
+                        )}
                       </div>
                     ))}
                   </div>

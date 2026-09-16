@@ -213,6 +213,7 @@ mod tests {
         let file = SchemaFile {
             name: "t.proto".to_string(),
             source: dir.join("t.proto").to_string_lossy().into_owned(),
+            auto: false,
         };
         let linked = linked::parse(&dir, &[file]).unwrap();
         let md = linked.message(message).unwrap();
