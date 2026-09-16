@@ -247,7 +247,10 @@ mod tests {
         let json = decoder.decode(&encoded_event()).unwrap();
 
         // Ни одного переноса строки: строка таблицы обязана остаться одной строкой.
-        assert!(!json.contains('\n'), "ожидался компактный JSON, получено: {json}");
+        assert!(
+            !json.contains('\n'),
+            "ожидался компактный JSON, получено: {json}"
+        );
         // Имена полей — из .proto, а не lowerCamelCase.
         assert!(json.contains("\"event_id\""), "{json}");
         assert!(!json.contains("eventId"), "{json}");

@@ -204,7 +204,10 @@ pub fn producer_config(base: &ClientConfig) -> ClientConfig {
     // Столько librdkafka пытается доставить сообщение, прежде чем сдаться. Та же
     // константа — потолок ожидания в `Worker::produce`: показать «отправлено»
     // без отчёта о доставке нельзя, а ждать дольше библиотеки бессмысленно.
-    cc.set("message.timeout.ms", PRODUCE_TIMEOUT.as_millis().to_string());
+    cc.set(
+        "message.timeout.ms",
+        PRODUCE_TIMEOUT.as_millis().to_string(),
+    );
 
     // Дефолт librdkafka — 5 мс накопления батча. Батчить тут нечего: сообщение
     // ровно одно, и эти миллисекунды были бы чистой задержкой ответа.
@@ -516,7 +519,10 @@ mod tests {
         conf.ssl_key_password = Some(" pass phrase ".into());
         let cc = config(&conf);
 
-        assert_eq!(cc.get("ssl.certificate.location"), Some("/certs/client.pem"));
+        assert_eq!(
+            cc.get("ssl.certificate.location"),
+            Some("/certs/client.pem")
+        );
         assert_eq!(cc.get("ssl.key.location"), Some("/certs/client.key"));
         // Пароль ключа не тримится: пробелы по краям — часть пароля.
         assert_eq!(cc.get("ssl.key.password"), Some(" pass phrase "));

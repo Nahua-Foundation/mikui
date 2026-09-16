@@ -123,7 +123,10 @@ mod tests {
     #[test]
     fn imported_file_keeps_the_path_it_is_imported_by() {
         let imports = set(&["common/types.proto"]);
-        let name = layout(Path::new("/home/u/work/schemas/common/types.proto"), &imports);
+        let name = layout(
+            Path::new("/home/u/work/schemas/common/types.proto"),
+            &imports,
+        );
         assert_eq!(name, "common/types.proto");
     }
 

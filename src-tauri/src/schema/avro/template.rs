@@ -213,8 +213,8 @@ mod tests {
             }"#,
         );
 
-        let json: serde_json::Value = serde_json::from_str(&skeleton(&linked))
-            .expect("заготовка обязана быть валидным JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&skeleton(&linked)).expect("заготовка обязана быть валидным JSON");
         let bytes = linked
             .encode(json.clone())
             .expect("заготовку обязана принимать собственная отправка");
@@ -260,9 +260,11 @@ mod tests {
     fn a_reference_to_another_schema_is_expanded() {
         let money = r#"{"type":"record","name":"Money","namespace":"common","fields":[{"name":"amount","type":"long"}]}"#;
         let order = r#"{"type":"record","name":"Order","namespace":"orders","fields":[{"name":"total","type":"common.Money"}]}"#;
-        let linked =
-            Linked::parse_files(&[order.to_string(), money.to_string()], Some("orders.Order"))
-                .unwrap();
+        let linked = Linked::parse_files(
+            &[order.to_string(), money.to_string()],
+            Some("orders.Order"),
+        )
+        .unwrap();
 
         let text = skeleton(&linked);
         // Не `null` и не имя типа: пользователю нужны поля, которые предстоит

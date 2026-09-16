@@ -194,7 +194,9 @@ pub fn by_subject(
         return Ok(hit);
     }
 
-    let fetched = registry.by_subject(subject, version)?.expect(SchemaKind::Avro)?;
+    let fetched = registry
+        .by_subject(subject, version)?
+        .expect(SchemaKind::Avro)?;
     let linked = Arc::new(Linked::parse_with_refs(
         &fetched.schema,
         &fetched.references,
@@ -381,7 +383,9 @@ fn remember_failure(key: Key, why: &str) {
 // --- Диск --------------------------------------------------------------------
 
 fn path_of(root: &Path, url: &str, id: u32) -> PathBuf {
-    root.join(CACHE_DIR).join(fingerprint(url)).join(format!("{id}.json"))
+    root.join(CACHE_DIR)
+        .join(fingerprint(url))
+        .join(format!("{id}.json"))
 }
 
 fn read_disk(root: &Path, url: &str, id: u32) -> Option<Cached> {
@@ -474,7 +478,8 @@ mod tests {
         let dir = Dir::new("offline");
         write_disk(&dir.0, "http://sr:8081", 7, &fetched(7));
 
-        let cached = read_disk(&dir.0, "http://sr:8081", 7).expect("схема должна была лечь на диск");
+        let cached =
+            read_disk(&dir.0, "http://sr:8081", 7).expect("схема должна была лечь на диск");
         assert!(cached.references.is_empty());
         let linked = Linked::parse_with_refs(&cached.schema, &cached.references).unwrap();
         assert_eq!(linked.root_name().as_deref(), Some("demo.Event"));

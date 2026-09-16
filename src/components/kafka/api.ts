@@ -132,6 +132,14 @@ export const deleteClusterUser = (clusterId: string, userId: string) =>
 export const getSettings = () => invoke<Settings>('get_settings');
 export const saveSettings = (settings: Settings) => invoke<void>('save_settings', { settings });
 
+// --- Диагностика ------------------------------------------------------------
+
+/** Путь к журналу паник, если приложение когда-нибудь падало. */
+export const panicLog = () => invoke<string | null>('panic_log');
+
+/** Показать журнал паник в файловом менеджере, чтобы его можно было прислать. */
+export const revealPanicLog = () => invoke<void>('reveal_panic_log');
+
 export const loadFavoriteTopics = async (): Promise<FavoriteTopics> =>
   parseFavoriteTopics((await getSettings())[FAVORITE_TOPICS_KEY]);
 

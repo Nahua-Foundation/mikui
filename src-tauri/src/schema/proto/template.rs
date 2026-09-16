@@ -97,12 +97,7 @@ fn included(field: &FieldDescriptor) -> bool {
     first == Some(field.number())
 }
 
-fn write_value(
-    field: &FieldDescriptor,
-    depth: usize,
-    stack: &mut Vec<String>,
-    out: &mut String,
-) {
+fn write_value(field: &FieldDescriptor, depth: usize, stack: &mut Vec<String>, out: &mut String) {
     match field.runtime_field_type() {
         // Пустые список и карта, а не образец элемента: сколько их нужно,
         // знает только отправляющий, а лишний элемент пришлось бы удалять.
@@ -205,7 +200,11 @@ mod tests {
     use crate::schema::types::SchemaFile;
 
     /// Разбирает текст .proto во временном каталоге и достаёт из него message.
-    fn message_of(name: &str, text: &str, message: &str) -> (std::path::PathBuf, MessageDescriptor) {
+    fn message_of(
+        name: &str,
+        text: &str,
+        message: &str,
+    ) -> (std::path::PathBuf, MessageDescriptor) {
         let dir = std::env::temp_dir().join(format!("mikui-template-test-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -392,8 +391,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for field in ids {
             let got = value[field].as_str().unwrap();
-            uuid::Uuid::parse_str(got)
-                .unwrap_or_else(|e| panic!("{field} — не UUID: {got} ({e})"));
+            uuid::Uuid::parse_str(got).unwrap_or_else(|e| panic!("{field} — не UUID: {got} ({e})"));
             // Один UUID на все поля значил бы, что сообщение ссылается само на
             // себя пятью разными полями, — а это почти наверняка не то, что
             // отправляют.
@@ -450,7 +448,10 @@ mod tests {
         );
 
         let text = skeleton(&md);
-        assert!(text.contains("\"direction\": \"DIRECTION_UNSPECIFIED\""), "{text}");
+        assert!(
+            text.contains("\"direction\": \"DIRECTION_UNSPECIFIED\""),
+            "{text}"
+        );
         protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }

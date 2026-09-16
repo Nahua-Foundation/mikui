@@ -448,9 +448,9 @@ mod tests {
         // Полчаса простоя без единого байта.
         meter.set_reading(false);
         meter.tick(
-                &[(0, 1_200_000)],
-                (0, 0),
-                Duration::ZERO,
+            &[(0, 1_200_000)],
+            (0, 0),
+            Duration::ZERO,
             start + Duration::from_secs(1800),
         );
 
@@ -494,8 +494,7 @@ mod tests {
 
         // Пять брокеров отдают по 200 КБ/с каждый, шестой только подключён.
         let snapshot = |second: u64| -> Vec<(i32, u64)> {
-            let mut brokers: Vec<(i32, u64)> =
-                (0..5).map(|id| (id, 200_000 * second)).collect();
+            let mut brokers: Vec<(i32, u64)> = (0..5).map(|id| (id, 200_000 * second)).collect();
             brokers.push((5, 0));
             brokers
         };

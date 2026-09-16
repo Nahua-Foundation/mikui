@@ -1,4 +1,4 @@
-import { ChevronDown, Filter, Link2, RefreshCw, Play, Folder, Search, Send, User, Users } from 'lucide-react';
+import { Bug, ChevronDown, Filter, Link2, RefreshCw, Play, Folder, Search, Send, User, Users } from 'lucide-react';
 import { Button } from '../ui/button';
 import {
   DropdownMenu,
@@ -92,6 +92,11 @@ interface HeaderDesktopProps {
    *  часть почтовых клиентов и мессенджеров незнакомую схему кликабельной не
    *  делает вовсе. */
   onOpenLink: () => void;
+  /** Путь к журналу паник, если он есть. Пока приложение не падало — `null`,
+   *  и кнопки в шапке нет: показывать её всегда значило бы держать на виду
+   *  напоминание о поломке, которой не было. */
+  crashLog: string | null;
+  onRevealCrashLog: () => void;
 }
 
 /**
@@ -157,6 +162,8 @@ export function HeaderDesktop({
   onOpenFavorites,
   onProduce,
   onOpenLink,
+  crashLog,
+  onRevealCrashLog,
 }: HeaderDesktopProps) {
   const partitions = topic ? Array.from({ length: topic.partitions }, (_, i) => i) : [];
   const hasActiveFilters = filters.key.trim() !== '' || filters.value.trim() !== '';
@@ -521,6 +528,18 @@ export function HeaderDesktop({
         <IconAction onClick={onOpenLink} title="Open a message link">
           <Link2 className="size-4" />
         </IconAction>
+
+        {/* Появляется только после падения — и переживает перезапуск, потому
+            что смотрит на файл, а не на память. Упавшее в прошлый запуск
+            важно не меньше: как раз его и просят прислать. */}
+        {crashLog && (
+          <IconAction
+            onClick={onRevealCrashLog}
+            title={`Crash log — show it in the folder and send it over:\n${crashLog}`}
+          >
+            <Bug className="size-4 text-danger" />
+          </IconAction>
+        )}
 
         {/* Живой хвост — Фаза 3. Кнопка на месте, чтобы не менять раскладку
             шапки, но выключена: раньше она показывала тост и не делала ничего,

@@ -147,11 +147,7 @@ fn effective_format(schema: &TopicSchema, detected: Option<SchemaKind>) -> BodyF
 /// кластера. Один лишь настроенный реестр уже повод вернуть вид: топику может
 /// быть чем декодировать и чем кодировать отправляемое, даже если руками ему
 /// не назначали ничего.
-pub fn view(
-    root: &Path,
-    cluster: &str,
-    topic: &str,
-) -> Result<Option<TopicSchemaView>, String> {
+pub fn view(root: &Path, cluster: &str, topic: &str) -> Result<Option<TopicSchemaView>, String> {
     let schemas = list(root)?;
     if let Some(index) = position(&schemas, cluster, topic) {
         return Ok(Some(describe(root, &schemas[index])?));
@@ -192,11 +188,7 @@ fn describe(root: &Path, schema: &TopicSchema) -> Result<TopicSchemaView, String
 }
 
 /// Декодер для топика, если он настроен и схема разбирается.
-pub fn decoder(
-    root: &Path,
-    cluster: &str,
-    topic: &str,
-) -> Result<Option<Arc<Decoder>>, String> {
+pub fn decoder(root: &Path, cluster: &str, topic: &str) -> Result<Option<Arc<Decoder>>, String> {
     let schemas = list(root)?;
     let stored = position(&schemas, cluster, topic).map(|i| schemas[i].clone());
     // Записи может не быть вовсе, а декодер всё равно найтись: реестр кластера
@@ -828,13 +820,15 @@ pub fn avro_for_produce(
     if let Some(subject) = subject {
         let (url, client) = registry_of(root, cluster)
             .ok_or("no schema registry is configured for this cluster")?;
-        let version = binding
-            .and_then(|a| a.version.filter(|_| a.subject.as_deref() == Some(&subject)));
+        let version =
+            binding.and_then(|a| a.version.filter(|_| a.subject.as_deref() == Some(&subject)));
 
         // Выбранный руками subject тоже проверяется: пользователь мог назвать
         // тот, что зарегистрирован protobuf'ом, и молча закодировать по нему
         // значило бы положить в топик заведомый мусор.
-        let fetched = client.by_subject(&subject, version)?.expect(SchemaKind::Avro)?;
+        let fetched = client
+            .by_subject(&subject, version)?
+            .expect(SchemaKind::Avro)?;
         let linked = Arc::new(Linked::parse_with_refs(
             &fetched.schema,
             &fetched.references,
@@ -862,8 +856,7 @@ fn avro_texts(dir: &Path, files: &[SchemaFile]) -> Result<Vec<String>, String> {
         .iter()
         .map(|file| {
             let bytes = read_copy(dir, file)?;
-            String::from_utf8(bytes)
-                .map_err(|e| format!("{} is not valid UTF-8: {e}", file.name))
+            String::from_utf8(bytes).map_err(|e| format!("{} is not valid UTF-8: {e}", file.name))
         })
         .collect()
 }
@@ -985,8 +978,8 @@ pub fn refresh_avro_files(
     name: Option<&str>,
 ) -> Result<TopicSchemaView, String> {
     let mut schemas = list(root)?;
-    let index = position(&schemas, cluster, topic)
-        .ok_or_else(|| format!("no schema for topic {topic}"))?;
+    let index =
+        position(&schemas, cluster, topic).ok_or_else(|| format!("no schema for topic {topic}"))?;
     let dir = avro_dir_of(root, &schemas[index]);
     let mut binding = schemas[index]
         .avro
@@ -1132,8 +1125,8 @@ pub fn set_avro_record(
     record: Option<String>,
 ) -> Result<TopicSchemaView, String> {
     let mut schemas = list(root)?;
-    let index = position(&schemas, cluster, topic)
-        .ok_or_else(|| format!("no schema for topic {topic}"))?;
+    let index =
+        position(&schemas, cluster, topic).ok_or_else(|| format!("no schema for topic {topic}"))?;
     let mut binding = schemas[index]
         .avro
         .clone()
@@ -1158,10 +1151,7 @@ pub fn set_avro_record(
 
 /// Складывает набор .avsc, проверяет разбором и ставит каталог на место.
 /// Возвращает список файлов и имена записей, которые в наборе объявлены.
-fn commit_avro(
-    dir: &Path,
-    pending: &[Pending],
-) -> Result<(Vec<SchemaFile>, Vec<String>), String> {
+fn commit_avro(dir: &Path, pending: &[Pending]) -> Result<(Vec<SchemaFile>, Vec<String>), String> {
     let staged = Staged::write(dir.to_path_buf(), pending)?;
 
     let texts: Vec<String> = pending
@@ -1553,9 +1543,10 @@ pub fn json_for_produce(
     };
 
     if let Some(subject) = subject {
-        let (url, client) =
-            registry_of(root, cluster).ok_or("no schema registry is configured for this cluster")?;
-        let version = binding.and_then(|b| b.version.filter(|_| b.subject.as_deref() == Some(&subject)));
+        let (url, client) = registry_of(root, cluster)
+            .ok_or("no schema registry is configured for this cluster")?;
+        let version =
+            binding.and_then(|b| b.version.filter(|_| b.subject.as_deref() == Some(&subject)));
 
         // id приезжает вместе со схемой: спрашивать его вторым запросом значило
         // бы ходить в реестр дважды на каждое нажатие клавиши в форме отправки.
@@ -1569,8 +1560,9 @@ pub fn json_for_produce(
 
     let files = binding.map(|b| b.files.as_slice()).unwrap_or_default();
     let texts = json_texts(&json_dir_of(root, &schema), files)?;
-    let compiled = json_compile(&texts)
-        .map_err(|_| "pick a subject or load a JSON schema file for this topic first".to_string())?;
+    let compiled = json_compile(&texts).map_err(|_| {
+        "pick a subject or load a JSON schema file for this topic first".to_string()
+    })?;
     Ok(JsonProduceSchema {
         compiled,
         id: None,
@@ -1609,8 +1601,12 @@ fn keep_existing(dir: &Path, files: &[SchemaFile]) -> Result<Vec<Pending>, Strin
 fn read_copy(dir: &Path, file: &SchemaFile) -> Result<Vec<u8>, String> {
     match std::fs::read(dir.join(&file.name)) {
         Ok(bytes) => Ok(bytes),
-        Err(_) => std::fs::read(&file.source)
-            .map_err(|e| format!("{} is gone and {} can't be read: {e}", file.name, file.source)),
+        Err(_) => std::fs::read(&file.source).map_err(|e| {
+            format!(
+                "{} is gone and {} can't be read: {e}",
+                file.name, file.source
+            )
+        }),
     }
 }
 
@@ -1671,7 +1667,10 @@ mod tests {
         assert_eq!(new_dir_name("c1", "orders"), new_dir_name("c1", "orders"));
         assert_ne!(new_dir_name("c1", "orders"), new_dir_name("c2", "orders"));
         // Разделитель не даёт склейке «c1» + «x.orders» совпасть с «c1x» + «orders».
-        assert_ne!(new_dir_name("c1", "x.orders"), new_dir_name("c1x", "orders"));
+        assert_ne!(
+            new_dir_name("c1", "x.orders"),
+            new_dir_name("c1x", "orders")
+        );
         assert_eq!(new_dir_name("c1", "orders").len(), 16);
     }
 
@@ -1929,7 +1928,10 @@ mod tests {
         linked::invalidate(&sandbox.schema_dir());
 
         let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
-        assert_eq!(view.error, None, "своя копия должна разбираться и без оригинала");
+        assert_eq!(
+            view.error, None,
+            "своя копия должна разбираться и без оригинала"
+        );
         assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
     }
 
@@ -1976,13 +1978,21 @@ mod tests {
         assert!(sandbox.add(&[bad]).is_err());
 
         let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
-        assert_eq!(view.files.len(), 1, "битый файл не должен был попасть в схему");
+        assert_eq!(
+            view.files.len(),
+            1,
+            "битый файл не должен был попасть в схему"
+        );
         assert_eq!(view.message.as_deref(), Some("demo.Event"));
         assert_eq!(view.error, None, "прежняя схема обязана остаться рабочей");
         assert!(!sandbox.schema_dir().join("bad.proto").exists());
         // И временный каталог за собой прибран.
         let staging = sandbox.schema_dir().with_extension("staging");
-        assert!(!staging.exists(), "черновик не убран: {}", staging.display());
+        assert!(
+            !staging.exists(),
+            "черновик не убран: {}",
+            staging.display()
+        );
     }
 
     /// Файл, который импортируют, сам по себе валиден — но без корневого он
@@ -1993,7 +2003,10 @@ mod tests {
         let orders = sandbox.author("orders.proto", ORDERS);
         let error = sandbox.add(&[orders]).unwrap_err();
         assert!(error.contains("common/types.proto"), "{error}");
-        assert!(sandbox.stored().is_empty(), "запись не должна была появиться");
+        assert!(
+            sandbox.stored().is_empty(),
+            "запись не должна была появиться"
+        );
     }
 
     #[test]
@@ -2031,7 +2044,10 @@ mod tests {
         assert!(refresh(&sandbox.root, CLUSTER, TOPIC, None).is_err());
 
         let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
-        assert_eq!(view.error, None, "на диске обязана была остаться рабочая копия");
+        assert_eq!(
+            view.error, None,
+            "на диске обязана была остаться рабочая копия"
+        );
         assert_eq!(view.messages, ["demo.Event"]);
     }
 
@@ -2053,8 +2069,14 @@ mod tests {
         assert!(view.files.is_empty());
         assert_eq!(view.format, BodyFormat::Json);
         assert_eq!(view.message, None);
-        assert!(!dir.exists(), "копии .proto должны были уйти вместе со схемой");
-        assert!(sandbox.stored().is_empty(), "пустая запись хранению не подлежит");
+        assert!(
+            !dir.exists(),
+            "копии .proto должны были уйти вместе со схемой"
+        );
+        assert!(
+            sandbox.stored().is_empty(),
+            "пустая запись хранению не подлежит"
+        );
         assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_none());
     }
 
@@ -2216,7 +2238,10 @@ mod tests {
         forget_cluster(&sandbox.root, CLUSTER).unwrap();
 
         assert!(view(&sandbox.root, CLUSTER, TOPIC).unwrap().is_none());
-        assert!(!doomed_dir.exists(), "копии .proto удалённого кластера остались");
+        assert!(
+            !doomed_dir.exists(),
+            "копии .proto удалённого кластера остались"
+        );
         // Соседний кластер не тронут.
         assert!(view(&sandbox.root, "dev", TOPIC).unwrap().is_some());
         assert!(decoder(&sandbox.root, "dev", TOPIC).unwrap().is_some());
@@ -2271,7 +2296,11 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
-        assert_eq!(view.avro.and_then(|a| a.error), None, "своя копия должна разбираться");
+        assert_eq!(
+            view.avro.and_then(|a| a.error),
+            None,
+            "своя копия должна разбираться"
+        );
         assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
     }
 
@@ -2303,8 +2332,16 @@ mod tests {
         let bad = sandbox.author("bad.avsc", "{ \"type\": \"record\", oops");
         assert!(sandbox.add_avsc(&[bad]).is_err());
 
-        let avro = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap().avro.unwrap();
-        assert_eq!(avro.files.len(), 1, "битый файл не должен был попасть в схему");
+        let avro = view(&sandbox.root, CLUSTER, TOPIC)
+            .unwrap()
+            .unwrap()
+            .avro
+            .unwrap();
+        assert_eq!(
+            avro.files.len(),
+            1,
+            "битый файл не должен был попасть в схему"
+        );
         assert_eq!(avro.error, None, "прежняя схема обязана остаться рабочей");
         assert!(!sandbox.avro_schema_dir().join("bad.avsc").exists());
     }
@@ -2317,7 +2354,10 @@ mod tests {
         let order = sandbox.author("order.avsc", ORDER_AVSC);
         let error = sandbox.add_avsc(&[order]).unwrap_err();
         assert!(error.contains("Money"), "{error}");
-        assert!(sandbox.stored().is_empty(), "запись не должна была появиться");
+        assert!(
+            sandbox.stored().is_empty(),
+            "запись не должна была появиться"
+        );
     }
 
     #[test]
@@ -2334,8 +2374,14 @@ mod tests {
             .unwrap();
         assert_eq!(view.format, BodyFormat::Json);
         assert!(view.avro.is_none());
-        assert!(!dir.exists(), "копии .avsc должны были уйти вместе со схемой");
-        assert!(sandbox.stored().is_empty(), "пустая запись хранению не подлежит");
+        assert!(
+            !dir.exists(),
+            "копии .avsc должны были уйти вместе со схемой"
+        );
+        assert!(
+            sandbox.stored().is_empty(),
+            "пустая запись хранению не подлежит"
+        );
         assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_none());
     }
 
@@ -2348,14 +2394,22 @@ mod tests {
         sandbox.add_avsc(&[path]).unwrap();
         let dir = sandbox.avro_schema_dir();
 
-        let view =
-            set_avro_subject(&sandbox.root, CLUSTER, TOPIC, Some("orders-value".into()), None)
-                .unwrap();
+        let view = set_avro_subject(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some("orders-value".into()),
+            None,
+        )
+        .unwrap();
         let avro = view.avro.unwrap();
         assert_eq!(avro.subject.as_deref(), Some("orders-value"));
         assert!(avro.files.is_empty());
         assert_eq!(avro.record, None);
-        assert!(!dir.exists(), "копии .avsc должны были уйти вместе с выбором реестра");
+        assert!(
+            !dir.exists(),
+            "копии .avsc должны были уйти вместе с выбором реестра"
+        );
     }
 
     /// Привязка обязана пережить перезапуск — как и любая другая настройка
@@ -2364,10 +2418,20 @@ mod tests {
     fn a_subject_binding_is_remembered() {
         let sandbox = Sandbox::new("avro-subject");
         set_options(&sandbox.root, CLUSTER, TOPIC, BodyFormat::Avro, None).unwrap();
-        set_avro_subject(&sandbox.root, CLUSTER, TOPIC, Some("orders-value".into()), Some(3))
-            .unwrap();
+        set_avro_subject(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some("orders-value".into()),
+            Some(3),
+        )
+        .unwrap();
 
-        let avro = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap().avro.unwrap();
+        let avro = view(&sandbox.root, CLUSTER, TOPIC)
+            .unwrap()
+            .unwrap()
+            .avro
+            .unwrap();
         assert_eq!(avro.subject.as_deref(), Some("orders-value"));
         assert_eq!(avro.version, Some(3));
     }
@@ -2378,8 +2442,14 @@ mod tests {
     fn a_subject_without_a_registry_is_an_explicit_error() {
         let sandbox = Sandbox::new("avro-no-registry");
         set_options(&sandbox.root, CLUSTER, TOPIC, BodyFormat::Avro, None).unwrap();
-        set_avro_subject(&sandbox.root, CLUSTER, TOPIC, Some("orders-value".into()), None)
-            .unwrap();
+        set_avro_subject(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some("orders-value".into()),
+            None,
+        )
+        .unwrap();
 
         let error = decoder(&sandbox.root, CLUSTER, TOPIC)
             .err()

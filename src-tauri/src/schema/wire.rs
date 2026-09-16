@@ -200,7 +200,13 @@ mod tests {
     #[test]
     fn the_id_is_big_endian() {
         let body = [0x00, 0x00, 0x01, 0x00, 0x00];
-        assert_eq!(framing(&body), Framing::Confluent { id: 65536, datum: &[] });
+        assert_eq!(
+            framing(&body),
+            Framing::Confluent {
+                id: 65536,
+                datum: &[]
+            }
+        );
     }
 
     #[test]
@@ -227,12 +233,18 @@ mod tests {
     #[test]
     fn a_lone_zero_byte_stays_a_datum() {
         assert_eq!(framing(&[0x00]), Framing::Bare(&[0x00]));
-        assert_eq!(framing(&[0x00, 0x00, 0x00]), Framing::Bare(&[0x00, 0x00, 0x00]));
+        assert_eq!(
+            framing(&[0x00, 0x00, 0x00]),
+            Framing::Bare(&[0x00, 0x00, 0x00])
+        );
     }
 
     #[test]
     fn a_frame_is_the_magic_the_id_and_the_body() {
-        assert_eq!(frame(42, &[0xde, 0xad]), vec![0x00, 0x00, 0x00, 0x00, 0x2a, 0xde, 0xad]);
+        assert_eq!(
+            frame(42, &[0xde, 0xad]),
+            vec![0x00, 0x00, 0x00, 0x00, 0x2a, 0xde, 0xad]
+        );
     }
 
     /// Собранное `frame` обязано разбираться `framing` — иначе мы кладём в
@@ -286,7 +298,9 @@ mod tests {
     #[test]
     fn a_nested_path_keeps_every_step() {
         // длина 3 (зигзаг 0x06), индексы 1, 0, 2 (зигзаг 0x02, 0x00, 0x04).
-        let body = [0x00, 0x00, 0x00, 0x00, 0x09, 0x06, 0x02, 0x00, 0x04, 0xbe, 0xef];
+        let body = [
+            0x00, 0x00, 0x00, 0x00, 0x09, 0x06, 0x02, 0x00, 0x04, 0xbe, 0xef,
+        ];
         assert_eq!(
             proto_framing(&body),
             ProtoFraming::Confluent {
@@ -324,7 +338,9 @@ mod tests {
     #[test]
     fn an_absurd_index_count_is_refused_without_allocating() {
         // Зигзаг-varint на 0x7fffffff: заведомо больше потолка.
-        let body = [0x00, 0x00, 0x00, 0x00, 0x01, 0xfe, 0xff, 0xff, 0xff, 0x0f, 0xaa];
+        let body = [
+            0x00, 0x00, 0x00, 0x00, 0x01, 0xfe, 0xff, 0xff, 0xff, 0x0f, 0xaa,
+        ];
         assert_eq!(proto_framing(&body), ProtoFraming::Bare(&body));
     }
 

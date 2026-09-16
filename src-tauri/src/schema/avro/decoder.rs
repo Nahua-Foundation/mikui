@@ -193,7 +193,10 @@ mod tests {
 
         let error = decoder.decode(&framed).unwrap_err();
         assert!(error.contains("schema id 42"), "{error}");
-        assert!(error.contains("no schema registry is configured"), "{error}");
+        assert!(
+            error.contains("no schema registry is configured"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -222,6 +225,9 @@ mod tests {
         let bytes = writer.into_inner().unwrap();
 
         let decoder = AvroDecoder::new(None, None, None);
-        assert_eq!(decoder.decode(&bytes).unwrap(), r#"{"id":"a-1","kind":"CLICK"}"#);
+        assert_eq!(
+            decoder.decode(&bytes).unwrap(),
+            r#"{"id":"a-1","kind":"CLICK"}"#
+        );
     }
 }

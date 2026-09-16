@@ -56,7 +56,9 @@ impl Decoder {
     /// обычные строки, которым просто повезло попасть в белый список.
     pub fn decode_with_enums(&self, payload: &[u8]) -> Result<(String, Vec<String>), String> {
         match self {
-            Decoder::Proto(d) => d.decode(payload).map(|json| (json, d.enum_values().to_vec())),
+            Decoder::Proto(d) => d
+                .decode(payload)
+                .map(|json| (json, d.enum_values().to_vec())),
             Decoder::Avro(d) => d.decode_with_enums(payload),
             Decoder::Json(d) => d.decode(payload).map(|json| (json, Vec::new())),
             Decoder::Hex => Ok((encode_hex(payload), Vec::new())),

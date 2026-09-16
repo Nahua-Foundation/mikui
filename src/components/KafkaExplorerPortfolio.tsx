@@ -80,6 +80,9 @@ const LINK_CONTEXT = 50;
 /** Звонок в дверь из бэкенда: система принесла ссылку — см. lib.rs. */
 const LINK_EVENT = 'mikui://link';
 
+/** Воркер упал и поднят заново: подключения больше нет — см. worker.rs. */
+const WORKER_RESTARTED = 'mikui://worker-restarted';
+
 const isSuperseded = (e: unknown) => String(e).includes(READ_SUPERSEDED);
 const isStopped = (e: unknown) => String(e).includes(SEARCH_STOPPED);
 
@@ -144,6 +147,8 @@ export function KafkaExplorerPortfolio() {
   /** Избранные топики ВСЕХ кластеров — так они и лежат в settings.json.
    *  Панели уходит только набор текущего. */
   const [favoriteTopics, setFavoriteTopics] = useState<FavoriteTopics>({});
+  /** Путь к журналу паник, если приложение когда-нибудь падало. */
+  const [crashLog, setCrashLog] = useState<string | null>(null);
   const [topics, setTopics] = useState<Topic[]>([]);
 
   const [total, setTotal] = useState(0);
@@ -323,6 +328,18 @@ export function KafkaExplorerPortfolio() {
       .then(setFavoriteTopics)
       .catch((e) => console.error('Failed to load favorite topics', e));
   }, []);
+
+  // Падал ли бэкенд когда-нибудь. Спрашивается один раз при старте и НЕ
+  // перечитывается: свежая паника и так приезжает своим сообщением, а вот
+  // записанная в прошлый запуск иначе осталась бы незамеченной — именно её
+  // обычно и просят прислать.
+  useEffect(() => {
+    api
+      .panicLog()
+      .then(setCrashLog)
+      .catch((e) => console.error('Failed to check the panic log', e));
+  }, []);
+
 
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
@@ -1152,14 +1169,56 @@ export function KafkaExplorerPortfolio() {
    * Состояние UI обязано это отразить целиком: и шапка, и список топиков, и
    * открытая таблица — иначе останется картинка живого сеанса, которого нет.
    */
-  const disconnect = useCallback(async () => {
-    await api.clusterDisconnect().catch((e) => console.error('Disconnect failed', e));
+  /**
+   * Забыть подключение. Бэкенду при этом ничего не говорится.
+   *
+   * Отдельно от `disconnect` ради перезапуска воркера: там отключаться уже не
+   * от чего — подключение ушло вместе с упавшим потоком, — а состояние на
+   * фронте осталось и показывает кластер живым.
+   */
+  const forgetConnection = useCallback(() => {
     setConnectedClusterId(null);
     setConnectedUserId(null);
     setConnectedName(null);
     setTopics([]);
     setSelectedTopic(null);
   }, []);
+
+  const disconnect = useCallback(async () => {
+    await api.clusterDisconnect().catch((e) => console.error('Disconnect failed', e));
+    forgetConnection();
+  }, [forgetConnection]);
+
+  /**
+   * Воркер упал и поднят заново.
+   *
+   * Сообщение об этом приезжает и ответом на команду, но ответ достаётся ровно
+   * тому вызову, который заметил смерть, — а подключения нет уже ни у кого.
+   * Поэтому состояние сбрасывается по событию: иначе шапка показывала бы
+   * кластер подключённым, а список — топики, которых на новом воркере нет.
+   *
+   * Заодно перечитываем путь к журналу: до этой паники его могло не быть
+   * вовсе, а кнопка «прислать трейс» нужна именно сейчас.
+   */
+  useEffect(() => {
+    const listener = listen(WORKER_RESTARTED, () => {
+      forgetConnection();
+      api
+        .panicLog()
+        .then(setCrashLog)
+        .catch((e) => console.error('Failed to check the panic log', e));
+      // Дольше обычного: это не «не получилось», а «состояние потеряно, надо
+      // переподключиться», и прочитать это человек обязан успеть.
+      toast.error(
+        'The Kafka worker crashed and was restarted. Reconnect to the cluster to continue — ' +
+          'the crash log is in the header, please send it over.',
+        { duration: 15000 },
+      );
+    });
+    return () => {
+      listener.then((stop) => stop()).catch(() => {});
+    };
+  }, [forgetConnection]);
 
   /** `fromConfig` — пришли из настроек кластера, значит есть куда вернуться. */
   const handleManageUsers = useCallback((cluster: KafkaCluster, fromConfig = false) => {
@@ -1250,6 +1309,13 @@ export function KafkaExplorerPortfolio() {
   const handleOpenLink = useCallback(() => {
     setIncomingLink(null);
     setIsOpenLinkOpen(true);
+  }, []);
+
+  const handleRevealCrashLog = useCallback(() => {
+    api.revealPanicLog().catch((e) => {
+      console.error('Failed to reveal the panic log', e);
+      toast.error(describeError(e));
+    });
   }, []);
 
   /**
@@ -1441,6 +1507,8 @@ export function KafkaExplorerPortfolio() {
         onOpenFavorites={handleOpenFavorites}
         onProduce={handleOpenProduce}
         onOpenLink={handleOpenLink}
+        crashLog={crashLog}
+        onRevealCrashLog={handleRevealCrashLog}
       />
 
       <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">

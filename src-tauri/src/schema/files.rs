@@ -26,7 +26,9 @@ pub struct Pending {
 /// не должен превращаться в запись куда угодно по файловой системе.
 fn is_safe_name(name: &str) -> bool {
     !name.is_empty()
-        && Path::new(name).components().all(|c| matches!(c, Component::Normal(_)))
+        && Path::new(name)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// Заново раскладывает каталог схемы под указанный набор файлов.

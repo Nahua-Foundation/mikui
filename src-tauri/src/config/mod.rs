@@ -7,7 +7,7 @@ mod types;
 // запись, битый файл отодвигается в `.bad`. Заводить второй набор этих
 // примитивов значило бы завести и второй набор способов их сломать.
 pub use store::{
-    clusters_at, config_dir, load_clusters, load_settings, read_json, save_clusters,
-    save_settings, write_atomic,
+    clusters_at, config_dir, load_clusters, load_settings, read_json, save_clusters, save_settings,
+    write_atomic,
 };
 pub use types::{ClusterConfig, ClusterUser, SchemaRegistry, Settings};

@@ -279,11 +279,20 @@ mod tests {
             "syntax = \"proto3\"; package p; message Before {}",
         );
 
-        assert_eq!(linked(&dir.0, &[file.clone()]).unwrap().messages, ["p.Before"]);
+        assert_eq!(
+            linked(&dir.0, &[file.clone()]).unwrap().messages,
+            ["p.Before"]
+        );
 
-        dir.write("a.proto", "syntax = \"proto3\"; package p; message After {}");
+        dir.write(
+            "a.proto",
+            "syntax = \"proto3\"; package p; message After {}",
+        );
         // Без сброса кэша разбор остался бы прежним — именно это и проверяем.
-        assert_eq!(linked(&dir.0, &[file.clone()]).unwrap().messages, ["p.Before"]);
+        assert_eq!(
+            linked(&dir.0, &[file.clone()]).unwrap().messages,
+            ["p.Before"]
+        );
         invalidate(&dir.0);
         assert_eq!(linked(&dir.0, &[file]).unwrap().messages, ["p.After"]);
     }
