@@ -3,6 +3,7 @@
 import { createPortal } from "react-dom";
 import { Toaster as Sonner, ToasterProps } from "sonner";
 import { useTheme } from "../../theme";
+import { useTrackpadToastSwipe } from "./toast-swipe";
 
 /**
  * Тост берёт тему у приложения, а не держит свою.
@@ -51,6 +52,8 @@ import { useTheme } from "../../theme";
  */
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme } = useTheme();
+  // Смахивание двумя пальцами по трекпаду — своего у sonner нет, см. хук.
+  useTrackpadToastSwipe();
   // В `body`, а не туда, где `<Toaster/>` стоит в дереве: внутри `#root` он
   // заперт в чужом контексте наложения — см. объяснение выше.
   return createPortal(
@@ -79,6 +82,9 @@ const Toaster = ({ ...props }: ToasterProps) => {
       }
       {...props}
     />,
+    // Узел важен не только для слоёв: в него React делегирует события портала,
+    // и на него же рассчитывает заслонка в `useTrackpadToastSwipe`. Менять —
+    // вместе с ней.
     document.body,
   );
 };
