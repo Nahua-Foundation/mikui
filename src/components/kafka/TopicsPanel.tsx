@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, Search, X } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, Star, X } from 'lucide-react';
 import { Input } from '../ui/input';
 import { Topic } from './types';
 import { Virtuoso } from 'react-virtuoso';
@@ -453,6 +453,13 @@ export function TopicsPanel({
             ) : (
               <ChevronDown className="size-3.5 shrink-0" />
             )}
+            {/* Та же звезда с заливкой, что стоит в отмеченной строке, и того
+                же цвета — по ней секция и опознаётся как «то самое избранное».
+                На размер меньше строчной: рядом с `text-xs` заголовка звезда в
+                `size-4` читалась бы кнопкой, а нажимается здесь вся шапка.
+                Цвет свой, не от заголовка: тот под курсором светлеет, а метка
+                секции от наведения меняться не должна. */}
+            <Star className="size-3 shrink-0 fill-current text-brand" />
             {/* Счётчик показывает то, что в секции ВИДНО: под активным поиском
                 она просеяна тем же словом, что и список под ней. */}
             Favorites ({favoriteRows.length})

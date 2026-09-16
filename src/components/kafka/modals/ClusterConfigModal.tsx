@@ -115,6 +115,52 @@ interface ClusterConfigModalProps {
   onApply?: (cluster: KafkaCluster) => Promise<void>;
 }
 
+/**
+ * Классы для кнопки, которая на время работы показывает вертушку.
+ *
+ * Без них подпись прошлого кадра оставалась нарисованной под новой: на кнопке
+ * читалось «Test» тёмным (цвет ВКЛЮЧЁННОЙ кнопки, то есть кадр до нажатия) и
+ * «Testing…» серым поверх него, и всё это подрагивало в такт вращению.
+ *
+ * `isolate` — против этого. `animate-spin` уводит вертушку на свой слой
+ * композитора, и WebKit перестаёт правильно гасить текстовую область родителя.
+ * Свой контекст наложения у кнопки замыкает слой внутри неё, и перерисовка
+ * снова накрывает подпись.
+ *
+ * `transition-colors` вместо `transition-all` из базового класса кнопки:
+ * анимировать «всё» у элемента, у которого меняется содержимое, — это просить
+ * движок сглаживать в том числе размеры и раскладку, то есть ровно то, что
+ * здесь и переключается.
+ */
+const SPINNER_BUTTON = 'isolate transition-colors';
+
+/**
+ * Подпись кнопки с двумя состояниями.
+ *
+ * Текст обёрнут в `span`, а не положен голым узлом: голый узел React правит
+ * НА МЕСТЕ, и гасить его приходится движку по грязной области. Два разных
+ * элемента он заменяет целиком, вместе с их коробками, — инвалидация выходит
+ * честной. Это вторая половина лечения от наложенных подписей.
+ */
+function SpinnerLabel({
+  busy,
+  busyText,
+  children,
+}: {
+  busy: boolean;
+  busyText: string;
+  children: string;
+}) {
+  return busy ? (
+    <>
+      <Loader2 className="size-4 animate-spin" />
+      <span>{busyText}</span>
+    </>
+  ) : (
+    <span>{children}</span>
+  );
+}
+
 export function ClusterConfigModal({
   open,
   onOpenChange,
@@ -827,10 +873,11 @@ export function ClusterConfigModal({
                     onClick={handleTestRegistry}
                     variant="outline"
                     disabled={isTestingRegistry}
-                    className="bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50"
+                    className={`bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 ${SPINNER_BUTTON}`}
                   >
-                    {isTestingRegistry && <Loader2 className="size-4 animate-spin" />}
-                    {isTestingRegistry ? 'Testing…' : 'Test registry'}
+                    <SpinnerLabel busy={isTestingRegistry} busyText="Testing…">
+                      Test registry
+                    </SpinnerLabel>
                   </Button>
                 </>
               )}
@@ -858,10 +905,11 @@ export function ClusterConfigModal({
             onClick={handleTestConnection}
             variant="outline"
             disabled={isTesting || isSaving}
-            className="flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex-1 bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono disabled:opacity-50 disabled:cursor-not-allowed ${SPINNER_BUTTON}`}
           >
-            {isTesting && <Loader2 className="size-4 animate-spin" />}
-            {isTesting ? 'Testing…' : 'Test'}
+            <SpinnerLabel busy={isTesting} busyText="Testing...">
+              Test
+            </SpinnerLabel>
           </Button>
           {/* Одна кнопка на оба действия — и в создании, и в правке.
               Отдельный Connect рядом с Save подключался бы НЕ СОХРАНЯЯ:
@@ -871,10 +919,11 @@ export function ClusterConfigModal({
           <Button
             onClick={handleSave}
             disabled={isSaving || isTesting}
-            className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed"
+            className={`flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:opacity-70 disabled:cursor-not-allowed ${SPINNER_BUTTON}`}
           >
-            {isSaving && <Loader2 className="size-4 animate-spin" />}
-            {isSaving ? 'Saving…' : 'Save & connect'}
+            <SpinnerLabel busy={isSaving} busyText="Saving...">
+              Save &amp; connect
+            </SpinnerLabel>
           </Button>
         </div>
       </DialogContentNoClose>
