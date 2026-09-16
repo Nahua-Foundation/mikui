@@ -1,4 +1,17 @@
-import { Bug, ChevronDown, Filter, Link2, RefreshCw, Play, Folder, Search, Send, User, Users } from 'lucide-react';
+import {
+  Bug,
+  ChevronDown,
+  Filter,
+  Link2,
+  RefreshCw,
+  Play,
+  Folder,
+  Search,
+  Send,
+  User,
+  Users,
+  X,
+} from 'lucide-react';
 import { Button } from '../ui/button';
 import {
   DropdownMenu,
@@ -21,6 +34,7 @@ import {
   ReadMode,
   ReadRange,
   EMPTY_FILTER,
+  hasQuery,
   needsSasl,
 } from './types';
 import { Tab } from './components/Tab';
@@ -166,7 +180,11 @@ export function HeaderDesktop({
   onRevealCrashLog,
 }: HeaderDesktopProps) {
   const partitions = topic ? Array.from({ length: topic.partitions }, (_, i) => i) : [];
-  const hasActiveFilters = filters.key.trim() !== '' || filters.value.trim() !== '';
+  const hasActiveFilters = hasQuery(filters);
+  /** Заполнено что-то, кроме верхнего поля, — значит в панели есть чего не
+   *  видно, и о ней надо сказать иначе, чем просто подсветкой. */
+  const hasAimedFilters =
+    filters.key.trim() !== '' || filters.headers.trim() !== '' || filters.value.trim() !== '';
   const allPartitions = selectedPartitions === null;
   /** В топике ровно одна партиция — выбирать не из чего. */
   const onlyPartition = partitions.length === 1;
@@ -292,19 +310,56 @@ export function HeaderDesktop({
             <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
               <div className="relative">
                 <Search className="absolute left-2 top-1/2 transform -translate-y-1/2 size-4 text-dim" />
-                {/* Поле поиска раньше было декоративным. Теперь это фильтр по
-                    телу сообщения; применяется в Rust по сырым байтам. */}
+                {/* Поле ищет ПО ВСЕМУ: в ключе, в заголовках, в теле. Раньше
+                    оно было привязано к запросу по телу и об этом молчало —
+                    единственное поле поиска на виду читается как «найди это в
+                    сообщениях», а находило только в одном из трёх мест.
+                    Прицельные запросы остались в панели рядом. */}
                 <Input
-                  value={filters.value}
-                  onChange={(e) => onFiltersChange({ ...filters, value: e.target.value })}
-                  placeholder="Search in messages"
+                  value={filters.anywhere}
+                  onChange={(e) => onFiltersChange({ ...filters, anywhere: e.target.value })}
+                  placeholder="Search everywhere"
                   disabled={isSearching}
-                  title={isSearching ? FILTER_LOCKED : undefined}
-                  className="bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8 pr-9 w-64"
+                  title={
+                    isSearching
+                      ? FILTER_LOCKED
+                      : 'Matches the key, the headers or the body. Narrow it down in the filters.'
+                  }
+                  // Место под крестик освобождается только когда он есть:
+                  // пустому полю лишний отступ ни к чему. Ровно так же устроено
+                  // поле поиска по названиям топиков.
+                  className={`bg-surface border-edge text-strong font-mono placeholder:text-dim pl-8 w-64 ${
+                    filters.anywhere ? 'pr-14' : 'pr-9'
+                  }`}
                 />
+                {/* Крестик заперт вместе с полем, а не спрятан: во время
+                    глубокого поиска фильтр не меняется, и кнопка, пропадающая
+                    именно тогда, когда запрос в поле самый длинный, выглядела
+                    бы поломкой. Подсказка у неё та же, что у поля. */}
+                {filters.anywhere && (
+                  <button
+                    type="button"
+                    onClick={() => onFiltersChange({ ...filters, anywhere: '' })}
+                    disabled={isSearching}
+                    title={isSearching ? FILTER_LOCKED : 'Clear search'}
+                    className={`absolute right-[26px] top-1/2 -translate-y-1/2 flex items-center transition-colors p-0 border-none bg-transparent disabled:cursor-not-allowed ${
+                      isSearching
+                        ? 'text-dim opacity-50'
+                        : 'text-dim hover:text-strong cursor-pointer'
+                    }`}
+                  >
+                    <X className="size-4" />
+                  </button>
+                )}
                 <DropdownMenu>
                   <DropdownMenuTrigger
-                    title={isSearching ? FILTER_LOCKED : 'Filters'}
+                    title={
+                      isSearching
+                        ? FILTER_LOCKED
+                        : hasAimedFilters
+                          ? 'Filters — some fields are set'
+                          : 'Filters'
+                    }
                     disabled={isSearching}
                     className={`absolute right-2 top-1/2 -translate-y-1/2 bg-transparent border-none outline-none p-0 transition-colors disabled:cursor-not-allowed ${
                       isSearching
@@ -318,12 +373,40 @@ export function HeaderDesktop({
                   </DropdownMenuTrigger>
                   <DropdownMenuContent className="bg-surface border-edge min-w-80 p-4" align="end">
                     <div className="space-y-4">
+                      {/* Первым — то же поле, что в шапке. Так видно, что общий
+                          запрос и прицельные живут в одном наборе и
+                          складываются, а не спорят друг с другом. */}
+                      <div className="space-y-2">
+                        <Label className="font-mono text-sm text-soft">Anywhere</Label>
+                        <Input
+                          value={filters.anywhere}
+                          onChange={(e) =>
+                            onFiltersChange({ ...filters, anywhere: e.target.value })
+                          }
+                          placeholder="Key, headers or body..."
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
+                        />
+                      </div>
                       <div className="space-y-2">
                         <Label className="font-mono text-sm text-soft">Key</Label>
                         <Input
                           value={filters.key}
                           onChange={(e) => onFiltersChange({ ...filters, key: e.target.value })}
                           placeholder="Filter by key..."
+                          className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label
+                          className="font-mono text-sm text-soft"
+                          title="Matches a header name or its value"
+                        >
+                          Headers
+                        </Label>
+                        <Input
+                          value={filters.headers}
+                          onChange={(e) => onFiltersChange({ ...filters, headers: e.target.value })}
+                          placeholder="Filter by header name or value..."
                           className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
@@ -336,6 +419,14 @@ export function HeaderDesktop({
                           className="bg-surface border-edge text-strong font-mono placeholder:text-dim"
                         />
                       </div>
+                      {/* Несколько заполненных полей — это И: каждое сужает
+                          отбор. Сказать об этом здесь дешевле, чем дать
+                          гадать, почему два запроса вместе находят меньше. */}
+                      {hasAimedFilters && filters.anywhere.trim() !== '' && (
+                        <div className="font-mono text-xs text-dim">
+                          A message has to match every field that is filled in.
+                        </div>
+                      )}
                       <div className="flex items-center gap-2">
                         <Checkbox
                           id="case-sensitive"

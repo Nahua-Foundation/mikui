@@ -2527,7 +2527,17 @@ impl Worker {
                     // Сито стоит ПОСЛЕ учёта и ДО арены: непопавшее в топике
                     // было, а в буфере его не будет.
                     if let Some(sieve) = &sieve {
-                        if !sieve.filter.matches(key, value, sieve.decoder.as_deref()) {
+                        // Уже разобранные заголовки, разложенные в ту же
+                        // последовательность кусков, что отдаёт арена
+                        // (`MessageStore::header_chunks`): имя, значение, имя…
+                        // Сито и просев буфера обязаны видеть одно и то же.
+                        let chunks = headers
+                            .iter()
+                            .flat_map(|(name, value)| [name.as_bytes(), *value]);
+                        if !sieve
+                            .filter
+                            .matches(key, value, chunks, sieve.decoder.as_deref())
+                        {
                             continue;
                         }
                     }
@@ -3116,7 +3126,10 @@ impl Worker {
 /// Разобранный запрос: иглы готовятся один раз на проход по буферу, а не на
 /// каждое сообщение.
 struct PreparedFilter {
+    /// Запрос «где угодно»: подходит совпадение в любом из полей.
+    anywhere: Needle,
     key: Needle,
+    headers: Needle,
     value: Needle,
     /// Разбирать ли тело перед поиском. Флаг фронта сам по себе ничего не
     /// значит — без схемы разбирать нечем.
@@ -3126,42 +3139,74 @@ struct PreparedFilter {
 impl PreparedFilter {
     fn new(filter: &MessageFilter, has_decoder: bool) -> Self {
         Self {
+            anywhere: Needle::new(&filter.anywhere, filter.case_sensitive),
             key: Needle::new(&filter.key, filter.case_sensitive),
+            headers: Needle::new(&filter.headers, filter.case_sensitive),
             value: Needle::new(&filter.value, filter.case_sensitive),
             decode_value: filter.search_decoded && has_decoder,
         }
     }
 
-    /// Пусты ли обе иглы, то есть «не фильтровать».
+    /// Пусты ли все иглы, то есть «не фильтровать».
     ///
     /// `search_decoded` сюда намеренно не входит: он задаёт, ГДЕ искать, а не
     /// ЧТО. Учитывать его значило бы на голом флаге с пустыми иглами уйти в
     /// медленный путь по всему буферу с запросом, который и так совпадает со
     /// всем подряд.
     fn is_empty(&self) -> bool {
-        self.key.is_empty() && self.value.is_empty()
+        self.anywhere.is_empty()
+            && self.key.is_empty()
+            && self.headers.is_empty()
+            && self.value.is_empty()
     }
 
-    fn matches(&self, key: &[u8], value: &[u8], decoder: Option<&Decoder>) -> bool {
+    /// Подходит ли сообщение. Заполненные поля соединяются И: каждое из них —
+    /// отдельное требование, и сузить отбор вторым полем должно быть можно.
+    fn matches<'a>(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        mut headers: impl Iterator<Item = &'a [u8]> + Clone,
+        decoder: Option<&Decoder>,
+    ) -> bool {
         // Ключ ищем только по сырым байтам: он не protobuf, разбирать нечего.
         if !self.key.matches(key) {
             return false;
         }
-        if self.value.matches(value) {
+        if !self.headers.is_empty() && !headers.clone().any(|c| self.headers.matches(c)) {
+            return false;
+        }
+        if !self.value.is_empty() && !self.body_matches(&self.value, value, decoder) {
+            return false;
+        }
+        if self.anywhere.is_empty() {
             return true;
         }
-        // Сначала сырые байты, декодирование — только на промахе. Строковые
-        // поля protobuf лежат на проводе непрерывным UTF-8 и находятся без
-        // разбора, поэтому обычный запрос по содержимому не платит за декодер
-        // вовсе; платит только настоящий промах или запрос по имени поля.
-        //
-        // Это важно: `SetFilter` пересобирает представление на каждое нажатие
-        // клавиши, и полный разбор буфера там встал бы поперёк того же потока,
-        // который отдаёт окна на экран.
+        // Порядок здесь — от дешёвого к дорогому: ключ короткий, заголовков
+        // единицы, тело может оказаться мегабайтом, а декодирование его же
+        // стоит дороже всего остального вместе.
+        self.anywhere.matches(key)
+            || headers.any(|chunk| self.anywhere.matches(chunk))
+            || self.body_matches(&self.anywhere, value, decoder)
+    }
+
+    /// Поиск по телу: сначала по сырым байтам, разбор — только на промахе.
+    ///
+    /// Строковые поля protobuf лежат на проводе непрерывным UTF-8 и находятся
+    /// без разбора, поэтому обычный запрос по содержимому не платит за декодер
+    /// вовсе; платит только настоящий промах или запрос по имени поля.
+    ///
+    /// Это важно: `SetFilter` пересобирает представление на каждое нажатие
+    /// клавиши, и полный разбор буфера там встал бы поперёк того же потока,
+    /// который отдаёт окна на экран.
+    fn body_matches(&self, needle: &Needle, value: &[u8], decoder: Option<&Decoder>) -> bool {
+        if needle.matches(value) {
+            return true;
+        }
         self.decode_value
             && decoder.is_some_and(|d| {
                 d.decode(value)
-                    .is_ok_and(|json| self.value.matches(json.as_bytes()))
+                    .is_ok_and(|json| needle.matches(json.as_bytes()))
             })
     }
 }
@@ -3207,7 +3252,12 @@ fn append_view(
     view: &mut Vec<u32>,
 ) {
     for i in from..store.committed_len() {
-        if prepared.matches(store.key(i), store.value(i), decoder) {
+        if prepared.matches(
+            store.key(i),
+            store.value(i),
+            store.header_chunks(i),
+            decoder,
+        ) {
             view.push(i as u32);
         }
     }
@@ -3859,9 +3909,28 @@ mod tests {
         MessageFilter {
             key: key.to_string(),
             value: value.to_string(),
-            case_sensitive: false,
-            search_decoded: false,
+            ..MessageFilter::default()
         }
+    }
+
+    /// Ключ, тело и заголовки одного сообщения.
+    type HeaderRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a [u8])]);
+
+    /// Стор с заголовками — для запросов по ним и по «где угодно».
+    fn store_with_headers(rows: &[HeaderRow]) -> MessageStore {
+        let mut store = MessageStore::new(1 << 20);
+        for (i, (key, value, headers)) in rows.iter().enumerate() {
+            assert!(store.push(
+                0,
+                i as i64,
+                i as i64,
+                key.as_bytes(),
+                value.as_bytes(),
+                headers
+            ));
+        }
+        store.commit_all();
+        store
     }
 
     fn view_of(
@@ -3910,6 +3979,80 @@ mod tests {
         assert_eq!(view_of(&store, &filter_of("КЛИЕНТ", ""), None), vec![0, 1]);
         assert_eq!(view_of(&store, &filter_of("", "сбербанк"), None), vec![0]);
         assert_eq!(view_of(&store, &filter_of("", "газпром"), None), vec![1]);
+    }
+
+    // --- Заголовки и «где угодно» --------------------------------------------
+
+    /// Строки для обоих тестов ниже: у каждого сообщения своё место, где
+    /// лежит слово `trace` — в ключе, в имени заголовка, в его значении и в
+    /// теле. Так видно, что поиск смотрит именно туда, куда обещает.
+    fn headers_rows() -> Vec<HeaderRow<'static>> {
+        vec![
+            ("trace-in-key", "body-0", &[]),
+            ("k1", "body-1", &[("x-trace-id", b"abc")]),
+            ("k2", "body-2", &[("x-request-id", b"trace-42")]),
+            ("k3", "body-3-trace", &[("content-type", b"json")]),
+            ("k4", "body-4", &[("content-type", b"json")]),
+        ]
+    }
+
+    fn headers_filter(query: &str) -> MessageFilter {
+        MessageFilter {
+            headers: query.to_string(),
+            ..MessageFilter::default()
+        }
+    }
+
+    fn anywhere_filter(query: &str) -> MessageFilter {
+        MessageFilter {
+            anywhere: query.to_string(),
+            ..MessageFilter::default()
+        }
+    }
+
+    #[test]
+    fn the_headers_needle_matches_a_name_or_a_value() {
+        let store = store_with_headers(&headers_rows());
+
+        // Имя у первого, значение у второго. Ни ключ, ни тело здесь не
+        // считаются — для них свои поля.
+        let found = view_of(&store, &headers_filter("trace"), None);
+        assert_eq!(found, vec![1, 2]);
+
+        let found = view_of(&store, &headers_filter("content-type"), None);
+        assert_eq!(found, vec![3, 4]);
+
+        // Заголовков нет вовсе — совпасть нечему, но и падать не на чем.
+        assert!(view_of(&store, &headers_filter("anything"), None).is_empty());
+    }
+
+    #[test]
+    fn the_anywhere_needle_looks_at_key_headers_and_body() {
+        let store = store_with_headers(&headers_rows());
+
+        // Ключ, имя заголовка, значение заголовка, тело — все четыре места.
+        let found = view_of(&store, &anywhere_filter("trace"), None);
+        assert_eq!(found, vec![0, 1, 2, 3]);
+
+        assert!(view_of(&store, &anywhere_filter("нет-такого"), None).is_empty());
+    }
+
+    /// Заполненные поля соединяются И: второе поле обязано СУЖАТЬ отбор, иначе
+    /// прицельный поиск поверх общего не имел бы смысла.
+    #[test]
+    fn anywhere_and_the_aimed_needles_narrow_each_other() {
+        let store = store_with_headers(&headers_rows());
+
+        let mut filter = anywhere_filter("trace");
+        filter.key = "k3".to_string();
+        // Под «где угодно» подходили четыре строки; ключ оставил одну — ту, у
+        // которой `trace` в теле. Остальные три отпали, включая ту, у которой
+        // совпадение было как раз в ключе.
+        assert_eq!(view_of(&store, &filter, None), vec![3]);
+
+        filter.key = String::new();
+        filter.headers = "x-request-id".to_string();
+        assert_eq!(view_of(&store, &filter, None), vec![2]);
     }
 
     #[test]

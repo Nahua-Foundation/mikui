@@ -24,6 +24,7 @@ import {
   EMPTY_FILTER,
   EMPTY_RANGE,
   clusterKey,
+  hasQuery,
 } from './kafka';
 import * as api from './kafka/api';
 import { HeaderDesktop } from './kafka';
@@ -1514,6 +1515,10 @@ export function KafkaExplorerPortfolio() {
       <div className="box-border content-stretch flex flex-row items-start justify-start p-0 relative shrink-0 w-full flex-1 min-h-0 h-full">
         <TopicsPanel
           topics={topics}
+          // Чьи это топики. Сменилась учётка — сменился и список: под другими
+          // ACL видно другое, и прежний запрос в поле поиска относится уже не
+          // к тому, что в нём лежит.
+          scope={connectedClusterId && `${connectedClusterId}:${connectedUserId ?? ''}`}
           selectedTopic={selectedTopic}
           onTopicSelect={handleSelectTopic}
           onTopicInfo={handleTopicInfo}
@@ -1541,7 +1546,7 @@ export function KafkaExplorerPortfolio() {
                 // is already in progress") — кнопку не предлагаем вовсе.
                 isLoadingMore={isLoadingMore || isLoadingMessages || isSearching}
                 onLoadMore={handleLoadMore}
-                hasFilter={filters.key.trim() !== '' || filters.value.trim() !== ''}
+                hasFilter={hasQuery(filters)}
                 isSearching={isSearching}
                 searchedBuffer={searchedBuffer}
                 scope={stats}
@@ -1658,6 +1663,9 @@ export function KafkaExplorerPortfolio() {
         onCreateNew={handleCreateNewCluster}
         onEditCluster={handleEditCluster}
         onConnectToCluster={handleConnectToCluster}
+        onDisconnect={() => {
+          disconnect().then(() => toast.info('Disconnected'));
+        }}
       />
 
       <ClusterConfigModal

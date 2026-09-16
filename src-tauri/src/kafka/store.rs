@@ -208,6 +208,23 @@ impl MessageStore {
         out
     }
 
+    /// Имена и значения заголовков подряд, по одному куску за раз.
+    ///
+    /// Отдельно от `headers` ради фильтра. Тот прогоняется по ВСЕМУ буферу на
+    /// каждое нажатие клавиши, а `headers` собирает `Vec` — то есть аллокацию
+    /// на сообщение, которых в буфере десятки тысяч. Здесь не аллоцируется
+    /// ничего, и различать имя от значения не нужно: поиск по заголовкам
+    /// совпадением считает и то и другое.
+    pub fn header_chunks(&self, i: usize) -> HeaderChunks<'_> {
+        let meta = &self.index[i];
+        HeaderChunks {
+            bytes: &self.blob[meta.headers.range()],
+            pos: 0,
+            // Кусков вдвое больше, чем заголовков: имя и значение у каждого.
+            left: meta.header_count as usize * 2,
+        }
+    }
+
     /// Сколько байт арены заняло бы это сообщение, если его положить.
     ///
     /// Нужна глубокому поиску: он кладёт в арену только находки, а мерить
@@ -329,6 +346,32 @@ impl MessageStore {
     }
 }
 
+/// Обход уложенных заголовков: имя, значение, имя, значение…
+///
+/// `Clone` — не удобство, а требование фильтра: запрос «где угодно» проходит
+/// по заголовкам вторым заходом, после ключа, и обойти их дважды надо без
+/// того, чтобы собирать что-либо в память.
+#[derive(Clone)]
+pub struct HeaderChunks<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    left: usize,
+}
+
+impl<'a> Iterator for HeaderChunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.left == 0 {
+            return None;
+        }
+        let (chunk, next) = read_chunk(self.bytes, self.pos)?;
+        self.pos = next;
+        self.left -= 1;
+        Some(chunk)
+    }
+}
+
 fn read_chunk(bytes: &[u8], pos: usize) -> Option<(&[u8], usize)> {
     let header_end = pos.checked_add(4)?;
     let len_bytes: [u8; 4] = bytes.get(pos..header_end)?.try_into().ok()?;
@@ -390,6 +433,36 @@ mod tests {
         assert_eq!(read[0], ("content-type", b"application/json".as_slice()));
         assert_eq!(read[1], ("empty", b"".as_slice()));
         assert_eq!(read[2], ("binary", [0xff, 0x00, 0xfe].as_slice()));
+    }
+
+    /// Обход для фильтра идёт по тем же байтам, что и разбор для модалки, — и
+    /// обязан видеть ровно то же, иначе поиск находил бы не то, что показано.
+    #[test]
+    fn header_chunks_walk_the_same_bytes_as_the_parsed_headers() {
+        let mut store = MessageStore::new(DEFAULT_MAX_BYTES);
+        let headers: Vec<(&str, &[u8])> = vec![
+            ("content-type", b"application/json".as_slice()),
+            ("empty", b"".as_slice()),
+            ("binary", &[0xff, 0x00, 0xfe]),
+        ];
+        assert!(store.push(0, 0, 0, b"k", b"v", &headers));
+
+        let chunks: Vec<&[u8]> = store.header_chunks(0).collect();
+        assert_eq!(
+            chunks,
+            vec![
+                b"content-type".as_slice(),
+                b"application/json".as_slice(),
+                b"empty".as_slice(),
+                b"".as_slice(),
+                b"binary".as_slice(),
+                [0xff, 0x00, 0xfe].as_slice(),
+            ]
+        );
+
+        // Сообщение без заголовков обходится нулём кусков, а не паникой.
+        assert!(store.push(0, 1, 0, b"k", b"v", &[]));
+        assert_eq!(store.header_chunks(1).count(), 0);
     }
 
     /// Тот самый инвариант, ради которого `footprint` живёт в этом модуле:

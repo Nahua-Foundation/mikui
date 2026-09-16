@@ -197,7 +197,18 @@ export interface SavedMessage extends FullMessage {
 
 /** Применяется в Rust по сырым байтам, до пересечения границы IPC. */
 export interface MessageFilter {
+  /**
+   * Запрос из поля в шапке: совпадение где угодно — в ключе, в имени или
+   * значении заголовка, в теле.
+   *
+   * Отдельно от `value` затем, что поле в шапке одно, стоит на виду и читается
+   * как «найди это в сообщениях». Раньше оно искало только по телу и об этом
+   * молчало. Прицельные поля остались в панели фильтров.
+   */
+  anywhere: string;
   key: string;
+  /** Запрос по заголовкам: совпадением считается и имя, и значение. */
+  headers: string;
   value: string;
   case_sensitive: boolean;
   /** Искать ли по разобранному телу, а не только по сырым байтам. Осмысленно
@@ -207,11 +218,21 @@ export interface MessageFilter {
 }
 
 export const EMPTY_FILTER: MessageFilter = {
+  anywhere: '',
   key: '',
+  headers: '',
   value: '',
   case_sensitive: false,
   search_decoded: false,
 };
+
+/** Задан ли хоть один запрос. Флаги (регистр, разбор тела) сюда не входят: они
+ *  говорят, ГДЕ и КАК искать, а не ЧТО, и сами по себе ничего не отбирают. */
+export const hasQuery = (filter: MessageFilter): boolean =>
+  filter.anywhere.trim() !== '' ||
+  filter.key.trim() !== '' ||
+  filter.headers.trim() !== '' ||
+  filter.value.trim() !== '';
 
 /** Столбцы, по которым можно кликнуть заголовок и отсортировать таблицу. */
 export type SortColumn = 'partition' | 'offset' | 'key' | 'timestamp';

@@ -42,6 +42,15 @@ const rowKey = (list: ListKind, name: string) => `${list}:${name}`;
 
 interface TopicsPanelProps {
   topics: Topic[];
+  /**
+   * Чей это список: кластер и учётка. `null` — не подключены.
+   *
+   * Нужен ради одного — сбросить поиск, когда список стал другим. Под другой
+   * учёткой видно другие топики, и оставшийся в поле запрос относится уже не
+   * к тому, что в списке: человек переключил пользователя и видит «No topics
+   * match "orders"» там, где топиков может быть полторы тысячи.
+   */
+  scope: string | null;
   selectedTopic: Topic | null;
   onTopicSelect: (topic: Topic) => void;
   /** Показать устройство и настройки топика — не обязательно открытого. */
@@ -69,6 +78,7 @@ function arrange(topics: Topic[], query: TopicQuery): Topic[] {
 
 export function TopicsPanel({
   topics,
+  scope,
   selectedTopic,
   onTopicSelect,
   onTopicInfo,
@@ -76,6 +86,13 @@ export function TopicsPanel({
   onToggleFavorite,
 }: TopicsPanelProps) {
   const [topicFilter, setTopicFilter] = useState('');
+
+  // Список сменился целиком — поиск по нему больше ни к чему не относится.
+  // Остальная раскладка панели (ширина, избранное) переключение переживает:
+  // это настройки вида, а не запрос к содержимому.
+  useEffect(() => {
+    setTopicFilter('');
+  }, [scope]);
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const rootRef = useRef<HTMLDivElement>(null);
   const dragging = useRef<{ startX: number; startW: number } | null>(null);
