@@ -316,7 +316,10 @@ export function SubjectPicker({
   }, [open, cluster, subjects, loading]);
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    // `modal` — чтобы над списком работало колесо мыши: попоувер уходит в
+    // портал у `body`, а модальное окно вокруг гасит там прокрутку. Подробный
+    // разбор — в `ProtoMessageSelect`, причина у них одна на двоих.
+    <Popover modal open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
           variant="outline"
