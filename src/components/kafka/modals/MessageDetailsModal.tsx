@@ -244,7 +244,10 @@ export function MessageDetailsModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContentNoClose className="max-w-[58rem] sm:max-w-[58rem] max-h-[90vh] bg-surface border-edge text-strong">
+      {/* Колонка на flex, а не сетка по умолчанию: высота окна ограничена
+          сверху, и внутри должно тянуться ровно одно — тело сообщения. Всё
+          остальное (заголовок, координаты, вкладки) занимает сколько нужно. */}
+      <DialogContentNoClose className="flex flex-col max-w-[58rem] sm:max-w-[58rem] max-h-[95vh] overflow-hidden bg-surface border-edge text-strong">
         <DialogHeader className="border-b border-edge pb-4">
           <DialogTitle className="font-mono text-soft text-lg">{title}</DialogTitle>
           <DialogDescription className="font-mono text-soft text-sm">
@@ -252,9 +255,20 @@ export function MessageDetailsModal({
           </DialogDescription>
         </DialogHeader>
         
-        <div className="space-y-6 overflow-auto">
-          {/* Message Metadata */}
-          <div className="grid grid-cols-2 gap-6">
+        <div className="flex flex-col gap-4 flex-1 min-h-0">
+          {/* Координаты сообщения.
+
+              Одной строкой, а не сеткой 2×2: те же четыре поля занимали по
+              вертикали вдвое больше, и всё это — за счёт тела сообщения, ради
+              которого окно и открывают.
+
+              Ключ — последним и на всю оставшуюся ширину. Он единственный тут
+              произвольной длины, и в сетке 2×2 стоял слева от timestamp: длинный
+              ключ переползал на соседа, и надписи налезали одна на другую.
+              Последней колонке переползать не на кого, а `minmax(0,1fr)`
+              (вместо `1fr`, чей автоминимум равен ширине содержимого) даёт ей
+              сжиматься и переносить строку. */}
+          <div className="grid grid-cols-[auto_auto_auto_minmax(0,1fr)] gap-x-6">
             <div>
               <div className="font-mono text-sm text-soft mb-1">Partition</div>
               <div className="font-mono text-brand">{message.partition}</div>
@@ -264,17 +278,33 @@ export function MessageDetailsModal({
               <div className="font-mono text-brand">{message.offset}</div>
             </div>
             <div>
-              <div className="font-mono text-sm text-soft mb-1">Key</div>
-              <div className="font-mono text-strong">{message.key}</div>
-            </div>
-            <div>
               <div className="font-mono text-sm text-soft mb-1">Timestamp</div>
-              <div className="font-mono text-strong">{formatTimestamp(message.timestamp)}</div>
+              <div className="font-mono text-strong whitespace-nowrap">
+                {formatTimestamp(message.timestamp)}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="font-mono text-sm text-soft mb-1">Key</div>
+              {/* `break-all`: ключи бывают без единого пробела (составной id,
+                  сериализованный ключ protobuf), и переносить их по словам
+                  значит не переносить вовсе.
+
+                  Потолок в три строки — чтобы ключ-простыня не съел ту самую
+                  высоту, которую здесь и освобождали; остаток докручивается, а
+                  целиком он есть в подсказке. */}
+              <div
+                // `leading-6` вместе с `max-h-[4.5rem]` — чтобы потолок пришёлся
+                // ровно на границу третьей строки, а не разрезал её пополам.
+                className="font-mono text-strong break-all leading-6 max-h-[4.5rem] overflow-auto"
+                title={message.key}
+              >
+                {message.key}
+              </div>
             </div>
           </div>
-          
+
           {/* Content Section with Tab Buttons */}
-          <div>
+          <div className="flex flex-col flex-1 min-h-0">
             <div className="flex items-center justify-between mb-4">
               <div className="flex gap-1">
                 {tabs.map((tab) => (
@@ -367,7 +397,14 @@ export function MessageDetailsModal({
               </div>
             )}
 
-            <div ref={bodyRef} className="bg-sunken border border-edge rounded-lg p-4 max-h-96 overflow-auto">
+            {/* `flex-1 min-h-0` вместо прежнего потолка в `max-h-96`: тело
+                занимает всю высоту, что осталась от окна, и не больше. У
+                короткого сообщения свободной высоты просто нет — и рамка
+                по-прежнему обнимает текст, а не растягивается на пустое. */}
+            <div
+              ref={bodyRef}
+              className="bg-sunken border border-edge rounded-lg p-4 flex-1 min-h-0 overflow-auto"
+            >
               {activeTab === 'payload' ? (
                 <div className="flex gap-4">
                   {/* Номера строк. sticky: строки больше не переносятся, а
