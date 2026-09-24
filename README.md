@@ -189,9 +189,50 @@ The installer isn't signed with a code-signing certificate, so **Windows
 SmartScreen** will show "Windows protected your PC" on first run — click
 **More info** → **Run anyway** to proceed. A fresh, unsigned executable with
 no download history may also get flagged by some antivirus products as a
-reputation-based false positive rather than an actual detection. Installing
-may prompt for administrator elevation (UAC), since it registers the
-`mikui://` link handler in the registry.
+reputation-based false positive rather than an actual detection.
+
+The app needs the **Microsoft Edge WebView2 Runtime**, which is part of
+Windows 11 but not of every Windows 10 or Windows Server install. If it is
+missing, the installer fetches it from Microsoft; if it is already there, the
+installer leaves it alone. On a machine without internet access, install the
+runtime beforehand — the [Evergreen Standalone
+Installer](https://developer.microsoft.com/microsoft-edge/webview2) run
+elevated puts it in place for every account on the machine.
+
+Binaries built with the MSVC toolchain link the C runtime dynamically, so the
+**Visual C++ Redistributable 2015–2022 (x64)** has to be present as well. Most
+machines already have it, pulled in by something else; a freshly imaged one may
+not.
+
+#### Installing for yourself or for the whole machine
+
+The installer asks which one you want:
+
+- **Just me** — goes to `%LOCALAPPDATA%\mikui`, registers `mikui://` under
+  `HKCU`, and touches nothing outside your profile.
+- **All users** — goes to `C:\Program Files\mikui`, registers `mikui://` under
+  `HKLM`, and needs administrator rights. This is the one to pick when several
+  accounts share the machine, or when a policy only allows running programs
+  from `Program Files`.
+
+Both modes come out of the same `mikui_<version>_x64-setup.exe`. For unattended
+installs the choice is a flag instead of a dialog:
+
+```bat
+mikui_<version>_x64-setup.exe /allusers /S /D=C:\Program Files\mikui
+mikui_<version>_x64-setup.exe /currentuser /S
+```
+
+`/S` is silent and `/P` is passive (progress, no questions). `/D=` sets the
+target directory and, being an NSIS built-in, has to come **last** and
+**unquoted** even when the path contains spaces. `/NS` skips the shortcuts,
+`/UPDATE` upgrades in place without recreating them. Uninstalling works the
+same way: `"C:\Program Files\mikui\uninstall.exe" /S`.
+
+Two things worth knowing before running this over an existing install: the
+installer closes a running mikui first — silently, when `/S` is in play — and
+the uninstaller only clears the settings of the account that runs it, and only
+when asked to. Other accounts keep theirs.
 
 ### Linux
 
