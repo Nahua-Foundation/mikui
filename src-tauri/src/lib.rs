@@ -1037,6 +1037,10 @@ async fn check_produce_payload(
 
 /// Заготовка тела и имена enum-значений выбранного message — всё, что форме
 /// отправки нужно знать про выбранный тип.
+///
+/// `message` — запись селектора: имя message либо `<Message>.<поле>` для ветки
+/// `oneof`. Кодировать в обоих случаях будет обёртка, а ветка решает, какое
+/// поле раскрыть в заготовке.
 #[tauri::command]
 async fn proto_message_form(
     app: tauri::AppHandle,

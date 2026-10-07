@@ -21,22 +21,71 @@ pub struct Linked {
     /// Транзитивные зависимости сюда не попадают: `google.protobuf.Timestamp`
     /// в выпадающем списке — мусор, декодировать им никто не собирается.
     pub messages: Vec<String>,
+    /// Чем селектор ОТПРАВКИ позволит закодировать тело: те же message плюс
+    /// ветки их `oneof` в виде `<Message>.<поле>`, по алфавиту.
+    ///
+    /// Отдельный список, а не `messages`: у топика выбирают тип, которым его
+    /// ЧИТАЮТ, и это всегда корневой message — ветка адресует поля внутри него,
+    /// а не сам тип. Сложи их вместе, и в настройках показа предлагалось бы
+    /// декодировать топик полем `order_changed`.
+    pub produce_choices: Vec<String>,
 }
 
 impl Linked {
     /// Ищет message по полному имени. Ведущая точка необязательна: снаружи имя
     /// приходит и из выпадающего списка (без точки), и из файла настроек.
     pub fn message(&self, full_name: &str) -> Option<MessageDescriptor> {
-        // `message_by_full_name` требует именно `.pkg.Name` и паникует на
-        // имени без точки — дописываем её здесь, а не оставляем это вызывающим.
-        let dotted = match full_name.starts_with('.') {
-            true => full_name.to_string(),
-            false => format!(".{full_name}"),
-        };
-        self.files
-            .iter()
-            .find_map(|f| f.message_by_full_name(&dotted))
+        message_in(&self.files, full_name)
     }
+
+    /// Разбирает запись селектора отправки: message, которым кодировать, и
+    /// выбранную ветку `oneof`, если выбрана именно она.
+    ///
+    /// Порядок разбора — сначала имя ЦЕЛИКОМ как message, и лишь потом как
+    /// `<message>.<поле>`. Он же разрешает неоднозначность: вложенный тип
+    /// (`demo.Outer.Second`) содержит точку ровно так же, как ветка, и разбирать
+    /// его на «родитель плюс поле» нельзя — зато можно просто спросить граф,
+    /// есть ли такое message.
+    pub fn produce_target(
+        &self,
+        choice: &str,
+    ) -> Result<(MessageDescriptor, Option<String>), String> {
+        if let Some(message) = self.message(choice) {
+            return Ok((message, None));
+        }
+
+        // Только последняя точка: имя message само содержит их сколько угодно.
+        let (head, branch) = choice.rsplit_once('.').ok_or_else(|| unknown(choice))?;
+        let message = self.message(head).ok_or_else(|| unknown(choice))?;
+        // Поле обязано быть и правда вариантом `oneof` этого message: иначе
+        // `produce_target("demo.Order.order_id")` вернул бы `demo.Order`, и
+        // заготовка молча построилась бы по чему-то другому, чем просили.
+        let known = message
+            .oneofs()
+            .any(|oneof| oneof.fields().any(|f| f.name() == branch));
+        if !known {
+            return Err(format!("{head} has no oneof field named {branch}"));
+        }
+        Ok((message, Some(branch.to_string())))
+    }
+}
+
+fn unknown(choice: &str) -> String {
+    format!("{choice} is not a message in the loaded .proto files")
+}
+
+/// Ищет message в графе файлов по полному имени.
+///
+/// Отдельной функцией, а не только методом `Linked`: список записей селектора
+/// строится ещё до того, как `Linked` собран.
+fn message_in(files: &[FileDescriptor], full_name: &str) -> Option<MessageDescriptor> {
+    // `message_by_full_name` требует именно `.pkg.Name` и паникует на имени без
+    // точки — дописываем её здесь, а не оставляем это вызывающим.
+    let dotted = match full_name.starts_with('.') {
+        true => full_name.to_string(),
+        false => format!(".{full_name}"),
+    };
+    files.iter().find_map(|f| f.message_by_full_name(&dotted))
 }
 
 /// Разобранные схемы, ключ — имя каталога.
@@ -111,10 +160,48 @@ pub fn parse(dir: &Path, files: &[SchemaFile]) -> Result<Linked, String> {
     let built = FileDescriptor::new_dynamic_fds(parsed.file_descriptors, &[])
         .map_err(|e| format!("can't link .proto files: {e}"))?;
 
+    let produce_choices = produce_choices(&built, &messages);
+
     Ok(Linked {
         files: built,
         messages,
+        produce_choices,
     })
+}
+
+/// Записи селектора ОТПРАВКИ: сами message плюс ветки их `oneof`.
+///
+/// Ветка нужна потому, что тип сообщения в топике — это конверт с `oneof`
+/// внутри (`PublicEvent`), а отправляют обычно одну конкретную ветку. Без такой
+/// записи выбрать в селекторе `OrderChanged` значило бы попросить приложение
+/// закодировать тело ТИПОМ ВЕТКИ: в топик уехали бы поля `OrderChanged` без
+/// обёртки, `oneof` в конверте остался бы пуст, а поля легли бы в корень — и
+/// потребитель, читающий топик как `PublicEvent`, увидел бы пустое сообщение.
+///
+/// Синтетические `oneof` сюда не попадают, и это не мелочь: проставь `optional`
+/// в proto3, и компилятор заводит под каждое такое поле свой `oneof`. Записи
+/// вида `Msg.optional_field` тогда предлагали бы закодировать тело типом,
+/// которого не существует. `MessageDescriptor::oneofs` их и отсеивает.
+fn produce_choices(files: &[FileDescriptor], messages: &[String]) -> Vec<String> {
+    let mut choices = Vec::with_capacity(messages.len());
+    for name in messages {
+        choices.push(name.clone());
+        let Some(message) = message_in(files, name) else {
+            continue;
+        };
+        for oneof in message.oneofs() {
+            for field in oneof.fields() {
+                choices.push(format!("{name}.{}", field.name()));
+            }
+        }
+    }
+    // По алфавиту — ровно как `messages`: в списке ищут подстрокой, и порядок,
+    // в котором ветки шли бы за своим конвертом, обрывался бы на первом же
+    // длинном имени. Сортировка заодно ставит ветку рядом с конвертом, потому
+    // что `<Msg>.` продолжает `<Msg>`.
+    choices.sort_unstable();
+    choices.dedup();
+    choices
 }
 
 /// Выбрасывает разобранную схему из кэша. Зовётся всякий раз, когда каталог
@@ -221,6 +308,151 @@ mod tests {
         );
         assert!(linked.message("demo.Zeta.Inner").is_some());
         assert!(linked.message(".demo.Alpha").is_some());
+    }
+
+    // --- Записи селектора отправки -----------------------------------------
+    //
+    // Ради них здесь и заведён отдельный список: тип сообщения в топике — это
+    // конверт с `oneof` внутри, а отправляют обычно одну его ветку. Выбрать её в
+    // списке, где есть только имена message, нечем.
+
+    const ENVELOPE: &str = r#"
+        syntax = "proto3";
+        package demo;
+        message OrderChanged { string order_id = 1; }
+        message WalletChanged { string wallet_id = 1; }
+        message PublicEvent {
+            oneof event {
+                OrderChanged order_changed = 1;
+                WalletChanged wallet_changed = 7;
+            }
+        }
+    "#;
+
+    /// Обёртка с `oneof` даёт записи и на себя, и на каждую свою ветку.
+    #[test]
+    fn a_oneof_wrapper_contributes_a_choice_per_branch() {
+        let dir = Dir::new("produce-choices");
+        let file = dir.write("events.proto", ENVELOPE);
+        let linked = parse(&dir.0, &[file]).unwrap();
+
+        assert_eq!(
+            linked.produce_choices,
+            vec![
+                "demo.OrderChanged",
+                "demo.PublicEvent",
+                "demo.PublicEvent.order_changed",
+                "demo.PublicEvent.wallet_changed",
+                "demo.WalletChanged",
+            ]
+        );
+        // Список «чем читать» веток не получает: ими декодируют поле, а не тип.
+        assert!(!linked.messages.iter().any(|m| m.contains("order_changed")));
+    }
+
+    /// `optional` в proto3 заводит СИНТЕТИЧЕСКИЙ `oneof` на каждое такое поле.
+    /// Запись вида `Msg.optional_field` предложила бы закодировать тело типом,
+    /// которого не существует, — а `produce_target` её бы отверг.
+    #[test]
+    fn a_proto3_optional_field_does_not_become_a_choice() {
+        let dir = Dir::new("produce-choices-optional");
+        let file = dir.write(
+            "events.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Order {
+                    optional string note = 1;
+                    optional int32 amount = 2;
+                }
+            "#,
+        );
+        let linked = parse(&dir.0, &[file]).unwrap();
+
+        assert_eq!(linked.produce_choices, vec!["demo.Order"]);
+        assert_eq!(linked.messages, vec!["demo.Order"]);
+    }
+
+    /// Без `oneof` записи селектора не отличаются от списка message: приписывать
+    /// к ним нечего.
+    #[test]
+    fn a_plain_schema_has_the_same_choices_as_messages() {
+        let dir = Dir::new("produce-choices-plain");
+        let file = dir.write(
+            "events.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Point { int32 x = 1; int32 y = 2; }
+                message Line { Point from = 1; Point to = 2; }
+            "#,
+        );
+        let linked = parse(&dir.0, &[file]).unwrap();
+
+        assert_eq!(linked.produce_choices, linked.messages);
+    }
+
+    /// Ветка разбирается в пару «обёртка и её поле» — именно её и кодируем.
+    #[test]
+    fn a_branch_choice_resolves_to_its_wrapper_and_field() {
+        let dir = Dir::new("produce-target-branch");
+        let file = dir.write("events.proto", ENVELOPE);
+        let linked = parse(&dir.0, &[file]).unwrap();
+
+        let (message, branch) = linked
+            .produce_target("demo.PublicEvent.order_changed")
+            .unwrap();
+        assert_eq!(message.full_name(), "demo.PublicEvent");
+        assert_eq!(branch.as_deref(), Some("order_changed"));
+
+        // И сама обёртка — тоже законная запись, но уже без ветки.
+        let (message, branch) = linked.produce_target("demo.PublicEvent").unwrap();
+        assert_eq!(message.full_name(), "demo.PublicEvent");
+        assert!(branch.is_none());
+    }
+
+    /// Вложенный тип содержит точку ровно так же, как ветка, и разбирать его на
+    /// «родитель плюс поле» нельзя. Спрашиваем граф, а не режем по точке.
+    #[test]
+    fn a_nested_message_name_is_not_mistaken_for_a_branch() {
+        let dir = Dir::new("produce-target-nested");
+        let file = dir.write(
+            "events.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Outer {
+                    message Second { int32 b = 1; }
+                    Second second = 1;
+                }
+            "#,
+        );
+        let linked = parse(&dir.0, &[file]).unwrap();
+
+        let (message, branch) = linked.produce_target("demo.Outer.Second").unwrap();
+        assert_eq!(message.full_name(), "demo.Outer.Second");
+        assert!(branch.is_none(), "вложенный тип — не ветка: {branch:?}");
+    }
+
+    /// Поле, которое не ветка `oneof`, кодировать «через обёртку» нельзя: иначе
+    /// `demo.Order.order_id` молча закодировал бы `demo.Order` целиком.
+    #[test]
+    fn a_field_that_is_not_a_branch_is_refused() {
+        let dir = Dir::new("produce-target-not-branch");
+        let file = dir.write(
+            "events.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Order { string order_id = 1; }
+            "#,
+        );
+        let linked = parse(&dir.0, &[file]).unwrap();
+
+        let error = linked.produce_target("demo.Order.order_id").unwrap_err();
+        assert!(error.contains("order_id"), "{error}");
+        assert!(linked.produce_target("demo.Nope").is_err());
+        assert!(linked.produce_target("no dots at all").is_err());
     }
 
     /// Ради этого случая и заведена вся раскладка файлов: импорт по пути

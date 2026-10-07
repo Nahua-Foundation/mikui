@@ -263,8 +263,16 @@ pub struct TopicSchemaView {
     pub files: Vec<SchemaFile>,
     pub message: Option<String>,
     /// Все message из добавленных файлов, по алфавиту — это и есть содержимое
-    /// выпадающего списка.
+    /// выпадающего списка НАСТРОЕК топика.
     pub messages: Vec<String>,
+    /// Содержимое выпадающего списка ФОРМЫ ОТПРАВКИ: [п. `produce_choices`].
+    ///
+    /// Отдельно от `messages`, потому что вопрос у двух списков разный. Здесь
+    /// выбирают, ЧЕМ КОДИРОВАТЬ, и кодировать приходится в том числе ветвью
+    /// `oneof` — а её в `messages` нет: настройки показывают топик целиком, и
+    /// ветка конверта в списке «чем читать» была бы предложением декодировать
+    /// тело полем.
+    pub produce_choices: Vec<String>,
     /// Схема лежит на диске, но не разбирается. Файлы всё равно показываем:
     /// иначе пользователю нечего чинить.
     pub error: Option<String>,
@@ -353,6 +361,17 @@ pub struct MessageForm {
     /// в реестре, и показать его надо — иначе форма молчит о том, каким
     /// контрактом она собралась кодировать.
     pub subject: Option<String>,
+    /// Чем тело закодируется на самом деле — полное имя message.
+    ///
+    /// У protobuf расходится с выбором в селекторе, когда выбрана ветка `oneof`:
+    /// там запись читается как `PublicEvent.order_changed`, а кодируется всё
+    /// равно `PublicEvent`. Показать это надо, потому что вывести расхождение
+    /// на фронте нечем: имена `oneof` живут в разобранном .proto, и повторять
+    /// там разбор имени значило бы завести второй способ решать то же самое —
+    /// ровно то, от чего здесь и уходят (см. `enum_values` выше).
+    ///
+    /// Пусто у Avro и JSON Schema: там выбирают схему, и она же кодирует.
+    pub message: Option<String>,
 }
 
 impl TopicSchemaView {
@@ -363,6 +382,7 @@ impl TopicSchemaView {
         schema: &TopicSchema,
         format: BodyFormat,
         messages: Vec<String>,
+        produce_choices: Vec<String>,
         error: Option<String>,
     ) -> Self {
         Self {
@@ -372,6 +392,7 @@ impl TopicSchemaView {
             files: schema.files.clone(),
             message: schema.message.clone(),
             messages,
+            produce_choices,
             error,
             avro: None,
             json: None,
