@@ -204,23 +204,23 @@ Binaries built with the MSVC toolchain link the C runtime dynamically, so the
 machines already have it, pulled in by something else; a freshly imaged one may
 not.
 
-#### Installing for yourself or for the whole machine
+#### Installing for the whole machine
 
-The installer asks which one you want:
+The installer is built in **per-machine mode only**: it always goes to
+`C:\Program Files\mikui`, registers `mikui://` under `HKLM`, and adds a Start
+menu entry every account on the machine can see. Administrator rights are
+required, so expect a UAC prompt — and run it from an elevated shell when
+scripting, since a silent install has no dialog to accept an elevation with.
 
-- **Just me** — goes to `%LOCALAPPDATA%\mikui`, registers `mikui://` under
-  `HKCU`, and touches nothing outside your profile.
-- **All users** — goes to `C:\Program Files\mikui`, registers `mikui://` under
-  `HKLM`, and needs administrator rights. This is the one to pick when several
-  accounts share the machine, or when a policy only allows running programs
-  from `Program Files`.
-
-Both modes come out of the same `mikui_<version>_x64-setup.exe`. For unattended
-installs the choice is a flag instead of a dialog:
+Per-machine was chosen over the per-user alternative (`%LOCALAPPDATA%\mikui`,
+`HKCU`) because it is the only one that works on a shared or managed machine:
+one copy serves every account instead of one per profile, and `Program Files`
+is where execution policies such as AppLocker allow programs to run by
+default. A per-user install is also invisible to other accounts and awkward to
+roll out — there is no way to select it any more.
 
 ```bat
-mikui_<version>_x64-setup.exe /allusers /S /D=C:\Program Files\mikui
-mikui_<version>_x64-setup.exe /currentuser /S
+mikui_<version>_x64-setup.exe /S /D=C:\Program Files\mikui
 ```
 
 `/S` is silent and `/P` is passive (progress, no questions). `/D=` sets the
@@ -233,6 +233,12 @@ Two things worth knowing before running this over an existing install: the
 installer closes a running mikui first — silently, when `/S` is in play — and
 the uninstaller only clears the settings of the account that runs it, and only
 when asked to. Other accounts keep theirs.
+
+Note for machines carrying a per-user install from **0.2.4 or earlier**: the
+per-machine installer looks for a previous installation under `HKLM` and will
+not see one made under `HKCU`. It installs cleanly alongside it, leaving the
+old copy in `%LOCALAPPDATA%\mikui` behind — remove it with the uninstaller
+sitting in that folder.
 
 ### Linux
 
