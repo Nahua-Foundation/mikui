@@ -35,21 +35,36 @@ const INDENT: &str = "  ";
 
 /// JSON-заготовка сообщения, с отступами в два пробела — ровно как печатает
 /// тела модалка чтения (`JSON.stringify(x, null, 2)`).
-pub fn skeleton(message: &MessageDescriptor) -> String {
+///
+/// `branch` — имя ветки `oneof`, если выбирали именно её (см.
+/// `Linked::produce_target`). Ветка нужна затем, что тип сообщения в топике —
+/// часто конверт с `oneof` внутри (`PublicEvent`), а кладут в него ОДНУ
+/// конкретную ветку. Без имени ветки заготовка раскрыла бы первую по порядку
+/// объявления, и пользователь заполнял бы соседнюю с той, которую просил: без
+/// имени поля внутри конверта `oneof` остаётся пустым, а потребитель читает
+/// пустое сообщение.
+///
+/// Действует ветка только на САМ message: у вложенных сообщений `oneof` свой, и
+/// выбирать её там не из чего.
+pub fn skeleton(message: &MessageDescriptor, branch: Option<&str>) -> String {
     let mut out = String::new();
     let mut stack = Vec::new();
-    write_message(message, 0, &mut stack, &mut out);
+    write_message(message, branch, 0, &mut stack, &mut out);
     out
 }
 
 fn write_message(
     message: &MessageDescriptor,
+    branch: Option<&str>,
     depth: usize,
     stack: &mut Vec<String>,
     out: &mut String,
 ) {
     stack.push(message.full_name().to_string());
-    let fields: Vec<FieldDescriptor> = message.fields().filter(included).collect();
+    // Ветка — только у корня: у вложенных сообщений `oneof` свой, и выбранной
+    // ветки для них никто не называл.
+    let branch = (depth == 0).then_some(branch).flatten();
+    let fields: Vec<FieldDescriptor> = message.fields().filter(|f| included(f, branch)).collect();
 
     if fields.is_empty() {
         out.push_str("{}");
@@ -84,13 +99,25 @@ fn write_message(
 
 /// Попадает ли поле в заготовку.
 ///
-/// Из `oneof` берётся только первый вариант: активен там ровно один, и
-/// перечислить все значило бы предложить заполнить взаимоисключающее. Что
-/// именно выбрано, видно по имени поля, а соседние варианты — в .proto.
-fn included(field: &FieldDescriptor) -> bool {
+/// Из каждого `oneof` берётся только ОДИН вариант: активен там ровно один, и
+/// перечислить все значило бы предложить заполнить взаимоисключающее. Какой
+/// именно — решает `branch`, когда он назван, а иначе первый: заготовка не
+/// должна зависеть от того, что пользователь ещё ничего не выбрал, и первый
+/// вариант даёт ей законченный вид. Соседние варианты при этом остаются видны в
+/// .proto, а их имена — в селекторе отправки.
+fn included(field: &FieldDescriptor, branch: Option<&str>) -> bool {
     let Some(oneof) = field.containing_oneof() else {
         return true;
     };
+    // Ветка выбирает вариант в СВОЁМ `oneof`, а не отменяет остальные: у message
+    // их бывает несколько, и выбор в одном не должен глушить соседние группы —
+    // иначе выбранная ветка молча выкинула бы из заготовки поля, которые к ней
+    // отношения не имеют.
+    if let Some(branch) = branch {
+        if oneof.fields().any(|f| f.name() == branch) {
+            return field.name() == branch;
+        }
+    }
     // Через `let`, а не одним выражением: итератор заимствует `oneof`, а тот
     // в хвостовой позиции успел бы умереть раньше временного значения.
     let first = oneof.fields().next().map(|f| f.number());
@@ -172,7 +199,9 @@ fn write_zero(
             if stack.iter().any(|seen| seen == m.full_name()) {
                 out.push_str("{}");
             } else {
-                write_message(m, depth, stack, out);
+                // Без ветки: `oneof` вложенного сообщения свой, и выбирать её
+                // здесь не из чего — назвать её пользователь мог только у корня.
+                write_message(m, None, depth, stack, out);
             }
         }
     }
@@ -244,7 +273,7 @@ mod tests {
         );
 
         assert_eq!(
-            skeleton(&md),
+            skeleton(&md, None),
             r#"{
   "title": "",
   "count": 0,
@@ -289,7 +318,7 @@ mod tests {
             "demo.Event",
         );
 
-        let text = skeleton(&md);
+        let text = skeleton(&md, None);
         // Круг проверяется по `event_id`: остальные поля заготовки нулевые, а
         // proto3 значения по умолчанию не печатает — они вернулись бы пустыми,
         // и такой круг ничего бы не доказал. Идентификатор же заполнен сам, и
@@ -329,7 +358,7 @@ mod tests {
             "demo.Node",
         );
 
-        let text = skeleton(&md);
+        let text = skeleton(&md, None);
         assert!(text.contains("\"parent\": {}"), "{text}");
         protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
         let _ = std::fs::remove_dir_all(dir);
@@ -351,10 +380,183 @@ mod tests {
             "demo.Payload",
         );
 
-        let text = skeleton(&md);
+        let text = skeleton(&md, None);
         assert!(text.contains("\"text\""), "{text}");
         assert!(!text.contains("\"blob\""), "{text}");
         assert!(!text.contains("\"code\""), "{text}");
+        protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Названная ветка раскрывается вместо первой по порядку объявления.
+    ///
+    /// Ради этого случая ветка и заведена: тип сообщения в топике — конверт с
+    /// `oneof` внутри, а кладут в него конкретную ветку. Без выбора заготовка
+    /// показала бы соседнюю, и заполнять пришлось бы то, чего не просили.
+    #[test]
+    fn a_named_branch_replaces_the_first_variant() {
+        let (dir, md) = message_of(
+            "oneof-branch",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Payload {
+                    string id = 1;
+                    oneof body { string text = 2; bytes blob = 3; int32 code = 4; }
+                }
+            "#,
+            "demo.Payload",
+        );
+
+        let text = skeleton(&md, Some("blob"));
+        assert!(text.contains("\"blob\""), "{text}");
+        assert!(!text.contains("\"text\""), "{text}");
+        assert!(!text.contains("\"code\""), "{text}");
+        protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Главная проверка отправки ветки.
+    ///
+    /// Выбранная ветка обязана уехать ПОЛЕМ ОБЁРТКИ, а не собственным типом: у
+    /// потребителя, читающего топик как `PublicEvent`, иначе не будет ни одного
+    /// поля, и он покажет пустое сообщение. Круг замыкается тем же декодером,
+    /// которым приложение показывает прочитанное.
+    #[test]
+    fn a_branch_skeleton_round_trips_as_the_wrapper_it_belongs_to() {
+        let (dir, md) = message_of(
+            "oneof-roundtrip",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message OrderChanged { string order_id = 1; }
+                message WalletChanged { string wallet_id = 1; }
+                message PublicEvent {
+                    oneof event {
+                        OrderChanged order_changed = 1;
+                        WalletChanged wallet_changed = 7;
+                    }
+                }
+            "#,
+            "demo.PublicEvent",
+        );
+
+        let text = skeleton(&md, Some("wallet_changed"));
+        // Заготовка — конверт целиком, с выбранной веткой внутри.
+        assert!(text.contains("\"wallet_changed\": {"), "{text}");
+        assert!(!text.contains("\"order_changed\""), "{text}");
+
+        // Ветка для проверки заполняется своим значением: нулевое у неё не
+        // печатается, и круг на пустом теле ничего бы не доказал. Через разбор
+        // JSON, а не подстановкой текста: `wallet_id` — идентификатор, и
+        // заготовка подставила туда UUID, а не пустую строку.
+        let mut filled: serde_json::Value = serde_json::from_str(&text).unwrap();
+        filled["wallet_changed"]["wallet_id"] = "w-1".into();
+        let filled = filled.to_string();
+        let parsed = protobuf_json_mapping::parse_dyn_from_str(&md, &filled)
+            .unwrap_or_else(|e| panic!("заготовка не разбирается: {e}\n{filled}"));
+        let bytes = parsed.write_to_bytes_dyn().unwrap();
+
+        // Кодировали обёрткой: читаем её же — и находим поле ВНУТРИ конверта.
+        let decoded = crate::schema::proto::ProtoDecoder::new(md.clone())
+            .decode(&bytes)
+            .unwrap();
+        let back: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(back["wallet_changed"]["wallet_id"], "w-1", "{decoded}");
+        assert!(back.get("order_changed").is_none(), "{decoded}");
+
+        // А теперь тот самый баг: то же тело, закодированное СОБСТВЕННЫМ типом
+        // ветки, — как оно уезжало бы без обёртки. Номера полей у веток свои, и
+        // конверт читает такие байты как чужое поле: отправителем заявлен
+        // `wallet_changed`, а приезжает либо отказ разбора, либо другая ветка.
+        // Ветка, которую положили, не приходит НИКОГДА — потребитель не ошибётся
+        // заметно, он просто не увидит отправленного сообщения.
+        let branch = md
+            .file_descriptor()
+            .message_by_full_name(".demo.WalletChanged")
+            .unwrap();
+        let unwrapped = protobuf_json_mapping::parse_dyn_from_str(&branch, r#"{"wallet_id": "w-1"}"#)
+            .unwrap()
+            .write_to_bytes_dyn()
+            .unwrap();
+        let as_wrapper = crate::schema::proto::ProtoDecoder::new(md)
+            .decode(&unwrapped)
+            .ok()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+        assert!(
+            as_wrapper
+                .as_ref()
+                .is_none_or(|v| v["wallet_changed"].is_null()),
+            "тело без обёртки не должно дойти как отправленная ветка: {as_wrapper:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ветка — только у корня. Вложенное сообщение со своим `oneof` обязано
+    /// получить первый вариант, а не ветку, названную для конверта: одинаковые
+    /// имена полей у двух типов — обычное дело, и совпадение по имени молча
+    /// раскрыло бы не то поле.
+    #[test]
+    fn a_branch_does_not_reach_into_nested_messages() {
+        let (dir, md) = message_of(
+            "oneof-branch-nested",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Inner {
+                    oneof kind { string text = 1; string blob = 2; }
+                }
+                message Outer {
+                    Inner inner = 1;
+                    oneof body { string text = 2; string blob = 3; }
+                }
+            "#,
+            "demo.Outer",
+        );
+
+        let text = skeleton(&md, Some("blob"));
+        assert!(text.contains("\"inner\": {"), "{text}");
+        // У корня раскрыта названная ветка...
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["blob"], "", "{text}");
+        assert!(parsed.get("text").is_none(), "{text}");
+        // ...а у вложенного — по-прежнему первый вариант по объявлению. Поле с
+        // тем же именем `blob` внутри `Inner` осталось закрытым.
+        assert_eq!(parsed["inner"]["text"], "", "{text}");
+        assert!(parsed["inner"].get("blob").is_none(), "{text}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// У message бывает несколько `oneof`, и выбор ветки в одном не должен
+    /// глушить соседние группы: ветка выбирает вариант в СВОЁМ `oneof`, а не
+    /// отменяет остальные.
+    #[test]
+    fn a_branch_leaves_other_oneofs_alone() {
+        let (dir, md) = message_of(
+            "oneof-several",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Event {
+                    oneof what { string click = 1; string view = 2; }
+                    oneof how { string device = 3; string referrer = 4; }
+                }
+            "#,
+            "demo.Event",
+        );
+
+        let text = skeleton(&md, Some("view"));
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // В своём `oneof` — названная ветка...
+        assert_eq!(parsed["view"], "", "{text}");
+        assert!(parsed.get("click").is_none(), "{text}");
+        // ...а соседняя группа по-прежнему даёт первый свой вариант, а не
+        // пропадает целиком.
+        assert_eq!(parsed["device"], "", "{text}");
+        assert!(parsed.get("referrer").is_none(), "{text}");
+
         protobuf_json_mapping::parse_dyn_from_str(&md, &text).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -385,7 +587,7 @@ mod tests {
             "demo.Order",
         );
 
-        let text = skeleton(&md);
+        let text = skeleton(&md, None);
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         let ids = ["id", "order_id", "client_uid", "request_uuid", "ID"];
@@ -425,7 +627,7 @@ mod tests {
             "#,
             "demo.Ref",
         );
-        assert_ne!(skeleton(&md), skeleton(&md));
+        assert_ne!(skeleton(&md, None), skeleton(&md, None));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -448,7 +650,7 @@ mod tests {
             "demo.Trade",
         );
 
-        let text = skeleton(&md);
+        let text = skeleton(&md, None);
         assert!(
             text.contains("\"direction\": \"DIRECTION_UNSPECIFIED\""),
             "{text}"
@@ -464,7 +666,7 @@ mod tests {
             "syntax = \"proto3\"; package demo; message Ping {}",
             "demo.Ping",
         );
-        assert_eq!(skeleton(&md), "{}");
+        assert_eq!(skeleton(&md, None), "{}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -164,7 +164,9 @@ export function ProduceMessageModal({
   const [moreHeaders, setMoreHeaders] = useState(false);
 
   const topicName = topic?.name ?? null;
-  const messages = useMemo(() => schema?.messages ?? [], [schema]);
+  /** Записи селектора: message и ветки их `oneof`. Именно отсюда выбирают, чем
+   *  кодировать, — см. `TopicSchema.produce_choices`. */
+  const messages = useMemo(() => schema?.produce_choices ?? [], [schema]);
   const canUseProto = messages.length > 0;
   const avro = schema?.avro ?? null;
   /** Кодировать Avro можно либо через реестр, либо по локальным .avsc. */
@@ -858,6 +860,19 @@ export function ProduceMessageModal({
                   hex
                 </button>
                 .
+              </div>
+            )}
+
+            {/* Что именно кодируется. Сказать это обязана форма: выбранная
+                ветка `oneof` в теле — конверт ЦЕЛИКОМ, и на провод уходит
+                обёртка с веткой внутри, а не тип ветки сам по себе. Вывести это
+                здесь нечем — имена `oneof` знает только разобранный .proto, и
+                приходит оно уже готовым ответом бэкенда. */}
+            {format === 'proto' && currentForm?.message && (
+              <div className="font-mono text-xs text-dim">
+                The body is wrapped in{' '}
+                <span className="text-soft">{currentForm.message}</span> — the branch you picked
+                goes in as its field.
               </div>
             )}
 

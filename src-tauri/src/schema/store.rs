@@ -172,15 +172,21 @@ fn describe(root: &Path, schema: &TopicSchema) -> Result<TopicSchemaView, String
     let detected_kind = detected.as_ref().map(|d| d.kind.as_str().to_string());
 
     if schema.files.is_empty() {
-        return Ok(TopicSchemaView::new(schema, format, Vec::new(), None)
+        return Ok(TopicSchemaView::new(schema, format, Vec::new(), Vec::new(), None)
             .with_avro(avro)
             .with_json(json)
             .with_detected_kind(detected_kind));
     }
     let dir = dir_of(root, schema);
     Ok(match linked::linked(&dir, &schema.files) {
-        Ok(linked) => TopicSchemaView::new(schema, format, linked.messages.clone(), None),
-        Err(e) => TopicSchemaView::new(schema, format, Vec::new(), Some(e)),
+        Ok(linked) => TopicSchemaView::new(
+            schema,
+            format,
+            linked.messages.clone(),
+            linked.produce_choices.clone(),
+            None,
+        ),
+        Err(e) => TopicSchemaView::new(schema, format, Vec::new(), Vec::new(), Some(e)),
     }
     .with_avro(avro)
     .with_json(json)
@@ -334,19 +340,23 @@ pub fn set_lens(
     Ok(view)
 }
 
-/// Descriptor одного message схемы — по имени, а не по тому, что выбрано в
-/// настройках топика.
+/// Чем кодировать тело: descriptor обёртки и выбранная ветка её `oneof`.
 ///
-/// Имя приходит отдельным аргументом ради отправки: класть в топик руками
+/// Тип приходит отдельным аргументом ради отправки: класть в топик руками
 /// приходится и не тот тип, которым топик читают (команду, а не событие;
 /// сообщение старой версии контракта), и заставлять ради этого переключать
 /// настройки показа значило бы менять то, как выглядит уже открытая таблица.
-pub fn message(
+///
+/// Ветка — потому что выбирают обычно не обёртку, а то, что в ней лежит: у
+/// топика с типом `PublicEvent` отправляют `OrderChanged`, и кодировать его
+/// надо ПОЛЕМ обёртки, а не собственным типом ветки. Разбор записи — в
+/// `Linked::produce_target`, объяснение самой нужды — в `produce_choices`.
+pub fn produce_target(
     root: &Path,
     cluster: &str,
     topic: &str,
-    name: &str,
-) -> Result<protobuf::reflect::MessageDescriptor, String> {
+    choice: &str,
+) -> Result<(protobuf::reflect::MessageDescriptor, Option<String>), String> {
     let schemas = list(root)?;
     let index = position(&schemas, cluster, topic)
         .ok_or_else(|| format!("no .proto schema for topic {topic}"))?;
@@ -357,9 +367,7 @@ pub fn message(
 
     let dir = dir_of(root, schema);
     let linked = linked::linked(&dir, &schema.files)?;
-    linked
-        .message(name)
-        .ok_or_else(|| format!("message {name} is not in the loaded .proto files"))
+    linked.produce_target(choice)
 }
 
 // --- Изменение --------------------------------------------------------------

@@ -277,14 +277,21 @@ pub fn test_registry(
 // же descriptor, иначе приложение показывало бы одно, а отправляло другое.
 
 /// Заготовка тела и имена enum-значений выбранного message.
+///
+/// `choice` — запись селектора отправки: либо имя message, либо `<Message>.<поле>`
+/// для ветки `oneof` (см. `proto::linked::produce_choices`). В обоих случаях
+/// кодировать будут ОБЁРТКОЙ, а ветка решает только, какое поле в заготовке
+/// раскрыть: тело — это конверт целиком, и уезжает он как есть.
 pub fn message_form(
     app: &AppHandle,
     cluster: &str,
     topic: &str,
-    message: &str,
+    choice: &str,
 ) -> Result<MessageForm, String> {
-    let md = store::message(&config::config_dir(app)?, cluster, topic, message)?;
-    let template = proto::template::skeleton(&md);
+    let (md, branch) = store::produce_target(&config::config_dir(app)?, cluster, topic, choice)?;
+    let template = proto::template::skeleton(&md, branch.as_deref());
+    // Имя снимается строкой, `ProtoDecoder::new` забирает descriptor себе.
+    let message = md.full_name().to_string();
     // Список берётся у декодера, а не собирается здесь заново: он же красит
     // enum в модалке чтения. Второй способ решать, что здесь enum, а что просто
     // строка, рано или поздно разошёлся бы с первым — и одно и то же значение
@@ -294,6 +301,7 @@ pub fn message_form(
         template,
         enum_values,
         subject: None,
+        message: Some(message),
     })
 }
 
@@ -313,6 +321,9 @@ pub fn avro_message_form(
         template: avro::template::skeleton(&found.linked),
         enum_values: found.linked.enum_values().to_vec(),
         subject: found.subject,
+        // Расхождение «выбрано одно, кодируется другим» бывает только у
+        // protobuf: у Avro выбирают схему, и она же кодирует.
+        message: None,
     })
 }
 
@@ -333,6 +344,8 @@ pub fn json_message_form(
         template: json::template::skeleton(found.compiled.schema()),
         enum_values: Vec::new(),
         subject: found.subject,
+        // См. `avro_message_form`: расхождение бывает только у protobuf.
+        message: None,
     })
 }
 
@@ -398,6 +411,13 @@ pub fn encode_avro(
 
 /// Кодирует введённый JSON в protobuf по выбранному message.
 ///
+/// Тело — конверт целиком, включая имя ветки `oneof` внутри него: обёртка тут не
+/// додумывается. Иначе отправленный из формы `OrderChanged` уезжал бы байтами
+/// самого `OrderChanged` — без `PublicEvent`, а значит и без признака того, чей
+/// это вариант: `oneof` в конверте остался бы пустым, и потребитель, читающий
+/// топик как `PublicEvent`, увидел бы пустое сообщение. Форма поэтому и
+/// показывает заготовку с полем ветки внутри (см. `message_form`).
+///
 /// Неизвестные поля НЕ игнорируются (`ParseOptions` оставлены дефолтными):
 /// опечатка в имени поля иначе молча уехала бы в топик пустым значением — а
 /// это ровно та ошибка, ради обнаружения которой схему к топику и грузят.
@@ -405,10 +425,10 @@ pub fn encode(
     app: &AppHandle,
     cluster: &str,
     topic: &str,
-    message: &str,
+    choice: &str,
     json: &str,
 ) -> Result<Vec<u8>, String> {
-    let md = store::message(&config::config_dir(app)?, cluster, topic, message)?;
+    let (md, _) = store::produce_target(&config::config_dir(app)?, cluster, topic, choice)?;
     let parsed = protobuf_json_mapping::parse_dyn_from_str(&md, json)
         .map_err(|e| format!("can't encode as {}: {e}", md.full_name()))?;
     parsed
