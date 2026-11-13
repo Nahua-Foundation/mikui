@@ -34,6 +34,20 @@ interface TopicConfigModalProps {
    * можно объяснить выключенной кнопкой, незачем.)
    */
   openTopic: string | null;
+  /**
+   * Схема открытого топика — та, которой таблица прямо сейчас читает тела.
+   *
+   * Нужна затем, чтобы у этого топика форме не приходилось ЖДАТЬ: приложение
+   * уже держит его схему и перечитывает её после каждой правки, в том числе
+   * после переключения формата в шапке. А открывают настройки чаще всего именно
+   * оттуда — шестерёнка стоит вплотную к селектору формата.
+   *
+   * Тому, что приехало, форма верит не на слово: схема несёт в себе имя своего
+   * топика и кластера, и посеяно будет только совпадающее. Без этой сверки
+   * нашлась бы своя щель — между выбором топика и ответом `applyTopicSchema`
+   * здесь лежит схема ПРЕЖНЕГО.
+   */
+  openTopicSchema?: TopicSchema | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /**
@@ -88,11 +102,37 @@ export type ProtoMode = 'paste' | 'files' | 'library';
  * контракта.
  */
 export function modeOf(schema: TopicSchema | null, sources: SourceView[]): ProtoMode {
+  return (
+    modeFromSchema(schema) ??
+    (sources.some((source) => source.sets.some((set) => !set.error)) ? 'library' : 'paste')
+  );
+}
+
+/**
+ * Та часть выбора вкладки, на которую отвечает САМА схема топика, — то есть всё,
+ * кроме ненастроенного топика.
+ *
+ * Отдельно от `modeOf` ради одного: у настроенного топика ответ известен сразу,
+ * как приехала схема, и ждать ради него библиотеку незачем. `null` — настроен
+ * топик ничем, и тогда вкладку решает то, есть ли в библиотеке что выбирать.
+ */
+export function modeFromSchema(schema: TopicSchema | null): ProtoMode | null {
   if (schema?.source) return 'library';
   const files = schema?.files ?? [];
   if (files.some((file) => file.pasted)) return 'paste';
   if (files.length > 0) return 'files';
-  return sources.some((source) => source.sets.some((set) => !set.error)) ? 'library' : 'paste';
+  return null;
+}
+
+/**
+ * Про схему известно всё, что нужно форме, — показывать можно.
+ *
+ * Не хватать может ровно одного: вкладки у ненастроенного protobuf-топика, и
+ * отвечает на это библиотека. Остальным форматам она не нужна вовсе, так что и
+ * ждать им нечего.
+ */
+export function settledWithoutLibrary(schema: TopicSchema | null): boolean {
+  return schema?.format !== 'proto' || modeFromSchema(schema) !== null;
 }
 
 /** Сколько ждать после последнего нажатия клавиши, прежде чем разбирать текст.
@@ -127,6 +167,27 @@ message OrderChanged {
   int64 at = 2;
 }`;
 
+/**
+ * Что стоит на месте формы, пока схема топика не приехала.
+ *
+ * Заготовка повторяет расстановку настоящей формы — подпись, поле под ней, блок
+ * ниже, — чтобы приехавшая форма встала на то же место, а не подвинула окно.
+ *
+ * Своя, а не `ui/skeleton`: тот красится в `bg-accent`, то есть мимо палитры
+ * этих окон (`surface`/`sunken`/`edge`), и в тёмной теме светится.
+ */
+function Waiting() {
+  return (
+    <div className="space-y-6 min-w-0" aria-hidden>
+      <div className="space-y-2">
+        <div className="h-4 w-28 rounded bg-edge animate-pulse" />
+        <div className="h-9 rounded border border-edge bg-sunken animate-pulse" />
+      </div>
+      <div className="h-24 rounded border border-edge bg-sunken animate-pulse" />
+    </div>
+  );
+}
+
 function chooseMessage(schema: TopicSchema | null): string | null {
   const messages = schema?.messages ?? [];
   if (schema?.message) {
@@ -144,6 +205,7 @@ export function TopicConfigModal({
   topic,
   cluster,
   openTopic,
+  openTopicSchema,
   open,
   onOpenChange,
   onSchemaChanged,
@@ -159,6 +221,9 @@ export function TopicConfigModal({
   const [guessing, setGuessing] = useState(false);
   /** Библиотека наборов .proto — из чего выбирать, кроме своих файлов. */
   const [sources, setSources] = useState<SourceView[]>([]);
+  /** За библиотекой уже сходили. Пустой список сам по себе ответа не даёт:
+   *  он одинаков и у пустой библиотеки, и у непрочитанной. */
+  const [sourcesLoaded, setSourcesLoaded] = useState(false);
   /** Поверх этой формы открыта сама библиотека. Окно источников живёт здесь, а
    *  не в шапке приложения: источники нужны ровно тогда, когда настраивают
    *  proto у топика, и других дверей к ним в приложении нет. */
@@ -172,75 +237,159 @@ export function TopicConfigModal({
   const [textError, setTextError] = useState<string | null>(null);
   /** Проверка текста идёт прямо сейчас. */
   const [checking, setChecking] = useState(false);
+  /**
+   * Про какую пару кластер-топик на экране стоит ответ.
+   *
+   * Несовпадение с текущей означает, что в полях чужая схема, — и это ровно то,
+   * что видел человек: переключив формат с avro на proto и открыв настройки, он
+   * две-три секунды смотрел на форму avro, ту самую, которую окно нарисовало в
+   * прошлый раз, после чего она скачком менялась на proto.
+   */
+  const [shown, setShown] = useState<string | null>(null);
+  /** В полях — схема ИМЕННО этого топика, а не ожидание и не чужая. */
+  const [ready, setReady] = useState(false);
+  /** Схему прочитать не удалось вовсе. Форма тогда не рисуется: пустые поля над
+   *  живой кнопкой Save — это приглашение затереть настройку, которую окно так
+   *  и не показало. */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const topicName = topic?.name ?? null;
 
   /**
-   * Перечитать библиотеку.
+   * Перечитать библиотеку. Возвращает её же: вызывающему она бывает нужна
+   * значением, а не состоянием — выбор вкладки считается по ней сразу.
    *
-   * Молча: без неё форма работает как работала — остаются свои файлы с диска, —
-   * а красный тост поверх открывшихся настроек читался бы как поломка самих
-   * настроек.
+   * Отказ молчит: без библиотеки форма работает как работала — остаются свои
+   * файлы с диска и вставка текстом, — а красный тост поверх открывшихся
+   * настроек читался бы как поломка самих настроек.
    */
-  const reloadSources = useCallback(async () => {
+  const loadSources = useCallback(async (): Promise<SourceView[]> => {
     try {
-      setSources(await api.listSchemaSources());
+      const library = await api.listSchemaSources();
+      setSources(library);
+      setSourcesLoaded(true);
+      return library;
     } catch (e) {
       console.error('Failed to list schema sources', e);
+      return [];
     }
   }, []);
 
-  // Состояние формы принадлежит паре кластер-топик, а модалка переиспользуется
-  // для любого из них. Без перечитывания при открытии в ней остались бы файлы
-  // и выбор от прошлого топика.
-  useEffect(() => {
-    if (!open || !cluster || !topicName) return;
-    let cancelled = false;
-
+  // --- Чья схема сейчас в полях -----------------------------------------------
+  //
+  // Состояние формы принадлежит паре кластер-топик, а окно одно на все топики
+  // списка, и пока новая схема не приехала, в полях остаётся ПРЕЖНЯЯ.
+  //
+  // Сбрасывается оно прямо в рендере, а не эффектом, и это здесь существенно:
+  // эффект отрабатывает уже ПОСЛЕ отрисовки, то есть чужую форму всё равно
+  // успело бы показать — ровно это и происходило. Присваивание состояния во
+  // время рендера React обрывает и начинает рендер заново, ничего не выводя на
+  // экран; это его собственный приём для состояния, которое зависит от пропсов.
+  const wanted = open && cluster && topicName ? `${cluster} ${topicName}` : null;
+  if (!open) {
+    // На закрытии сбрасывается только метка, но не поля: окно закрывается с
+    // анимацией и всё это время ещё нарисовано, а заготовка вместо формы в
+    // уезжающем окне — такая же неправда, как чужая форма во въезжающем. Метки
+    // довольно, чтобы следующее открытие считалось открытием даже у того же
+    // самого топика.
+    if (shown !== null) setShown(null);
+  } else if (wanted !== shown) {
+    setShown(wanted);
+    // Схему открытого топика приложение уже держит — ей и сеем. Сверка по имени
+    // обязательна: `openTopic` говорит, какой топик открыт, а схема приезжает
+    // отдельным ответом, и между этими двумя событиями в ней лежит прежняя.
+    const seed =
+      openTopicSchema && openTopicSchema.cluster === cluster && openTopicSchema.topic === topicName
+        ? openTopicSchema
+        : null;
+    setSchema(seed);
+    setFormat(seed?.format ?? 'json');
+    setMessage(chooseMessage(seed));
+    // В поле — то, что применено. Пусто у топика, настроенного иначе: текст от
+    // ПРОШЛОГО топика в нём был бы приглашением применить чужой контракт.
+    setText(seed?.pasted_text ?? '');
+    setTextError(null);
     // Подбор относится к паре кластер-топик и к тому, что лежало в буфере в
     // момент нажатия: показывать его на следующем топике значило бы предлагать
     // ответ, посчитанный по чужим телам.
     setGuess(null);
+    setMode(modeFromSchema(seed) ?? 'paste');
+    setReady(!!seed && settledWithoutLibrary(seed));
+    setLoadError(null);
+  }
 
-    // Схема и библиотека читаются ВМЕСТЕ, а не двумя независимыми запросами:
-    // от обеих зависит выбор открытой вкладки (`modeOf`), и реши его первый
-    // пришедший ответ — у ненастроенного топика открывалось бы поле для текста
-    // ровно до того мгновения, как приедет список из сорока контрактов.
-    Promise.all([
-      api.getTopicSchema(cluster, topicName),
-      // Молча: без библиотеки форма работает как работала — остаются свои файлы
-      // с диска и вставка текстом, — а красный тост поверх открывшихся настроек
-      // читался бы как поломка самих настроек.
-      api.listSchemaSources().catch((e): SourceView[] => {
-        console.error('Failed to list schema sources', e);
-        return [];
-      }),
-    ])
-      .then(([loaded, library]) => {
-        if (cancelled) return;
-        setSchema(loaded);
-        setSources(library);
-        setFormat(loaded?.format ?? 'json');
-        setMessage(chooseMessage(loaded));
-        setMode(modeOf(loaded, library));
-        // В поле — то, что применено. Пусто у топика, настроенного иначе: текст
-        // от ПРОШЛОГО топика в нём был бы приглашением применить чужой контракт.
-        setText(loaded?.pasted_text ?? '');
-        setTextError(null);
-        if (loaded?.error) {
-          toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
-        }
-      })
-      .catch((e) => {
+  // Чтение схемы. Ответ с диска — последнее слово в любом случае: посеянное
+  // лишь избавляет от ожидания, но источником правды не становится.
+  useEffect(() => {
+    if (!open || !cluster || !topicName) return;
+    let cancelled = false;
+
+    void (async () => {
+      let loaded: TopicSchema | null;
+      try {
+        loaded = await api.getTopicSchema(cluster, topicName);
+      } catch (e) {
         if (cancelled) return;
         console.error('Failed to load topic schema', e);
-        toast.error(`Failed to load topic settings: ${describeError(e)}`);
-      });
+        // Тоста мало: он уедет, а окно останется — и останется в нём заготовка,
+        // которую не отличить от «ещё грузится». Причина обязана лежать на том
+        // месте, где должна была быть форма.
+        setLoadError(describeError(e));
+        return;
+      }
+      if (cancelled) return;
+
+      setSchema(loaded);
+      setFormat(loaded?.format ?? 'json');
+      setMessage(chooseMessage(loaded));
+      setText(loaded?.pasted_text ?? '');
+      setTextError(null);
+      if (loaded?.error) {
+        toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
+      }
+
+      // Вкладку, на которую отвечает сама схема, ставим здесь же и библиотеку
+      // ради неё не ждём. Ждать приходится ровно в одном случае — у
+      // ненастроенного protobuf-топика, — и тогда до ответа форма показывает
+      // ожидание, а не наугад выбранную вкладку.
+      const decided = modeFromSchema(loaded);
+      if (decided) setMode(decided);
+      if (settledWithoutLibrary(loaded)) setReady(true);
+
+      // Остальным форматам библиотека не нужна вовсе: у avro-топика ходить за
+      // списком protobuf-контрактов незачем.
+      if (loaded?.format !== 'proto') return;
+      const library = await loadSources();
+      if (cancelled || decided) return;
+      setMode(modeOf(loaded, library));
+      setReady(true);
+    })();
 
     return () => {
       cancelled = true;
     };
-  }, [open, cluster, topicName]);
+  }, [open, cluster, topicName, loadSources]);
+
+  /**
+   * Формат переключили прямо здесь — и если это proto, вкладке «Library»
+   * отвечать пока нечем: чтение выше за библиотекой не ходило, топик был
+   * другого формата.
+   *
+   * Отдельным эффектом «когда формат стал proto, а библиотеки нет» это делать
+   * нельзя: при открытии настроек протобафного топика он сработал бы заодно с
+   * чтением, и за списком ушли бы ДВА запроса сразу — а первый после
+   * перезабора дерева стоит полторы секунды, и параллельно их было бы два.
+   * Селектор — единственное место, где формат становится proto без участия
+   * чтения: кнопки загрузки и вставки живут внутри самой вкладки, то есть при
+   * уже протобафном формате.
+   */
+  const handleFormatPick = useCallback(
+    (picked: BodyFormat) => {
+      setFormat(picked);
+      if (picked === 'proto' && !sourcesLoaded) void loadSources();
+    },
+    [sourcesLoaded, loadSources],
+  );
 
   /**
    * Разбор текста, пока он ещё в поле.
@@ -363,7 +512,7 @@ export function TopicConfigModal({
    * формату не относящееся вовсе.
    */
   const handleSourcesChanged = useCallback(async () => {
-    await reloadSources();
+    await loadSources();
     if (!cluster || !topicName) return;
     try {
       const reloaded = await api.getTopicSchema(cluster, topicName);
@@ -377,7 +526,7 @@ export function TopicConfigModal({
     } catch (e) {
       console.error('Failed to re-read the topic schema', e);
     }
-  }, [cluster, topicName, message, onSchemaChanged, reloadSources]);
+  }, [cluster, topicName, message, onSchemaChanged, loadSources]);
 
   const handleLoadFiles = useCallback(async () => {
     if (!cluster || !topicName) return;
@@ -644,14 +793,23 @@ export function TopicConfigModal({
    * это объяснение под надписью «источников нет» было бы противоречием.
    */
   const hasLibrary = usableSets > 0 || !!bound || brokenSets > 0;
-  /** Привязка указывает на набор, который в библиотеке ЕСТЬ и разбирается. */
-  const boundIsLive =
-    !!bound &&
-    sources.some(
-      (source) =>
-        source.id === bound.source &&
-        source.sets.some((set) => set.entry === bound.entry && !set.error),
-    );
+  /**
+   * Привязка указывает на набор, который в библиотеке ЕСТЬ и разбирается.
+   *
+   * `null` — за библиотекой ещё не сходили, и судить не о чем. Третье состояние
+   * здесь не из любви к ним: привязанный топик форма показывает, не дожидаясь
+   * списка контрактов (вкладку ей назвала сама схема), и без этого `null` всё
+   * это время селектор стоял бы у него пустым, а под ним — «контракта больше нет
+   * в библиотеке». То есть окно пугало бы ровно тем, чего не случилось.
+   */
+  const boundIsLive = !sourcesLoaded
+    ? null
+    : !!bound &&
+      sources.some(
+        (source) =>
+          source.id === bound.source &&
+          source.sets.some((set) => set.entry === bound.entry && !set.error),
+      );
 
   /**
    * Типов объявлено несколько, а выбор не сделан.
@@ -685,10 +843,28 @@ export function TopicConfigModal({
             своего min-content. Без этого длинный путь к .proto растягивает
             колонку, и форма вылезает за подложку модалки. */}
         <div className="space-y-6 pt-4 min-w-0">
+          {loadError && (
+            <div className="rounded border border-edge border-dashed p-3 font-mono text-xs text-brand break-words">
+              Could not read the settings of this topic: {loadError}
+            </div>
+          )}
+
+          {!ready && !loadError && <Waiting />}
+
+          {/* Схема ещё не приехала — и до тех пор форма не рисуется вовсе.
+              Показывать в это время ПРЕЖНЮЮ и было той самой бедой: окно
+              открывалось мгновенно, но с формой того формата, которым топик
+              настраивали в прошлый раз.
+
+              Снятием с дерева, а не классом: форма — это не картинка, а живые
+              поля с кнопками, и невидимая, но нажимаемая «Load .proto» успела
+              бы применить файлы не к тому формату. */}
+          {ready && (
+          <>
           {/* Message Type */}
           <div className="space-y-2">
             <Label className="font-mono text-sm text-soft">Message Type</Label>
-            <Select value={format} onValueChange={(v) => setFormat(v as BodyFormat)}>
+            <Select value={format} onValueChange={(v) => handleFormatPick(v as BodyFormat)}>
               <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                 <SelectValue />
               </SelectTrigger>
@@ -901,7 +1077,7 @@ export function TopicConfigModal({
                   {hasLibrary ? (
                     <SchemaSetSelect
                       sources={sources}
-                      value={boundIsLive ? bound : null}
+                      value={boundIsLive === false ? null : bound}
                       onChange={(binding) => void handleBind(binding)}
                       disabled={busy}
                     />
@@ -929,7 +1105,7 @@ export function TopicConfigModal({
                       перестал разбираться. Промолчать нельзя — топик в этом
                       состоянии не декодируется, а по виду формы непонятно
                       почему. */}
-                  {bound && !boundIsLive && (
+                  {bound && boundIsLive === false && (
                     <div className="font-mono text-xs text-brand break-words">
                       This topic is bound to {bound.entry}, but that contract is not in the library
                       anymore — fetch its source again in Schema sources, or pick another way to
@@ -1072,6 +1248,8 @@ export function TopicConfigModal({
               file to decode these bodies.
             </div>
           )}
+          </>
+          )}
 
           {/* Action Buttons */}
           <div className="flex gap-3 pt-4">
@@ -1086,9 +1264,13 @@ export function TopicConfigModal({
                 кнопки глушит выключенной события, а вместе с ними и `title`.
                 Нажатие от этого не появляется, выключенная кнопка событий
                 click не отдаёт. */}
+            {/* Пока схема не приехала, Save выключен не для красоты: сохранять
+                он будет то, что стоит в полях, а стоит там заготовка — `json`
+                и пустой тип. Нажатие в эту секунду стёрло бы настройку топика
+                вместо того, чтобы её показать. */}
             <Button
               onClick={handleSave}
-              disabled={busy || !cluster || needsMessage}
+              disabled={busy || !cluster || !ready || needsMessage}
               title={needsMessage ? 'Pick the message type this topic carries first' : undefined}
               className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:pointer-events-auto disabled:cursor-not-allowed"
             >

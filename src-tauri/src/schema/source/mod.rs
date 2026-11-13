@@ -18,6 +18,7 @@
 
 #[cfg(test)]
 mod demo_cases;
+mod digest;
 mod fetch;
 mod store;
 mod tree;

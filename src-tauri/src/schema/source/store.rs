@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::super::files::{Pending, Staged};
 use super::super::proto::linked;
+use super::digest;
 use super::fetch as remote;
 use super::tree;
 use super::types::{SchemaSource, SetView, SourceKind, SourceView};
@@ -185,14 +186,23 @@ pub fn set_inputs(root: &Path, id: &str, entry: &str) -> (Vec<PathBuf>, Vec<Stri
 
 /// Источники вместе с наборами — содержимое окна библиотеки.
 ///
-/// Разбор каждого набора лениво закэширован (`linked::linked_set`), так что
-/// повторное открытие окна стоит почти ничего.
+/// Файлы дерева здесь не читаются вовсе, пока дерево не менялось: во что оно
+/// делится и что в наборах объявлено, посчитано один раз и лежит слепком
+/// (`digest`). На дерево приходится ровно одна проверка — на месте ли оно.
 pub fn views(root: &Path) -> Result<Vec<SourceView>, String> {
     let sources = list(root)?;
+    let mut digest = digest::read(root);
+    // Переписывать файл стоит только когда он и правда разошёлся с записями:
+    // показ библиотеки — чтение, и превращать его в запись на каждый взгляд
+    // незачем.
+    let mut stale = false;
+
     let mut views = Vec::with_capacity(sources.len());
     for source in sources {
         let dir = dir_of(root, &source.id);
         if !dir.is_dir() {
+            // Слепок не трогаем: дерево вернётся перезабором, а тот сменит
+            // метку и пересчитает всё сам.
             views.push(SourceView {
                 source,
                 sets: Vec::new(),
@@ -201,43 +211,79 @@ pub fn views(root: &Path) -> Result<Vec<SourceView>, String> {
             continue;
         }
 
-        let files = tree::proto_files(&dir);
-        let scope = source.subdir.as_deref();
-        let entries = tree::entries(&dir, &files, scope);
-        // Три разных беды, и советы у них разные: пустое дерево чинят
-        // источником, пустая область — подкаталогом, а круг импортов — самими
-        // файлами. Один текст на все три отправлял бы чинить не туда.
-        let error = entries.is_empty().then(|| match (files.is_empty(), scope) {
-            (true, _) => "no .proto files in this source".to_string(),
-            (false, Some(scope)) if !scope.trim().is_empty() => format!(
-                "none of the {} .proto files here is a contract under `{scope}` — \
-                 check the subdirectory, or clear it to search the whole tree",
-                files.len()
-            ),
-            // Входных нет, а файлы есть — значит они импортируют друг друга по
-            // кругу. Сказать об этом надо: список наборов иначе просто пуст.
-            (false, _) => format!(
-                "all {} .proto files here import one another — none of them is a contract of its own",
-                files.len()
-            ),
-        });
+        let stamp = digest::Stamp::of(&source);
+        let entry = match digest.get(&source.id) {
+            Some(known) if known.stamp == stamp => known.clone(),
+            _ => {
+                let fresh = scan(root, &source, &dir, stamp);
+                digest.insert(source.id.clone(), fresh.clone());
+                stale = true;
+                fresh
+            }
+        };
 
-        let sets = entries
-            .into_iter()
-            .map(|entry| describe_set(root, &source.id, entry))
-            .collect();
         views.push(SourceView {
             source,
-            sets,
-            error,
+            sets: entry.sets,
+            error: entry.error,
         });
+    }
+
+    // Слепки убранных источников держать незачем, и `delete` их не чистит
+    // нарочно: он сносит каталог и запись, а слепок — производное, и место ему
+    // отваливаться там же, где оно пересчитывается.
+    let before = digest.len();
+    digest.retain(|id, _| views.iter().any(|view| view.source.id == *id));
+    stale |= digest.len() != before;
+
+    if stale {
+        digest::write(root, &digest);
     }
     Ok(views)
 }
 
+/// Делит дерево на наборы и разбирает каждый — то, ради чего и заведён слепок.
+///
+/// Единственное место, которое читает .proto источника, и зовётся оно только на
+/// изменившемся дереве.
+fn scan(root: &Path, source: &SchemaSource, dir: &Path, stamp: digest::Stamp) -> digest::Entry {
+    let files = tree::proto_files(dir);
+    let scope = source.subdir.as_deref();
+    let entries = tree::entries(dir, &files, scope);
+    // Три разных беды, и советы у них разные: пустое дерево чинят
+    // источником, пустая область — подкаталогом, а круг импортов — самими
+    // файлами. Один текст на все три отправлял бы чинить не туда.
+    let error = entries.is_empty().then(|| match (files.is_empty(), scope) {
+        (true, _) => "no .proto files in this source".to_string(),
+        (false, Some(scope)) if !scope.trim().is_empty() => format!(
+            "none of the {} .proto files here is a contract under `{scope}` — \
+             check the subdirectory, or clear it to search the whole tree",
+            files.len()
+        ),
+        // Входных нет, а файлы есть — значит они импортируют друг друга по
+        // кругу. Сказать об этом надо: список наборов иначе просто пуст.
+        (false, _) => format!(
+            "all {} .proto files here import one another — none of them is a contract of its own",
+            files.len()
+        ),
+    });
+
+    let sets = entries
+        .into_iter()
+        .map(|entry| describe_set(root, &source.id, entry))
+        .collect();
+    digest::Entry { stamp, sets, error }
+}
+
 fn describe_set(root: &Path, id: &str, entry: String) -> SetView {
     let (include, inputs) = set_inputs(root, id, &entry);
-    match linked::linked_set(&include, &inputs) {
+    // Мимо кэша разбора (`parse_set`, а не `linked_set`) намеренно. Граф здесь
+    // нужен на одну строчку вывода и больше никогда, а кэш держит восемь
+    // последних и общий с декодером открытого топика: сложи сюда девяносто
+    // шесть наборов — и схема, которой таблица прямо сейчас читает тела,
+    // вылетит из него вся. Набор, к которому топик привяжут, попадёт туда сам,
+    // когда им начнут декодировать.
+    match linked::parse_set(&include, &inputs) {
         Ok(linked) => SetView {
             entry,
             root: linked.root.clone(),
@@ -666,6 +712,138 @@ mod tests {
         sandbox.author("README.md", "nothing here");
         assert!(sandbox.add_folder("s1").is_err());
         assert!(list(&sandbox.root).unwrap().is_empty());
+    }
+
+    /// Главное свойство слепка: на неизменившемся дереве файлы НЕ читаются.
+    ///
+    /// Проверяется прямым способом — после первого показа .proto из каталога
+    /// убираются, а сам каталог остаётся. Ответ обязан не измениться ни на
+    /// букву: читай `views` дерево, наборов стало бы ноль.
+    ///
+    /// Это не экономия на мелочи. На библиотеке владельца (пять источников,
+    /// 232 файла, 96 наборов) обход и разбор стоили полторы секунды в
+    /// отладочной сборке, и платились они на каждое открытие настроек топика —
+    /// кэш разбора при 96 наборах не попадал никогда.
+    #[test]
+    fn a_warm_digest_answers_without_reading_the_tree() {
+        let sandbox = Sandbox::new("digest-warm");
+        sandbox.author("orders.proto", ORDERS);
+        sandbox.author("wallets.proto", WALLETS);
+        sandbox.author("common/types.proto", COMMON);
+        sandbox.add_folder("s1").unwrap();
+
+        let before = views(&sandbox.root).unwrap();
+        assert_eq!(before[0].sets.len(), 2);
+
+        // Дерево на месте, а файлов в нём больше нет.
+        let dir = dir_of(&sandbox.root, "s1");
+        for name in tree::proto_files(&dir) {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        assert!(tree::proto_files(&dir).is_empty());
+
+        let after = views(&sandbox.root).unwrap();
+        assert_eq!(after[0].error, None);
+        let sets: Vec<(&str, Option<&str>)> = after[0]
+            .sets
+            .iter()
+            .map(|s| (s.entry.as_str(), s.root.as_deref()))
+            .collect();
+        assert_eq!(
+            sets,
+            [
+                ("orders.proto", Some("orders.OrderChanged")),
+                ("wallets.proto", Some("wallets.WalletChanged")),
+            ]
+        );
+    }
+
+    /// Перезабор дерева слепок обесценивает — иначе обновлённый контракт
+    /// показывался бы старым.
+    ///
+    /// Случай нарочно такой, где число файлов не меняется: единственное, чем
+    /// новое дерево отличается от прежнего, — это `fetched_at`, и метка обязана
+    /// держаться в том числе на нём.
+    #[test]
+    fn refetching_the_tree_recomputes_the_digest() {
+        let sandbox = Sandbox::new("digest-refetch");
+        sandbox.author("orders.proto", "syntax = \"proto3\"; package o; message Before {}");
+        sandbox.add_folder("s1").unwrap();
+        assert_eq!(
+            views(&sandbox.root).unwrap()[0].sets[0].root.as_deref(),
+            Some("o.Before")
+        );
+
+        sandbox.author("orders.proto", "syntax = \"proto3\"; package o; message After {}");
+        let files = read_folder(&sandbox.outside).unwrap();
+        let refetched = replace_tree(&sandbox.root, "s1", files).unwrap();
+        assert_eq!(refetched.files, 1, "файлов столько же, что и было");
+
+        assert_eq!(
+            views(&sandbox.root).unwrap()[0].sets[0].root.as_deref(),
+            Some("o.After")
+        );
+    }
+
+    /// Смена области поиска контрактов — единственное, что меняет деление на
+    /// наборы БЕЗ похода за деревом. Метка держится и на ней.
+    #[test]
+    fn changing_the_scope_recomputes_the_digest() {
+        let sandbox = Sandbox::new("digest-scope");
+        sandbox.author("internal/orders.proto", SCOPED_ORDERS);
+        sandbox.author("pkg/common/types.proto", COMMON);
+        sandbox.author("docs/analysts/orders.proto", DOCS_COPY);
+        sandbox.add_folder("s1").unwrap();
+
+        // Без области контрактами считаются оба самостоятельных файла.
+        let wide = views(&sandbox.root).unwrap();
+        assert_eq!(wide[0].sets.len(), 2);
+
+        update(&sandbox.root, "s1", |source| {
+            source.subdir = Some("internal".to_string())
+        })
+        .unwrap();
+
+        let narrow = views(&sandbox.root).unwrap();
+        assert_eq!(narrow[0].sets.len(), 1);
+        assert_eq!(narrow[0].sets[0].entry, "internal/orders.proto");
+    }
+
+    /// Слепок убранного источника не остаётся лежать: `delete` его не трогает
+    /// нарочно, отваливается он там же, где пересчитывается.
+    #[test]
+    fn deleting_a_source_drops_its_digest_too() {
+        let sandbox = Sandbox::new("digest-delete");
+        sandbox.author("orders.proto", ORDERS);
+        sandbox.author("common/types.proto", COMMON);
+        sandbox.add_folder("s1").unwrap();
+        views(&sandbox.root).unwrap();
+        assert!(digest::read(&sandbox.root).contains_key("s1"));
+
+        delete(&sandbox.root, "s1").unwrap();
+        assert!(views(&sandbox.root).unwrap().is_empty());
+        assert!(digest::read(&sandbox.root).is_empty());
+    }
+
+    /// Битый слепок — не беда: это производное, и пересчитать его дешевле, чем
+    /// объяснять человеку, что сломался файл, которого он не заводил.
+    #[test]
+    fn a_broken_digest_is_recomputed_rather_than_reported() {
+        let sandbox = Sandbox::new("digest-broken");
+        sandbox.author("orders.proto", ORDERS);
+        sandbox.author("common/types.proto", COMMON);
+        sandbox.add_folder("s1").unwrap();
+        views(&sandbox.root).unwrap();
+
+        std::fs::write(sandbox.root.join("proto-sets.json"), b"{not json").unwrap();
+
+        let views = views(&sandbox.root).unwrap();
+        assert_eq!(views[0].sets.len(), 1);
+        assert_eq!(views[0].sets[0].root.as_deref(), Some("orders.OrderChanged"));
+        // И починился на диске сам: обломков вроде `.bad` после него не
+        // остаётся, в отличие от настоящих файлов настроек.
+        assert!(digest::read(&sandbox.root).contains_key("s1"));
+        assert!(!sandbox.root.join("proto-sets.json.bad").exists());
     }
 
     #[test]

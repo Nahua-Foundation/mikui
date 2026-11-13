@@ -1648,6 +1648,11 @@ export function KafkaExplorerPortfolio() {
         topic={configTopic}
         cluster={schemaCluster}
         openTopic={selectedTopic?.name ?? null}
+        // Схема открытого топика — чтобы у него настройки открывались сразу
+        // настроенными, без секунд ожидания с формой прошлого формата. Окно
+        // сверяет её с именем топика и кластера само, так что прежняя схема,
+        // лежащая здесь между выбором топика и ответом, не посеется.
+        openTopicSchema={openSchema}
         open={isConfigModalOpen}
         onOpenChange={setIsConfigModalOpen}
         onSchemaChanged={handleSchemaChanged}

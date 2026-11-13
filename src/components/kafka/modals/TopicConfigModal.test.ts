@@ -1,16 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { modeOf } from './TopicConfigModal';
-import { SchemaFile, SourceView, TopicSchema } from '../types';
+import { modeFromSchema, modeOf, settledWithoutLibrary } from './TopicConfigModal';
+import { BodyFormat, SchemaFile, SourceView, TopicSchema } from '../types';
 
 /** Схема топика: всё, кроме способа задать контракт, выбору вкладки безразлично. */
 function schema(parts: {
   files?: SchemaFile[];
   source?: { source: string; entry: string } | null;
+  format?: BodyFormat;
 }): TopicSchema {
   return {
     cluster: 'c',
     topic: 't',
-    format: 'proto',
+    format: parts.format ?? 'proto',
     files: parts.files ?? [],
     source: parts.source ?? null,
     message: null,
@@ -90,5 +91,54 @@ describe('modeOf', () => {
    *  выбрать» отвечает «нет», даже когда в ней девятнадцать контрактов. */
   it('does not count contracts that do not parse', () => {
     expect(modeOf(schema({}), library(true))).toBe('paste');
+  });
+});
+
+/** Та часть ответа, которую даёт сама схема: по ней и видно, кому библиотека
+ *  нужна, а кому нет. */
+describe('modeFromSchema', () => {
+  it('answers for a topic that is configured somehow', () => {
+    expect(modeFromSchema(schema({ source: { source: 's1', entry: 'orders.proto' } }))).toBe(
+      'library',
+    );
+    expect(modeFromSchema(schema({ files: [PASTED] }))).toBe('paste');
+    expect(modeFromSchema(schema({ files: [DISK] }))).toBe('files');
+  });
+
+  /** Ненастроенный топик — единственный, за кого отвечает библиотека. */
+  it('leaves the unconfigured topic to the library', () => {
+    expect(modeFromSchema(schema({}))).toBeNull();
+    expect(modeFromSchema(null)).toBeNull();
+  });
+});
+
+describe('settledWithoutLibrary', () => {
+  /**
+   * Главное, ради чего это заведено: библиотеку ждут только там, где без неё
+   * нечего показать.
+   *
+   * У avro-топика вкладок с контрактами нет вовсе, а стоил поход за библиотекой
+   * полторы секунды — и платились они на каждое открытие настроек, какого бы
+   * формата топик ни был.
+   */
+  it('does not make other formats wait for the .proto library', () => {
+    for (const format of ['json', 'text', 'avro', 'jsonschema', 'hex'] as BodyFormat[]) {
+      expect(settledWithoutLibrary(schema({ format }))).toBe(true);
+    }
+  });
+
+  /** Настроенный protobuf-топик знает свою вкладку сам. */
+  it('shows a configured proto topic right away', () => {
+    expect(
+      settledWithoutLibrary(schema({ source: { source: 's1', entry: 'orders.proto' } })),
+    ).toBe(true);
+    expect(settledWithoutLibrary(schema({ files: [DISK] }))).toBe(true);
+    expect(settledWithoutLibrary(schema({ files: [PASTED] }))).toBe(true);
+  });
+
+  /** А ненастроенный — не знает, и показывать ему наугад выбранную вкладку
+   *  значит моргнуть ею, как только приедет библиотека. */
+  it('waits for the library when the proto topic is configured by nothing', () => {
+    expect(settledWithoutLibrary(schema({}))).toBe(false);
   });
 });
