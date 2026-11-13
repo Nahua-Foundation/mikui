@@ -14,8 +14,10 @@ use super::avro::{self, AvroDecoder, Linked};
 use super::decoder::Decoder;
 use super::files::{Pending, Staged};
 use super::json::{self, Compiled, JsonDecoder};
+use super::proto::guess::{self, Candidate, Guess};
 use super::proto::{imports, linked, resolve, ProtoDecoder};
 use super::registry::{Registry, SchemaKind, SubjectAnswer};
+use super::source::{self, SourceBinding};
 use super::types::{
     AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, LensSetting, SchemaFile, TopicSchema,
     TopicSchemaView,
@@ -42,8 +44,48 @@ fn save(root: &Path, schemas: &[TopicSchema]) -> Result<(), String> {
 }
 
 /// Каталог с копиями .proto этой схемы.
+///
+/// Только СВОИХ копий. Для топика, привязанного к библиотеке, этот каталог
+/// пуст и не используется — и подменять его здесь деревом источника нельзя ни в
+/// коем случае: `forget_cluster` сносит его вместе с кластером, а дерево
+/// источника общее на все топики и переживает любой из них.
 fn dir_of(root: &Path, schema: &TopicSchema) -> PathBuf {
     root.join(SCHEMAS_DIR).join(&schema.dir)
+}
+
+/// Разбор набора топика — своего или библиотечного.
+///
+/// Единственное место, где эти два случая вообще различаются: дальше и показу,
+/// и декодеру, и подбору нужен один и тот же `Linked`.
+fn parsed_set(root: &Path, schema: &TopicSchema) -> Result<Arc<linked::Linked>, String> {
+    match &schema.source {
+        Some(binding) => {
+            let (include, inputs) = source::set_inputs(root, &binding.source, &binding.entry);
+            linked::linked_set(&include, &inputs)
+        }
+        None => linked::linked(&dir_of(root, schema), &schema.files),
+    }
+}
+
+/// То же в обход кэша.
+///
+/// Нужно одному вызывающему — перебору всех наборов кластера в `guess_message`.
+/// Кэш держит восемь записей (`proto::linked`), и проход по полутора десяткам
+/// наборов вытеснил бы из него разбор открытого топика, то есть заплатил бы
+/// перерисовкой таблицы за подсказку в форме.
+fn parsed_set_fresh(root: &Path, schema: &TopicSchema) -> Result<linked::Linked, String> {
+    match &schema.source {
+        Some(binding) => {
+            let (include, inputs) = source::set_inputs(root, &binding.source, &binding.entry);
+            linked::parse_set(&include, &inputs)
+        }
+        None => linked::parse(&dir_of(root, schema), &schema.files),
+    }
+}
+
+/// Есть ли у топика что разбирать: свои файлы или привязка к библиотеке.
+fn has_proto(schema: &TopicSchema) -> bool {
+    !schema.files.is_empty() || schema.source.is_some()
 }
 
 /// Имя каталога схемы: FNV-1a от пары кластер-топик.
@@ -76,6 +118,10 @@ fn position(schemas: &[TopicSchema], cluster: &str, topic: &str) -> Option<usize
 /// Запись, в которой нечего хранить: держать её в файле — только копить мусор.
 fn is_trivial(schema: &TopicSchema) -> bool {
     schema.files.is_empty()
+        // Привязка к набору из библиотеки — это вся схема топика целиком:
+        // своих файлов у него нет и не будет, и выбрось эту запись, топик
+        // остался бы без схемы вовсе.
+        && schema.source.is_none()
         && schema.message.is_none()
         && schema.format.is_none()
         && schema.avro.as_ref().is_none_or(AvroBinding::is_empty)
@@ -97,11 +143,35 @@ fn blank(cluster: &str, topic: &str) -> TopicSchema {
         topic: topic.to_string(),
         format: None,
         files: Vec::new(),
+        source: None,
         message: None,
         dir: new_dir_name(cluster, topic),
         avro: None,
         json: None,
         lens: None,
+    }
+}
+
+/// Подставляет единственный корневой тип набора там, где тип не выбран.
+///
+/// Нужно топикам, чьи .proto загружены раньше, чем появилось правило корня:
+/// заставлять человека перечитывать файлы ради вывода, который можно сделать
+/// прямо сейчас, незачем. Заодно это и есть обещанный ноль кликов — топик с
+/// загруженной схемой начинает декодироваться, ни разу не побывав в настройках.
+///
+/// Запись на диске при этом НЕ меняется, и это важно: выбора человек не делал,
+/// а вывод пересчитывается при каждом обращении — значит, изменившийся .proto
+/// он подхватит сам. Сохранится он только тогда, когда человек нажмёт Save,
+/// увидев его в форме.
+///
+/// Зовётся и из `decoder`, и из `describe` — ровно затем, чтобы форма
+/// показывала то же, чем декодируется таблица.
+fn fill_root(root: &Path, schema: &mut TopicSchema) {
+    if schema.message.is_some() || !has_proto(schema) {
+        return;
+    }
+    if let Ok(linked) = parsed_set(root, schema) {
+        schema.message = linked.root.clone();
     }
 }
 
@@ -160,6 +230,13 @@ pub fn view(root: &Path, cluster: &str, topic: &str) -> Result<Option<TopicSchem
 }
 
 fn describe(root: &Path, schema: &TopicSchema) -> Result<TopicSchemaView, String> {
+    // Копия ради одного поля: тип, не выбранный руками, выводится из устройства
+    // набора (`fill_root`), и форма обязана показать именно его — тем же он
+    // уедет и в декодер.
+    let mut schema = schema.clone();
+    fill_root(root, &mut schema);
+    let schema = &schema;
+
     let detected = detected_subject(root, schema);
     let format = effective_format(schema, detected.as_ref().map(|d| d.kind));
     let avro = avro_view(root, schema, detected.as_ref());
@@ -171,26 +248,42 @@ fn describe(root: &Path, schema: &TopicSchema) -> Result<TopicSchemaView, String
     // и объяснить это больше нечем.
     let detected_kind = detected.as_ref().map(|d| d.kind.as_str().to_string());
 
-    if schema.files.is_empty() {
+    if !has_proto(schema) {
         return Ok(TopicSchemaView::new(schema, format, Vec::new(), Vec::new(), None)
             .with_avro(avro)
             .with_json(json)
             .with_detected_kind(detected_kind));
     }
-    let dir = dir_of(root, schema);
-    Ok(match linked::linked(&dir, &schema.files) {
+    let pasted_text = pasted_text(root, schema);
+    Ok(match parsed_set(root, schema) {
         Ok(linked) => TopicSchemaView::new(
             schema,
             format,
             linked.messages.clone(),
             linked.produce_choices.clone(),
             None,
-        ),
+        )
+        .with_root(linked.root.clone()),
         Err(e) => TopicSchemaView::new(schema, format, Vec::new(), Vec::new(), Some(e)),
     }
     .with_avro(avro)
     .with_json(json)
-    .with_detected_kind(detected_kind))
+    .with_detected_kind(detected_kind)
+    .with_pasted_text(pasted_text))
+}
+
+/// Текст вставленного контракта, как он лежит в каталоге схемы.
+///
+/// Читается и при сломанном разборе — именно тогда он и нужнее всего: править
+/// текст человек будет в том же поле, и показать ему вместо текста пустоту
+/// значило бы заставить вставлять всё заново ради одной опечатки.
+///
+/// Не UTF-8 быть не может — текст пришёл строкой из формы, — но отвечать на это
+/// ошибкой незачем: поле просто окажется пустым, а причина видна в разборе.
+fn pasted_text(root: &Path, schema: &TopicSchema) -> Option<String> {
+    let file = schema.files.iter().find(|f| f.pasted)?;
+    let bytes = std::fs::read(dir_of(root, schema).join(&file.name)).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Декодер для топика, если он настроен и схема разбирается.
@@ -199,7 +292,8 @@ pub fn decoder(root: &Path, cluster: &str, topic: &str) -> Result<Option<Arc<Dec
     let stored = position(&schemas, cluster, topic).map(|i| schemas[i].clone());
     // Записи может не быть вовсе, а декодер всё равно найтись: реестр кластера
     // знает про топик схему, и спрашивать об этом пользователя незачем.
-    let schema = stored.unwrap_or_else(|| blank(cluster, topic));
+    let mut schema = stored.unwrap_or_else(|| blank(cluster, topic));
+    fill_root(root, &mut schema);
 
     let detected = detected_subject(root, &schema);
     let format = effective_format(&schema, detected.as_ref().map(|d| d.kind));
@@ -209,8 +303,7 @@ pub fn decoder(root: &Path, cluster: &str, topic: &str) -> Result<Option<Arc<Dec
 
     match format {
         BodyFormat::Proto => {
-            let dir = dir_of(root, &schema);
-            let linked = linked::linked(&dir, &schema.files)?;
+            let linked = parsed_set(root, &schema)?;
             let name = schema.message.as_deref().unwrap_or_default();
             let message = linked
                 .message(name)
@@ -361,13 +454,85 @@ pub fn produce_target(
     let index = position(&schemas, cluster, topic)
         .ok_or_else(|| format!("no .proto schema for topic {topic}"))?;
     let schema = &schemas[index];
-    if schema.files.is_empty() {
+    if !has_proto(schema) {
         return Err(format!("no .proto files loaded for topic {topic}"));
     }
 
-    let dir = dir_of(root, schema);
-    let linked = linked::linked(&dir, &schema.files)?;
+    let linked = parsed_set(root, schema)?;
     linked.produce_target(choice)
+}
+
+/// Подбирает тип по телам топика, перебирая всё, что загружено этому кластеру.
+///
+/// Пул кандидатов — все message всех .proto, уже загруженных ЛЮБОМУ топику
+/// этого кластера, а не только этому. Иначе подбирать было бы не из чего: у
+/// топика без схемы своих файлов нет вовсе, а именно ему подбор и нужен.
+/// Кластером пул ограничен по той же причине, по какой привязка схемы идёт по
+/// паре кластер-топик: одноимённые топики в dev и prod несут разные контракты.
+///
+/// Каждый набор разбирается отдельно и падает отдельно — сломанный .proto
+/// одного топика не должен гасить подбор для всех. Разбор идёт через
+/// `linked::parse`, в обход кэша: в нём восемь мест (`proto::linked`), и проход
+/// по полутора десяткам каталогов вытеснил бы оттуда разбор открытого топика,
+/// то есть заплатил бы перерисовкой таблицы за подсказку в форме.
+pub fn guess_message(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    samples: &[Vec<u8>],
+) -> Result<Guess, String> {
+    if samples.is_empty() {
+        return Err("no message bodies to match against — read the topic first".to_string());
+    }
+
+    let schemas = list(root)?;
+    // Тип, который топику уже назначен. Он остаётся в списке при любых числах,
+    // даже не разобрав ни одного тела, — потому что главный вопрос к подбору
+    // звучит «почему не мой», и ответить на него можно только строкой про него
+    // самого. Без этого верный на вид тип исчезал бесследно, и выяснить, что он
+    // спотыкается о вложенное сообщение, было нечем.
+    let chosen = position(&schemas, cluster, topic).and_then(|i| schemas[i].message.clone());
+
+    let mut candidates = Vec::new();
+    for schema in schemas.iter().filter(|s| s.cluster == cluster) {
+        if !has_proto(schema) {
+            continue;
+        }
+        let own = schema.topic == topic;
+        let Ok(linked) = parsed_set_fresh(root, schema) else {
+            continue;
+        };
+        for name in &linked.messages {
+            let Some(descriptor) = linked.message(name) else {
+                continue;
+            };
+            let fit = guess::fit(&descriptor, samples);
+            // Разобравшие лишь часть тел тоже едут наружу — отбирает из них
+            // `Guess::new`. Отсеивать их здесь значило бы прятать верный ответ
+            // ровно в том случае, ради которого всё и затевалось: в живом
+            // топике попадаются и сообщения другого вида, и хвосты старого
+            // контракта, и одного такого тела хватало, чтобы правильный тип
+            // исчез из списка молча.
+            //
+            // Совсем ничего не разобравшие — другое дело: сказать о них нечего,
+            // а в пуле их сотни. Но только ЧУЖИЕ: свой набор человек видит
+            // своими глазами и спрашивает ровно про него («а где мой Levels?»),
+            // и список, из которого половина его типов пропала без объяснения,
+            // отвечает на этот вопрос молчанием.
+            if fit.parsed == 0 && !own && chosen.as_deref() != Some(name.as_str()) {
+                continue;
+            }
+            candidates.push(Candidate {
+                message: name.clone(),
+                from_topic: schema.topic.clone(),
+                own,
+                root: linked.root.as_deref() == Some(name.as_str()),
+                fit,
+            });
+        }
+    }
+
+    Ok(Guess::new(samples.len(), candidates))
 }
 
 // --- Изменение --------------------------------------------------------------
@@ -394,7 +559,18 @@ pub fn add_files(
     let index = ensure_record(&mut schemas, cluster, topic);
     let dir = dir_of(root, &schemas[index]);
 
-    let mut picked = picked_bytes(&dir, &schemas[index].files, |_| false)?;
+    // Вставленный текст в новый набор не переносится. Это те же два ответа на
+    // один вопрос, что и привязка к библиотеке ниже: контракт, вставленный
+    // руками, и файлы с диска — разные способы задать схему ОДНОГО топика, и
+    // сосуществуя они объявляли бы типы, половины которых пользователь уже не
+    // видит ни в одном поле формы.
+    let kept: Vec<SchemaFile> = schemas[index]
+        .files
+        .iter()
+        .filter(|f| !f.pasted)
+        .cloned()
+        .collect();
+    let mut picked = picked_bytes(&dir, &kept, |_| false)?;
     for source in sources {
         let bytes = std::fs::read(source).map_err(|e| format!("can't read {source}: {e}"))?;
         // Тот же файл, добавленный повторно, — это «перечитать», а не дубликат.
@@ -402,11 +578,181 @@ pub fn add_files(
         picked.push((source.clone(), bytes));
     }
 
-    let messages = assemble_and_commit(&mut schemas[index], &dir, picked)?;
+    let assembled = assemble_and_commit(&mut schemas[index], &dir, picked)?;
     schemas[index].format = Some(BodyFormat::Proto);
-    settle_message(&mut schemas[index], &messages);
+    // Загрузить свои файлы — значит перестать читать топик набором из
+    // библиотеки. Оставить обе привязки нельзя: это два ответа на вопрос «чем
+    // декодировать», и выигрывал бы тот, которого раньше спросили. Выбор типа
+    // пересчитывается ниже уже по своим файлам.
+    schemas[index].source = None;
+    settle_message(&mut schemas[index], &assembled);
 
     let view = describe(root, &schemas[index])?;
+    save(root, &schemas)?;
+    Ok(view)
+}
+
+/// Имя, под которым ложится вставленный текст.
+///
+/// Видно его почти нигде — в списке файлов вставленный контракт показан текстом
+/// в поле, а не строкой, — но имя обязано быть: под ним файл лежит в каталоге, и
+/// по нему же парсер отсчитывает «свои» message. Постоянное, а не по топику:
+/// имя топика бывает с точками и слэшами, и превращать его в имя файла значило
+/// бы заводить правило очистки там, где выбора вообще нет — файл-то один.
+const PASTED_NAME: &str = "pasted.proto";
+
+/// Кладёт топику контракт, текст которого вставили руками.
+///
+/// Самый прямой из трёх путей: ни диалога файлов, ни источника — текст и кнопка.
+///
+/// Файл РОВНО ОДИН, и это не экономия, а свойство: у вставленного текста нет
+/// каталога, рядом с которым искать импорты, поэтому разрешиться может только то,
+/// что парсер несёт в себе (`google/protobuf/*`). Контракт с чужими импортами
+/// сюда не влезает в принципе — для него и заведены папки и репозитории, и
+/// именно это говорит ошибка (`explain_pasted_imports`).
+///
+/// Как и загрузка файлов, снимает привязку к библиотеке: два ответа на вопрос
+/// «чем декодировать» сосуществовать не должны.
+pub fn add_text(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    text: &str,
+) -> Result<TopicSchemaView, String> {
+    if text.trim().is_empty() {
+        return Err("the pasted contract is empty".to_string());
+    }
+
+    let mut schemas = list(root)?;
+    let index = ensure_record(&mut schemas, cluster, topic);
+    let dir = dir_of(root, &schemas[index]);
+
+    // Прежний набор не переносится: вставленный текст — это ВЕСЬ контракт
+    // топика, а не добавка к тому, что лежало. Иначе выбранные раньше файлы
+    // продолжали бы объявлять типы, которых во вставленном тексте нет, и список
+    // «чем декодировать» отвечал бы не про то, что видно в поле.
+    let pending = vec![Pending::pasted(PASTED_NAME.to_string(), text.as_bytes().to_vec())];
+    let assembled = commit(&mut schemas[index], &dir, &pending)
+        .map_err(|e| match explain_pasted_imports(text.as_bytes()) {
+            Some(why) => format!("{why}\n\n{e}"),
+            None => e,
+        })?;
+
+    schemas[index].format = Some(BodyFormat::Proto);
+    schemas[index].source = None;
+    settle_message(&mut schemas[index], &assembled);
+
+    let view = describe(root, &schemas[index])?;
+    save(root, &schemas)?;
+    Ok(view)
+}
+
+/// Разбирает вставленный текст, ничего не сохраняя.
+///
+/// Нужна форме: про ошибку в контракте человек должен узнать, пока текст ещё
+/// в поле, а не после того, как настройки топика им заменены. Разбор здесь тот
+/// же самый, что и в `add_text`, — то есть ответ её совпадает с тем, что скажет
+/// применение, а не приближает его.
+///
+/// Складывается при этом во ВРЕМЕННЫЙ каталог, а не в рабочий каталог топика:
+/// проверка идёт на каждое затишье в наборе текста, и трогать то, чем топик
+/// читается прямо сейчас, она не имеет права. `Staged` без `commit` уносит за
+/// собой всё сам.
+pub fn check_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("the pasted contract is empty".to_string());
+    }
+
+    let pending = vec![Pending::pasted(PASTED_NAME.to_string(), text.as_bytes().to_vec())];
+    let listing: Vec<SchemaFile> = pending.iter().map(SchemaFile::from).collect();
+    // Имя уникальное: проверка может идти одновременно с применением, и общий
+    // каталог означал бы, что одна операция сносит каталог другой на полуслове.
+    let target = std::env::temp_dir().join(format!("mikui-proto-check-{}", uuid::Uuid::new_v4()));
+    let staged = Staged::write(target, &pending)?;
+    linked::parse(staged.path(), &listing)
+        .map(|_| ())
+        .map_err(|e| match explain_pasted_imports(text.as_bytes()) {
+            Some(why) => format!("{why}\n\n{e}"),
+            None => e,
+        })
+}
+
+/// Чем объяснить отказ, когда вставленный текст импортирует чужие файлы.
+///
+/// `None` — импортов нет или все они из тех, что парсер несёт в себе; тогда
+/// разбор упал по другой причине и выдумывать ей объяснение нельзя.
+///
+/// Отдельное объяснение нужно потому, что сообщение парсера («... is not found
+/// in import path») правдиво и бесполезно: искать было негде и быть не могло, а
+/// что с этим делать — из него не следует никак.
+fn explain_pasted_imports(bytes: &[u8]) -> Option<String> {
+    let outside: Vec<String> = imports::imports_of_bytes(bytes)
+        .into_iter()
+        .filter(|import| !imports::is_bundled(import))
+        .collect();
+    if outside.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the pasted contract imports {}, and pasted text has no folder next to it to look in. \
+         Add the folder or the repository holding these files as a schema source and pick the \
+         contract there, or paste a contract that imports nothing outside google/protobuf.",
+        outside.join(", ")
+    ))
+}
+
+/// Привязывает топик к набору из библиотеки.
+///
+/// Это и есть «пачкой»: вместо диалога файлов, ожидания резолва импортов и
+/// выбора типа — один выбор набора. Тип подставляет правило корня
+/// (`settle_message`), и в типичном наборе выбирать там не из чего.
+///
+/// Свои копии файлов при этом СНОСЯТСЯ: два ответа на вопрос «чем
+/// декодировать» — это способ показывать то одно, то другое в зависимости от
+/// того, какой проверили раньше. Прежний выбор типа тоже сбрасывается — он
+/// относился к прежнему набору, и перенести его в новый не на что.
+///
+/// `entry` пуст — привязка снимается, топик возвращается к своим файлам.
+pub fn bind_source(
+    root: &Path,
+    cluster: &str,
+    topic: &str,
+    binding: Option<SourceBinding>,
+) -> Result<TopicSchemaView, String> {
+    let mut schemas = list(root)?;
+    let index = ensure_record(&mut schemas, cluster, topic);
+
+    if let Some(binding) = &binding {
+        // Набор обязан разбираться, иначе привязка обещает декодирование,
+        // которого не будет. Правило всего модуля: изменение применяется,
+        // только если после него схема работает.
+        let (include, inputs) = source::set_inputs(root, &binding.source, &binding.entry);
+        let linked = linked::linked_set(&include, &inputs)?;
+
+        let dir = dir_of(root, &schemas[index]);
+        linked::invalidate(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        schemas[index].files = Vec::new();
+        schemas[index].source = Some(binding.clone());
+        schemas[index].format = Some(BodyFormat::Proto);
+        schemas[index].message = None;
+        settle_message(
+            &mut schemas[index],
+            &Assembled {
+                messages: linked.messages.clone(),
+                root: linked.root.clone(),
+            },
+        );
+    } else {
+        schemas[index].source = None;
+        schemas[index].message = None;
+    }
+
+    let view = describe(root, &schemas[index])?;
+    if is_trivial(&schemas[index]) {
+        schemas.remove(index);
+    }
     save(root, &schemas)?;
     Ok(view)
 }
@@ -433,14 +779,26 @@ pub fn refresh(
         }
     }
 
+    // Перечитывать вставленный текст неоткуда: оригинала на диске нет вовсе, и
+    // единственный его экземпляр — тот, что лежит в каталоге схемы. Форма этой
+    // кнопки у вставленного контракта и не показывает; отказ здесь — на случай,
+    // когда команду позвали мимо неё.
+    if schemas[index].files.iter().any(|f| f.pasted) {
+        return Err(
+            "this topic is read by a contract pasted as text — there is no file on disk to \
+             re-read. Edit the text and apply it again."
+                .to_string(),
+        );
+    }
+
     // Подтянутые по импорту в `picked` не попадают, и перечитывать их отдельно
     // не нужно: они и так будут прочитаны с диска заново при поиске.
     let picked = picked_bytes(&dir, &schemas[index].files, |file| {
         name.is_none_or(|wanted| wanted == file.name)
     })?;
 
-    let messages = assemble_and_commit(&mut schemas[index], &dir, picked)?;
-    settle_message(&mut schemas[index], &messages);
+    let assembled = assemble_and_commit(&mut schemas[index], &dir, picked)?;
+    settle_message(&mut schemas[index], &assembled);
 
     let view = describe(root, &schemas[index])?;
     save(root, &schemas)?;
@@ -498,8 +856,8 @@ pub fn remove_file(
         return Ok(Some(view));
     }
 
-    let messages = assemble_and_commit(&mut schemas[index], &dir, picked)?;
-    settle_message(&mut schemas[index], &messages);
+    let assembled = assemble_and_commit(&mut schemas[index], &dir, picked)?;
+    settle_message(&mut schemas[index], &assembled);
 
     let view = describe(root, &schemas[index])?;
     save(root, &schemas)?;
@@ -1569,6 +1927,10 @@ fn keep_existing(dir: &Path, files: &[SchemaFile]) -> Result<Vec<Pending>, Strin
                 source: file.source.clone(),
                 bytes: read_copy(dir, file)?,
                 auto: file.auto,
+                // Набор сохраняется как есть — вместе с тем, что текст у него
+                // вставленный: потеряв признак, файл превратился бы в «выбранный
+                // руками» с пустым путём, то есть в обещание перечитать ничто.
+                pasted: file.pasted,
             })
         })
         .collect()
@@ -1601,7 +1963,11 @@ fn picked_bytes(
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut out = Vec::with_capacity(files.len());
     for file in files.iter().filter(|f| !f.auto) {
-        let bytes = if stale(file) {
+        // Вставленный текст перечитывать неоткуда: оригинала нет, и
+        // единственный его экземпляр — это копия в каталоге схемы. `stale` для
+        // него не спрашивают вовсе, иначе «перечитать с диска» попыталось бы
+        // прочитать пустой путь.
+        let bytes = if stale(file) && !file.pasted {
             std::fs::read(&file.source)
                 .map_err(|e| format!("can't re-read {}: {e}", file.source))?
         } else {
@@ -1661,6 +2027,9 @@ fn assemble(picked: Vec<(String, Vec<u8>)>) -> (Vec<Pending>, Option<String>) {
         source: found.source.to_string_lossy().into_owned(),
         bytes: found.bytes,
         auto: true,
+        // Найденное по импорту лежит на диске по своему пути — вставленным оно
+        // не бывает по определению.
+        pasted: false,
     }));
     (pending, explained)
 }
@@ -1675,7 +2044,7 @@ fn assemble_and_commit(
     schema: &mut TopicSchema,
     dir: &Path,
     picked: Vec<(String, Vec<u8>)>,
-) -> Result<Vec<String>, String> {
+) -> Result<Assembled, String> {
     let (pending, explained) = assemble(picked);
     commit(schema, dir, &pending).map_err(|e| match explained {
         Some(why) => format!("{why}\n\n{e}"),
@@ -1683,46 +2052,74 @@ fn assemble_and_commit(
     })
 }
 
+/// Что дал разбор только что собранного набора.
+///
+/// Не один лишь список типов: выбрать из него нужный помогает ещё и то, как
+/// набор устроен, — см. `linked::Linked::root`.
+struct Assembled {
+    messages: Vec<String>,
+    root: Option<String>,
+}
+
 /// Складывает набор файлов, проверяет его разбором и, только если он удался,
 /// ставит каталог на место и переписывает список файлов схемы.
 ///
-/// Возвращает message, которые в этом наборе объявлены.
+/// Возвращает message, которые в этом наборе объявлены, и его корневой тип.
 fn commit(
     schema: &mut TopicSchema,
     dir: &Path,
     pending: &[Pending],
-) -> Result<Vec<String>, String> {
+) -> Result<Assembled, String> {
     let staged = Staged::write(dir.to_path_buf(), pending)?;
 
     let listing: Vec<SchemaFile> = pending.iter().map(SchemaFile::from).collect();
 
     // Разбираем ещё во временном каталоге: неудача не должна оставить следа.
     let linked = linked::parse(staged.path(), &listing)?;
-    let messages = linked.messages.clone();
+    let assembled = Assembled {
+        messages: linked.messages.clone(),
+        root: linked.root.clone(),
+    };
 
     // Прошлый разбор относится к прежнему содержимому каталога и с этого
     // момента врёт.
     linked::invalidate(dir);
     staged.commit()?;
     schema.files = listing;
-    Ok(messages)
+    Ok(assembled)
 }
 
 /// Приводит выбранный message в соответствие с тем, что теперь есть в схеме.
 ///
+/// Три правила, в порядке убывания силы.
+///
 /// Единственный message подставляется сам — выбирать не из чего, а требовать
-/// выбор значило бы требовать лишний клик. Исчезнувший из схемы выбор
-/// сбрасывается: молча декодировать не тем, что показано в форме, нельзя.
-fn settle_message(schema: &mut TopicSchema, messages: &[String]) {
-    if let [only] = messages {
+/// выбор значило бы требовать лишний клик.
+///
+/// Выбор, сделанный руками, сохраняется, пока такой тип в наборе есть: человек
+/// мог осознанно читать топик вложенным типом, и переставлять его выбор на
+/// «правильный» нельзя.
+///
+/// А вот когда выбора нет (или он из схемы исчез), подставляется
+/// ЕДИНСТВЕННЫЙ КОРНЕВОЙ тип набора, если он единственный. Это та же мысль,
+/// что и у первого правила: .proto, написанный под один топик, несёт конверт
+/// сверху и всё остальное внутри него, так что выбирать опять не из чего —
+/// просто увидеть это можно не по длине списка, а по устройству схемы
+/// (`linked::Linked::root`). Три типа, два из которых лежат внутри третьего, —
+/// это ровно один кандидат, а не три.
+fn settle_message(schema: &mut TopicSchema, assembled: &Assembled) {
+    if let [only] = assembled.messages.as_slice() {
         schema.message = Some(only.clone());
         return;
     }
     if let Some(chosen) = &schema.message {
-        if !messages.iter().any(|m| m == chosen) {
-            schema.message = None;
+        if assembled.messages.iter().any(|m| m == chosen) {
+            return;
         }
     }
+    // Корня может и не быть — тогда это сброс, как и прежде: молча
+    // декодировать не тем, что показано в форме, нельзя.
+    schema.message = assembled.root.clone();
 }
 
 #[cfg(test)]
@@ -1747,6 +2144,7 @@ mod tests {
             topic: "t".into(),
             format: Some(BodyFormat::Proto),
             files: Vec::new(),
+            source: None,
             message: message.map(str::to_string),
             dir: "d".into(),
             avro: None,
@@ -1755,24 +2153,33 @@ mod tests {
         }
     }
 
+    /// Набор с несколькими типами и без корня: такой и есть предмет подбора по
+    /// телам, выводить тут нечего.
+    fn flat(messages: &[&str]) -> Assembled {
+        Assembled {
+            messages: messages.iter().map(|m| m.to_string()).collect(),
+            root: None,
+        }
+    }
+
     #[test]
     fn a_single_message_is_selected_without_asking() {
         let mut schema = schema_with(None);
-        settle_message(&mut schema, &["demo.Only".to_string()]);
+        settle_message(&mut schema, &flat(&["demo.Only"]));
         assert_eq!(schema.message.as_deref(), Some("demo.Only"));
     }
 
     #[test]
     fn a_single_message_overrides_a_stale_choice() {
         let mut schema = schema_with(Some("demo.Gone"));
-        settle_message(&mut schema, &["demo.Only".to_string()]);
+        settle_message(&mut schema, &flat(&["demo.Only"]));
         assert_eq!(schema.message.as_deref(), Some("demo.Only"));
     }
 
     #[test]
     fn several_messages_leave_the_valid_choice_alone() {
         let mut schema = schema_with(Some("demo.B"));
-        settle_message(&mut schema, &["demo.A".to_string(), "demo.B".to_string()]);
+        settle_message(&mut schema, &flat(&["demo.A", "demo.B"]));
         assert_eq!(schema.message.as_deref(), Some("demo.B"));
     }
 
@@ -1781,8 +2188,43 @@ mod tests {
     #[test]
     fn a_choice_that_vanished_from_the_schema_is_dropped() {
         let mut schema = schema_with(Some("demo.Gone"));
-        settle_message(&mut schema, &["demo.A".to_string(), "demo.B".to_string()]);
+        settle_message(&mut schema, &flat(&["demo.A", "demo.B"]));
         assert_eq!(schema.message, None);
+    }
+
+    /// Три типа, два из которых лежат внутри третьего, — это один кандидат, а
+    /// не три, и выбирать тут не из чего ровно так же, как при единственном
+    /// типе. Ради этого правила и считается корень набора.
+    #[test]
+    fn the_only_root_type_is_selected_without_asking() {
+        let mut schema = schema_with(None);
+        settle_message(
+            &mut schema,
+            &Assembled {
+                messages: vec![
+                    "demo.Envelope".to_string(),
+                    "demo.Envelope.Inner".to_string(),
+                    "demo.Payload".to_string(),
+                ],
+                root: Some("demo.Envelope".to_string()),
+            },
+        );
+        assert_eq!(schema.message.as_deref(), Some("demo.Envelope"));
+    }
+
+    /// Выбор человека сильнее вывода по устройству схемы: читать топик
+    /// вложенным типом — законное желание, и переставлять его на корень нельзя.
+    #[test]
+    fn a_hand_picked_type_survives_the_root_rule() {
+        let mut schema = schema_with(Some("demo.Payload"));
+        settle_message(
+            &mut schema,
+            &Assembled {
+                messages: vec!["demo.Envelope".to_string(), "demo.Payload".to_string()],
+                root: Some("demo.Envelope".to_string()),
+            },
+        );
+        assert_eq!(schema.message.as_deref(), Some("demo.Payload"));
     }
 
     #[test]
@@ -1923,6 +2365,10 @@ mod tests {
             add_files(&self.root, CLUSTER, TOPIC, sources)
         }
 
+        fn paste(&self, text: &str) -> Result<TopicSchemaView, String> {
+            add_text(&self.root, CLUSTER, TOPIC, text)
+        }
+
         fn add_avsc(&self, sources: &[String]) -> Result<TopicSchemaView, String> {
             add_avro_files(&self.root, CLUSTER, TOPIC, sources)
         }
@@ -1978,6 +2424,423 @@ mod tests {
         assert_eq!(view.files[0].source, path);
         // И уже есть чем декодировать.
         assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
+    }
+
+    /// Набор из конверта и его частей декодируется без единого клика: тип
+    /// выводится из устройства схемы, а не выбирается руками.
+    ///
+    /// Раскладка — из настоящего набора (`OrderBookV2` с полями типа `Levels`),
+    /// и она же была главной жалобой: типов три, выбирать из них по виду
+    /// списка было непонятно что, а подобрать по байтам конверт и его нутро
+    /// нельзя — они ложатся на тело одинаково.
+    #[test]
+    fn a_wrapper_set_decodes_without_picking_a_message_by_hand() {
+        let sandbox = Sandbox::new("root-rule");
+        let path = sandbox.author(
+            "ob.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message OrderBookV2 {
+                    string instrument_uid = 1;
+                    Levels asks = 7;
+                    Levels bids = 8;
+                }
+                message Levels { double base_price = 1; }
+            "#,
+        );
+        let view = sandbox.add(&[path]).unwrap();
+
+        assert_eq!(view.messages, ["demo.Levels", "demo.OrderBookV2"]);
+        assert_eq!(view.message.as_deref(), Some("demo.OrderBookV2"));
+        assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
+    }
+
+    /// То же для записи, сохранённой РАНЬШЕ правила корня: тип в ней не выбран,
+    /// и перечитывать файлы ради вывода человек не обязан.
+    #[test]
+    fn an_old_record_without_a_choice_falls_back_to_the_root() {
+        let sandbox = Sandbox::new("root-legacy");
+        let path = sandbox.author(
+            "ob.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Envelope { Payload payload = 1; }
+                message Payload { string id = 1; }
+            "#,
+        );
+        sandbox.add(&[path]).unwrap();
+
+        // Так выглядит запись, сделанная прошлой версией: файлы есть, выбора нет.
+        let mut schemas = sandbox.stored();
+        schemas[0].message = None;
+        save(&sandbox.root, &schemas).unwrap();
+
+        let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
+        assert_eq!(view.message.as_deref(), Some("demo.Envelope"));
+        assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
+        // На диске при этом по-прежнему пусто: выбора человек не делал, а вывод
+        // пересчитывается при каждом обращении.
+        assert_eq!(sandbox.stored()[0].message, None);
+    }
+
+    // --- Привязка к библиотеке ---------------------------------------------
+
+    /// Главный случай всей затеи: топик привязан к набору из библиотеки и
+    /// декодируется — без диалога файлов, без копий и без выбора типа руками.
+    #[test]
+    fn a_topic_bound_to_a_library_set_decodes_without_picking_anything() {
+        let sandbox = Sandbox::new("bind");
+        // Дерево источника — как его принёс бы гитлаб: контракт плюс общие типы.
+        let repo = sandbox.outside.join("repo");
+        let write = |relative: &str, text: &str| {
+            let path = repo.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "orders.proto",
+            r#"
+                syntax = "proto3";
+                package orders;
+                import "common/types.proto";
+                message OrderChanged { common.Money total = 1; Line line = 2; }
+                message Line { string sku = 1; }
+            "#,
+        );
+        write(
+            "common/types.proto",
+            "syntax = \"proto3\"; package common; message Money { int64 amount = 1; }",
+        );
+
+        let files = source::read_folder(&repo).unwrap();
+        source::add(
+            &sandbox.root,
+            source::folder_source("lib1".to_string(), &repo),
+            files,
+        )
+        .unwrap();
+
+        let view = bind_source(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some(SourceBinding {
+                source: "lib1".to_string(),
+                entry: "orders.proto".to_string(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(view.format, BodyFormat::Proto);
+        // Корень подставился сам — ради этого правило и заводилось.
+        assert_eq!(view.message.as_deref(), Some("orders.OrderChanged"));
+        assert_eq!(view.messages, ["orders.Line", "orders.OrderChanged"]);
+        // Своих копий у топика нет вовсе: набор один на всех, кто на него
+        // сослался.
+        assert!(view.files.is_empty());
+        assert!(!sandbox.schema_dir().exists());
+        assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
+
+        // И это пережило запись на диск.
+        let stored = &sandbox.stored()[0];
+        assert_eq!(stored.source.as_ref().unwrap().entry, "orders.proto");
+    }
+
+    /// Самодостаточный контракт — тот, который и будут вставлять: текст в поле,
+    /// и топик читается. Ни диалога файлов, ни источника.
+    #[test]
+    fn pasted_text_becomes_the_contract_of_the_topic() {
+        let sandbox = Sandbox::new("paste-plain");
+        let view = sandbox
+            .paste("syntax = \"proto3\"; package demo; message Event { string id = 1; }")
+            .unwrap();
+
+        assert_eq!(view.format, BodyFormat::Proto);
+        assert_eq!(view.messages, ["demo.Event"]);
+        // Тип подставлен правилом корня: выбирать не из чего, и спрашивать
+        // незачем — ровно как при загрузке файла с единственным типом.
+        assert_eq!(view.message.as_deref(), Some("demo.Event"));
+        assert_eq!(view.files.len(), 1);
+        assert!(view.files[0].pasted);
+        // Пути нет и быть не может: оригинала на диске не существует.
+        assert_eq!(view.files[0].source, "");
+        assert!(view.error.is_none());
+    }
+
+    /// Текст возвращается в форму тем же, каким его вставили: поле с текстом —
+    /// это редактируемое состояние, и открыть настройки значит увидеть в нём
+    /// то, что применено.
+    #[test]
+    fn the_pasted_text_comes_back_in_the_view() {
+        let sandbox = Sandbox::new("paste-roundtrip");
+        let text = "syntax = \"proto3\";\npackage demo;\nmessage Event { string id = 1; }\n";
+        sandbox.paste(text).unwrap();
+
+        let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
+        assert_eq!(view.pasted_text.as_deref(), Some(text));
+    }
+
+    /// Битый текст не сохраняется вовсе — то же правило, что у файлов: схема,
+    /// которая работала, обязана остаться работать.
+    #[test]
+    fn a_pasted_contract_that_does_not_parse_changes_nothing() {
+        let sandbox = Sandbox::new("paste-broken");
+        sandbox
+            .paste("syntax = \"proto3\"; package demo; message Event { string id = 1; }")
+            .unwrap();
+
+        let failed = sandbox.paste("syntax = \"proto3\"; message Broken {").unwrap_err();
+        assert!(!failed.is_empty());
+
+        let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
+        assert_eq!(view.messages, ["demo.Event"]);
+        assert!(view.pasted_text.as_deref().unwrap().contains("message Event"));
+    }
+
+    /// Проверка отвечает ровно то же, что ответит применение: разбор у них один
+    /// и тот же. Иначе форма обещала бы одно, а кнопка делала другое.
+    #[test]
+    fn checking_the_text_answers_the_same_as_applying_it() {
+        assert!(check_text("syntax = \"proto3\"; message A { string id = 1; }").is_ok());
+        assert!(check_text("syntax = \"proto3\"; message Broken {").is_err());
+        assert!(check_text("   ").is_err());
+
+        // И ничего при этом не остаётся: временный каталог уносит за собой
+        // `Staged`, а каталога топика проверка не касается вовсе.
+        let sandbox = Sandbox::new("paste-check-leaves-nothing");
+        check_text("syntax = \"proto3\"; message A { string id = 1; }").unwrap();
+        assert!(sandbox.stored().is_empty());
+    }
+
+    /// Чужой импорт во вставленном тексте — не «файл не найден», а «искать было
+    /// негде». Разница в том, что делать: за соседними файлами надо идти в
+    /// библиотеку, и ошибка обязана это назвать.
+    #[test]
+    fn a_pasted_contract_importing_outside_files_says_where_to_put_them() {
+        let sandbox = Sandbox::new("paste-import");
+        let failed = sandbox
+            .paste(
+                "syntax = \"proto3\"; import \"common/types.proto\"; \
+                 message Order { common.Money total = 1; }",
+            )
+            .unwrap_err();
+
+        assert!(failed.contains("common/types.proto"), "{failed}");
+        assert!(failed.contains("schema source"), "{failed}");
+    }
+
+    /// Well-known типы парсер несёт в себе — контракт с `Timestamp` вставляется
+    /// как есть, и советовать для него библиотеку было бы неправдой.
+    #[test]
+    fn a_pasted_contract_may_import_the_well_known_types() {
+        let sandbox = Sandbox::new("paste-wellknown");
+        let view = sandbox
+            .paste(
+                "syntax = \"proto3\"; package demo; \
+                 import \"google/protobuf/timestamp.proto\"; \
+                 message Event { google.protobuf.Timestamp at = 1; }",
+            )
+            .unwrap();
+
+        assert_eq!(view.messages, ["demo.Event"]);
+        // Подтянутого файла в списке нет: well-known разрешается внутри
+        // парсера, на диск за ним никто не ходил.
+        assert_eq!(view.files.len(), 1);
+    }
+
+    /// Три способа задать схему взаимоисключающи, и вставленный текст в этом
+    /// не исключение: выбрать файлы с диска — значит перестать читать топик
+    /// вставленным контрактом.
+    #[test]
+    fn loading_files_from_disk_drops_the_pasted_contract() {
+        let sandbox = Sandbox::new("paste-then-files");
+        sandbox
+            .paste("syntax = \"proto3\"; package pasted; message Pasted { string id = 1; }")
+            .unwrap();
+
+        let own = sandbox.author(
+            "mine.proto",
+            "syntax = \"proto3\"; package mine; message Mine { string id = 1; }",
+        );
+        let view = sandbox.add(&[own]).unwrap();
+
+        assert_eq!(view.messages, ["mine.Mine"]);
+        assert_eq!(view.files.len(), 1);
+        assert!(!view.files[0].pasted);
+        assert!(view.pasted_text.is_none());
+    }
+
+    /// И наоборот: вставленный текст — это ВЕСЬ контракт топика, а не добавка к
+    /// тому, что было выбрано раньше.
+    #[test]
+    fn pasting_text_drops_the_files_picked_from_disk() {
+        let sandbox = Sandbox::new("files-then-paste");
+        let own = sandbox.author(
+            "mine.proto",
+            "syntax = \"proto3\"; package mine; message Mine { string id = 1; }",
+        );
+        sandbox.add(&[own]).unwrap();
+
+        let view = sandbox
+            .paste("syntax = \"proto3\"; package pasted; message Pasted { string id = 1; }")
+            .unwrap();
+
+        assert_eq!(view.messages, ["pasted.Pasted"]);
+        assert_eq!(view.files.len(), 1);
+        assert!(view.files[0].pasted);
+    }
+
+    /// Перечитывать вставленный текст неоткуда, и отказ об этом говорит прямо:
+    /// иначе «обновить всё» попыталось бы прочитать путь, которого нет.
+    #[test]
+    fn refreshing_a_pasted_contract_is_refused() {
+        let sandbox = Sandbox::new("paste-refresh");
+        sandbox
+            .paste("syntax = \"proto3\"; package demo; message Event { string id = 1; }")
+            .unwrap();
+
+        let failed = refresh(&sandbox.root, CLUSTER, TOPIC, None).unwrap_err();
+        assert!(failed.contains("pasted as text"), "{failed}");
+
+        // Схема при этом цела: отказ — это отказ, а не поломка.
+        let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
+        assert_eq!(view.messages, ["demo.Event"]);
+    }
+
+    /// Вставленный текст снимает привязку к библиотеке ровно так же, как
+    /// загрузка файлов, и по той же причине.
+    #[test]
+    fn pasting_text_unbinds_the_library() {
+        let sandbox = Sandbox::new("bind-then-paste");
+        let repo = sandbox.outside.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("orders.proto"),
+            "syntax = \"proto3\"; package orders; message OrderChanged { string id = 1; }",
+        )
+        .unwrap();
+
+        let files = source::read_folder(&repo).unwrap();
+        source::add(
+            &sandbox.root,
+            source::folder_source("lib1".to_string(), &repo),
+            files,
+        )
+        .unwrap();
+        bind_source(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some(SourceBinding {
+                source: "lib1".to_string(),
+                entry: "orders.proto".to_string(),
+            }),
+        )
+        .unwrap();
+
+        let view = sandbox
+            .paste("syntax = \"proto3\"; package pasted; message Pasted { string id = 1; }")
+            .unwrap();
+
+        assert!(view.source.is_none());
+        assert_eq!(view.message.as_deref(), Some("pasted.Pasted"));
+        assert!(sandbox.stored()[0].source.is_none());
+    }
+
+    /// Загрузка своих файлов снимает привязку к библиотеке: два ответа на
+    /// вопрос «чем декодировать» не должны сосуществовать.
+    #[test]
+    fn loading_own_files_unbinds_the_library() {
+        let sandbox = Sandbox::new("bind-then-files");
+        let repo = sandbox.outside.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("orders.proto"),
+            "syntax = \"proto3\"; package orders; message OrderChanged { string id = 1; }",
+        )
+        .unwrap();
+
+        let files = source::read_folder(&repo).unwrap();
+        source::add(
+            &sandbox.root,
+            source::folder_source("lib1".to_string(), &repo),
+            files,
+        )
+        .unwrap();
+        bind_source(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some(SourceBinding {
+                source: "lib1".to_string(),
+                entry: "orders.proto".to_string(),
+            }),
+        )
+        .unwrap();
+        assert!(sandbox.stored()[0].source.is_some());
+
+        let own = sandbox.author(
+            "mine.proto",
+            "syntax = \"proto3\"; package mine; message Mine { string id = 1; }",
+        );
+        let view = sandbox.add(&[own]).unwrap();
+
+        assert!(view.source.is_none());
+        assert_eq!(view.message.as_deref(), Some("mine.Mine"));
+        assert_eq!(view.files.len(), 1);
+        assert!(sandbox.stored()[0].source.is_none());
+    }
+
+    /// Запись, сохранённая до появления библиотеки: своих файлов она держит
+    /// своих, ключа `source` в ней нет вовсе — и читаться она обязана как
+    /// прежде, без всякой миграции.
+    #[test]
+    fn a_record_written_before_the_library_still_works() {
+        let sandbox = Sandbox::new("legacy-json");
+        let path = sandbox.author(
+            "events.proto",
+            "syntax = \"proto3\"; package demo; message Event { string id = 1; }",
+        );
+        sandbox.add(&[path]).unwrap();
+
+        // Так выглядит файл настроек прошлой версии: ни `source`, ни `root`.
+        let dir = sandbox.stored()[0].dir.clone();
+        let json = serde_json::to_string(&serde_json::json!([{
+            "cluster": CLUSTER,
+            "topic": TOPIC,
+            "format": "proto",
+            "files": [{ "name": "events.proto", "source": "/gone/events.proto" }],
+            "message": "demo.Event",
+            "dir": dir,
+        }]))
+        .unwrap();
+        std::fs::write(sandbox.root.join("proto.json"), json).unwrap();
+
+        let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
+        assert!(view.source.is_none());
+        assert_eq!(view.message.as_deref(), Some("demo.Event"));
+        assert_eq!(view.error, None);
+        assert!(decoder(&sandbox.root, CLUSTER, TOPIC).unwrap().is_some());
+    }
+
+    /// Привязка к набору, которого нет, не применяется: обещать декодирование,
+    /// которого не будет, нельзя.
+    #[test]
+    fn binding_to_a_set_that_does_not_parse_is_refused() {
+        let sandbox = Sandbox::new("bind-missing");
+        assert!(bind_source(
+            &sandbox.root,
+            CLUSTER,
+            TOPIC,
+            Some(SourceBinding {
+                source: "nope".to_string(),
+                entry: "orders.proto".to_string(),
+            }),
+        )
+        .is_err());
+        assert!(sandbox.stored().is_empty());
     }
 
     /// Схема обязана пережить перезапуск приложения и переезд исходников.

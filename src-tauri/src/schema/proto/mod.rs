@@ -5,6 +5,7 @@
 //! этажом выше, в `schema`. Здесь только то, что знает про protobuf.
 
 pub mod decoder;
+pub mod guess;
 pub mod imports;
 pub mod linked;
 pub mod resolve;

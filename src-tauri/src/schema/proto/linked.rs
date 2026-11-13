@@ -5,11 +5,12 @@
 //! include-каталогом — самим каталогом схемы, куда файлы уложены под теми
 //! именами, под которыми их импортируют (см. `imports::layout`).
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use protobuf::descriptor::DescriptorProto;
-use protobuf::reflect::{FileDescriptor, MessageDescriptor};
+use protobuf::reflect::{FileDescriptor, MessageDescriptor, RuntimeFieldType, RuntimeType};
 
 use crate::schema::types::SchemaFile;
 
@@ -29,6 +30,19 @@ pub struct Linked {
     /// а не сам тип. Сложи их вместе, и в настройках показа предлагалось бы
     /// декодировать топик полем `order_changed`.
     pub produce_choices: Vec<String>,
+    /// Единственный КОРНЕВОЙ тип набора — тот, на который не ссылается ни один
+    /// другой и который не объявлен внутри другого.
+    ///
+    /// Если такой ровно один, он и есть тип топика, и гадать по байтам незачем:
+    /// .proto, написанный под один топик, выглядит именно так — конверт сверху,
+    /// а всё остальное в него вложено или им переиспользовано. Это ответ по
+    /// УСТРОЙСТВУ СХЕМЫ, а не по данным, и потому он доступен даже тогда, когда
+    /// топик ни разу не открывали.
+    ///
+    /// `None` — корней несколько (в файле лежат независимые друг от друга типы)
+    /// либо ни одного (типы ссылаются по кругу). Вот тогда и остаётся подбор по
+    /// телам: `proto::guess`.
+    pub root: Option<String>,
 }
 
 impl Linked {
@@ -88,24 +102,35 @@ fn message_in(files: &[FileDescriptor], full_name: &str) -> Option<MessageDescri
     files.iter().find_map(|f| f.message_by_full_name(&dotted))
 }
 
-/// Разобранные схемы, ключ — имя каталога.
+/// Разобранные схемы, ключ — каталоги включения и входные файлы.
 ///
 /// Разбор стоит миллисекунды, а зовут его на каждое переключение топика и на
 /// каждое открытие настроек. `Mutex<Vec<..>>` вместо `HashMap`: записей единицы,
 /// зато `Vec::new()` — const, и статику не нужен ни `LazyLock`, ни лишний крейт.
+///
+/// Входные файлы в ключе обязательны, и это не предусмотрительность: наборы из
+/// библиотеки ДЕЛЯТ каталог — дерево источника одно на все его контракты, а
+/// набор задаётся входным файлом в нём. Ключ из одного каталога отдал бы
+/// второму набору разбор первого.
 static CACHE: Mutex<Vec<(String, Arc<Linked>)>> = Mutex::new(Vec::new());
 
 /// Сколько разобранных схем держать. Пользователь ходит по нескольким топикам,
 /// а не по сотне; дальше это была бы просто удерживаемая память.
 const CACHE_LIMIT: usize = 8;
 
-/// Разбирает каталог, переиспользуя прошлый результат, если он ещё годен.
+/// Разбирает каталог схемы топика, переиспользуя прошлый результат.
 pub fn linked(dir: &Path, files: &[SchemaFile]) -> Result<Arc<Linked>, String> {
-    let key = cache_key(dir);
+    linked_set(std::slice::from_ref(&dir.to_path_buf()), &inputs_of(files))
+}
+
+/// То же для набора с несколькими каталогами включения — то есть для набора из
+/// библиотеки. См. `parse_set`.
+pub fn linked_set(include: &[PathBuf], inputs: &[String]) -> Result<Arc<Linked>, String> {
+    let key = cache_key(include, inputs);
     if let Some(hit) = cached(&key) {
         return Ok(hit);
     }
-    let built = Arc::new(parse(dir, files)?);
+    let built = Arc::new(parse_set(include, inputs)?);
     remember(key, Arc::clone(&built));
     Ok(built)
 }
@@ -115,20 +140,59 @@ pub fn linked(dir: &Path, files: &[SchemaFile]) -> Result<Arc<Linked>, String> {
 /// Нужно ровно там, где результат ещё не имеет права стать общим: файлы лежат
 /// во временном каталоге и, если разбор не удастся, будут снесены.
 pub fn parse(dir: &Path, files: &[SchemaFile]) -> Result<Linked, String> {
-    // Входные файлы — только выбранные пользователем. Подтянутые по импорту
-    // лежат в том же каталоге и разрешаются как зависимости, но входными не
-    // становятся: `mine` ниже считается по входным, а типы зависимостей в
-    // списке «чем декодировать» — такой же мусор, как `google.protobuf.Any`.
-    let inputs: Vec<&SchemaFile> = files.iter().filter(|f| !f.auto).collect();
+    parse_set(std::slice::from_ref(&dir.to_path_buf()), &inputs_of(files))
+}
+
+/// Имена файлов, которые идут разбору ВХОДНЫМИ.
+///
+/// Только выбранные пользователем. Подтянутые по импорту лежат в том же
+/// каталоге и разрешаются как зависимости, но входными не становятся: по
+/// входным считается список «своих» message, а типы зависимостей в списке «чем
+/// декодировать» — такой же мусор, как `google.protobuf.Any`.
+fn inputs_of(files: &[SchemaFile]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| !f.auto)
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// Разбирает набор: несколько каталогов включения, входные файлы — именами
+/// относительно одного из них.
+///
+/// Каталогов включения несколько ради раскладок, которые иначе не разобрать.
+/// Импорт в .proto — это путь ОТ КОРНЯ ВКЛЮЧЕНИЯ, и у репозитория таким корнем
+/// бывает то он сам (раскладка Go), то `src/main/proto` внутри модуля
+/// (Maven, Gradle, ScalaPB). Какой именно — заранее не известно, поэтому
+/// передаются все подходящие; лишний корень разбору не мешает.
+pub fn parse_set(include: &[PathBuf], inputs: &[String]) -> Result<Linked, String> {
     if inputs.is_empty() {
         return Err("no .proto files".to_string());
     }
+    if include.is_empty() {
+        return Err("no include directories".to_string());
+    }
+
+    // Путь входного файла собирается с тем корнем, под которым он и правда
+    // лежит: `protobuf_parse` считает по нему относительное имя файла, и корень
+    // не тот дал бы либо «no such file», либо имя, по которому потом не
+    // найдутся «свои» message.
+    let mut paths = Vec::with_capacity(inputs.len());
+    for name in inputs {
+        let found = include
+            .iter()
+            .map(|root| root.join(name))
+            .find(|path| path.exists())
+            .ok_or_else(|| format!("{name} is not in the schema directory"))?;
+        paths.push(found);
+    }
 
     let mut parser = protobuf_parse::Parser::new();
-    parser
-        .pure()
-        .include(dir)
-        .inputs(inputs.iter().map(|f| dir.join(&f.name)));
+    parser.pure();
+    for root in include {
+        parser.include(root);
+    }
+    parser.inputs(paths);
 
     let parsed = parser
         .parse_and_typecheck()
@@ -161,12 +225,56 @@ pub fn parse(dir: &Path, files: &[SchemaFile]) -> Result<Linked, String> {
         .map_err(|e| format!("can't link .proto files: {e}"))?;
 
     let produce_choices = produce_choices(&built, &messages);
+    let root = single_root(&built, &messages);
 
     Ok(Linked {
         files: built,
         messages,
         produce_choices,
+        root,
     })
+}
+
+/// Единственный корневой тип набора. См. `Linked::root`.
+///
+/// Корень — это message, который в этом же наборе никем не востребован: ни
+/// полем другого типа, ни объявлением внутри него. Считается по СВОИМ типам:
+/// `google.protobuf.Timestamp` и прочие зависимости в списке не участвуют
+/// вовсе, а значит и корнями стать не могут.
+///
+/// Ссылка типа на самого себя корня не отменяет — дерево с полем своего же типа
+/// (`message Node { Node next = 1; }`) остаётся корнем ровно так же.
+fn single_root(files: &[FileDescriptor], messages: &[String]) -> Option<String> {
+    let mut taken: HashSet<String> = HashSet::new();
+    for name in messages {
+        let Some(descriptor) = message_in(files, name) else {
+            continue;
+        };
+        // Объявлен внутри другого — он часть его устройства, а не самостоятельный
+        // тип топика. Это ровно то, что в .proto означает вложенный `message`.
+        if descriptor.enclosing_message().is_some() {
+            taken.insert(name.clone());
+        }
+        for field in descriptor.fields() {
+            let referenced = match field.runtime_field_type() {
+                RuntimeFieldType::Singular(RuntimeType::Message(m)) => m,
+                RuntimeFieldType::Repeated(RuntimeType::Message(m)) => m,
+                // Ключ map'а скаляром по определению формата — смотрим значение.
+                RuntimeFieldType::Map(_, RuntimeType::Message(m)) => m,
+                _ => continue,
+            };
+            let referenced = referenced.full_name().to_string();
+            if &referenced != name {
+                taken.insert(referenced);
+            }
+        }
+    }
+
+    let mut roots = messages.iter().filter(|name| !taken.contains(*name));
+    match (roots.next(), roots.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Записи селектора ОТПРАВКИ: сами message плюс ветки их `oneof`.
@@ -207,9 +315,12 @@ fn produce_choices(files: &[FileDescriptor], messages: &[String]) -> Vec<String>
 /// Выбрасывает разобранную схему из кэша. Зовётся всякий раз, когда каталог
 /// переписан: иначе после «обновить» декодировали бы прежней версией.
 pub fn invalidate(dir: &Path) {
-    let key = cache_key(dir);
+    // По префиксу, а не по точному совпадению: из одного каталога разбирается
+    // сколько угодно наборов (библиотека), и знать их входные файлы тому, кто
+    // просто поменял содержимое каталога, неоткуда.
+    let prefix = dir.to_string_lossy().into_owned();
     if let Ok(mut cache) = CACHE.lock() {
-        cache.retain(|(k, _)| *k != key);
+        cache.retain(|(k, _)| !k.starts_with(&prefix));
     }
 }
 
@@ -232,8 +343,17 @@ fn collect_messages(package: &str, message: &DescriptorProto, out: &mut Vec<Stri
     out.push(full);
 }
 
-fn cache_key(dir: &Path) -> String {
-    dir.to_string_lossy().into_owned()
+/// Ключ кэша: каталоги включения и входные файлы.
+///
+/// Первым идёт первый каталог включения — на этом держится `invalidate`,
+/// который сбрасывает всё, что разобрано из этого каталога, не зная входных
+/// файлов.
+fn cache_key(include: &[PathBuf], inputs: &[String]) -> String {
+    let dirs: Vec<String> = include
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    format!("{}|{}", dirs.join(";"), inputs.join(","))
 }
 
 fn cached(key: &str) -> Option<Arc<Linked>> {
@@ -277,6 +397,7 @@ mod tests {
                 name: name.to_string(),
                 source: path.to_string_lossy().into_owned(),
                 auto: false,
+                pasted: false,
             }
         }
     }
@@ -308,6 +429,120 @@ mod tests {
         );
         assert!(linked.message("demo.Zeta.Inner").is_some());
         assert!(linked.message(".demo.Alpha").is_some());
+    }
+
+    // --- Корневой тип набора -----------------------------------------------
+    //
+    // Ответ по УСТРОЙСТВУ схемы, а не по данным: .proto, написанный под один
+    // топик, несёт конверт сверху и всё остальное внутри него. Там, где это
+    // видно, подбирать по байтам нечего — и, что важнее, не надо открывать
+    // топик, чтобы получить ответ.
+
+    /// Обёртка плюс то, что она в себе держит: корень один, и это она.
+    ///
+    /// Раскладка из настоящего набора — `OrderBookV2` с полями типа `Levels`.
+    #[test]
+    fn a_wrapper_with_its_parts_has_a_single_root() {
+        let dir = Dir::new("root-wrapper");
+        let file = dir.write(
+            "ob.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message OrderBookV2 {
+                    string instrument_uid = 1;
+                    Levels asks = 7;
+                    Levels bids = 8;
+                }
+                message Levels { double base_price = 1; }
+            "#,
+        );
+
+        let linked = parse(&dir.0, &[file]).unwrap();
+        assert_eq!(linked.root.as_deref(), Some("demo.OrderBookV2"));
+    }
+
+    /// Конверт с `oneof`: ветки — его части, корень опять один.
+    #[test]
+    fn a_oneof_envelope_is_the_root_of_its_branches() {
+        let dir = Dir::new("root-oneof");
+        let file = dir.write("events.proto", ENVELOPE);
+        let linked = parse(&dir.0, &[file]).unwrap();
+        assert_eq!(linked.root.as_deref(), Some("demo.PublicEvent"));
+    }
+
+    /// Вложенное объявление — тоже «внутри другого», даже если полем его никто
+    /// не держит. В .proto это ровно то и значит.
+    #[test]
+    fn a_nested_declaration_is_not_a_root() {
+        let dir = Dir::new("root-nested");
+        let file = dir.write(
+            "nested.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Outer { message Inner { int32 a = 1; } int32 b = 1; }
+            "#,
+        );
+
+        let linked = parse(&dir.0, &[file]).unwrap();
+        assert_eq!(linked.root.as_deref(), Some("demo.Outer"));
+    }
+
+    /// Два независимых типа — двух корней не бывает «одним ответом». Вот тут и
+    /// начинается подбор по телам.
+    #[test]
+    fn two_independent_types_leave_no_single_root() {
+        let dir = Dir::new("root-flat");
+        let file = dir.write(
+            "flat.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message A { string id = 1; }
+                message B { string id = 1; }
+            "#,
+        );
+
+        let linked = parse(&dir.0, &[file]).unwrap();
+        assert_eq!(linked.root, None);
+    }
+
+    /// Ссылка типа на себя корня не отменяет: дерево с полем своего же типа —
+    /// такой же корень, как и всякий другой.
+    #[test]
+    fn a_self_referencing_type_is_still_a_root() {
+        let dir = Dir::new("root-self");
+        let file = dir.write(
+            "tree.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message Node { Node next = 1; int32 value = 2; }
+            "#,
+        );
+
+        let linked = parse(&dir.0, &[file]).unwrap();
+        assert_eq!(linked.root.as_deref(), Some("demo.Node"));
+    }
+
+    /// Типы, ссылающиеся друг на друга по кругу, корня не дают вовсе —
+    /// и выдумывать его на ровном месте нельзя.
+    #[test]
+    fn mutually_referencing_types_have_no_root() {
+        let dir = Dir::new("root-cycle");
+        let file = dir.write(
+            "cycle.proto",
+            r#"
+                syntax = "proto3";
+                package demo;
+                message A { B b = 1; }
+                message B { A a = 1; }
+            "#,
+        );
+
+        let linked = parse(&dir.0, &[file]).unwrap();
+        assert_eq!(linked.root, None);
     }
 
     // --- Записи селектора отправки -----------------------------------------

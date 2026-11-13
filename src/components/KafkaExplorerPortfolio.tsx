@@ -1640,9 +1640,19 @@ export function KafkaExplorerPortfolio() {
         onOpenChange={setIsProduceModalOpen}
       />
 
+      {/* Библиотеки наборов .proto здесь больше нет: окно переехало внутрь
+          настроек топика, откуда его и открывают. Перечитать схему после правок
+          в ней — тоже забота настроек: там это делается полностью, с новым
+          списком контрактов, а не одним лишь перезапуском декодера. */}
       <TopicConfigModal
         topic={configTopic}
         cluster={schemaCluster}
+        openTopic={selectedTopic?.name ?? null}
+        // Схема открытого топика — чтобы у него настройки открывались сразу
+        // настроенными, без секунд ожидания с формой прошлого формата. Окно
+        // сверяет её с именем топика и кластера само, так что прежняя схема,
+        // лежащая здесь между выбором топика и ответом, не посеется.
+        openTopicSchema={openSchema}
         open={isConfigModalOpen}
         onOpenChange={setIsConfigModalOpen}
         onSchemaChanged={handleSchemaChanged}

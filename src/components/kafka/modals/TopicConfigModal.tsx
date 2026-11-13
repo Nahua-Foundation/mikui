@@ -1,23 +1,53 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '../../ui/button';
-import { FileText, RotateCw, Upload, X } from 'lucide-react';
+import { ClipboardType, FileText, FolderOpen, Library, RotateCw, Upload, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Dialog, DialogHeader, DialogTitle } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Label } from '../../ui/label';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../../ui/tabs';
 import { AvroSchema } from '../components/AvroSchema';
+import { GuessResults } from '../components/GuessResults';
 import { JsonSchemaSettings } from '../components/JsonSchemaSettings';
+import { ProtoEditor } from '../components/ProtoEditor';
 import { ProtoMessageSelect } from '../components/ProtoMessageSelect';
+import { SchemaSetSelect } from '../components/SchemaSetSelect';
+import { SchemaSourcesModal } from './SchemaSourcesModal';
 import * as api from '../api';
 import { describeError } from '../api';
-import { BodyFormat, Topic, TopicSchema } from '../types';
+import { BodyFormat, SchemaGuess, SourceBinding, SourceView, Topic, TopicSchema } from '../types';
 
 interface TopicConfigModalProps {
   topic: Topic | null;
   /** Ключ кластера — см. `clusterKey`. null, когда подключения нет. */
   cluster: string | null;
+  /**
+   * Какой топик сейчас открыт в таблице.
+   *
+   * Нужен подбору типа: образцы он берёт из буфера воркера, а буфер один и
+   * принадлежит открытому топику. Настройки же открывают у любого топика
+   * списка, и кнопка подбора у не-открытого обязана быть выключена — иначе
+   * пользователь получил бы уверенный ответ, посчитанный по чужим телам.
+   * (Бэкенд такой запрос всё равно отвергнет, но объяснять это тостом, когда
+   * можно объяснить выключенной кнопкой, незачем.)
+   */
+  openTopic: string | null;
+  /**
+   * Схема открытого топика — та, которой таблица прямо сейчас читает тела.
+   *
+   * Нужна затем, чтобы у этого топика форме не приходилось ЖДАТЬ: приложение
+   * уже держит его схему и перечитывает её после каждой правки, в том числе
+   * после переключения формата в шапке. А открывают настройки чаще всего именно
+   * оттуда — шестерёнка стоит вплотную к селектору формата.
+   *
+   * Тому, что приехало, форма верит не на слово: схема несёт в себе имя своего
+   * топика и кластера, и посеяно будет только совпадающее. Без этой сверки
+   * нашлась бы своя щель — между выбором топика и ответом `applyTopicSchema`
+   * здесь лежит схема ПРЕЖНЕГО.
+   */
+  openTopicSchema?: TopicSchema | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /**
@@ -48,6 +78,116 @@ const FORMATS: { value: BodyFormat; label: string }[] = [
  * не декодируются вовсе. Когда типов несколько, угадать нельзя — поле остаётся
  * пустым, и тогда его требует `handleSave`.
  */
+/**
+ * Откуда топик берёт свой .proto. Три способа, и выбран может быть только один.
+ *
+ * Взаимоисключающи они не для порядка в интерфейсе, а по устройству: это три
+ * ответа на один вопрос «чем декодировать», и сосуществуя они решались бы тем,
+ * какой из них проверили раньше. Бэкенд держит то же правило — загрузка файлов
+ * снимает привязку к библиотеке и стирает вставленный текст, привязка сносит
+ * свои копии, вставка стирает файлы.
+ */
+export type ProtoMode = 'paste' | 'files' | 'library';
+
+/**
+ * Какая вкладка открыта, когда окно только открылось.
+ *
+ * У настроенного топика — та, которой он настроен: видеть надо то, чем он
+ * читается, а не предложение настроить его заново.
+ *
+ * У ненастроенного выбор между «вставить текст» и библиотекой решается тем,
+ * есть ли в библиотеке что выбирать. Есть — библиотека: один выбор контракта
+ * дешевле любого другого способа, ради этого она и заведена. Нет — поле для
+ * текста: это самый прямой путь, и он не требует ничего, кроме самого
+ * контракта.
+ */
+export function modeOf(schema: TopicSchema | null, sources: SourceView[]): ProtoMode {
+  return (
+    modeFromSchema(schema) ??
+    (sources.some((source) => source.sets.some((set) => !set.error)) ? 'library' : 'paste')
+  );
+}
+
+/**
+ * Та часть выбора вкладки, на которую отвечает САМА схема топика, — то есть всё,
+ * кроме ненастроенного топика.
+ *
+ * Отдельно от `modeOf` ради одного: у настроенного топика ответ известен сразу,
+ * как приехала схема, и ждать ради него библиотеку незачем. `null` — настроен
+ * топик ничем, и тогда вкладку решает то, есть ли в библиотеке что выбирать.
+ */
+export function modeFromSchema(schema: TopicSchema | null): ProtoMode | null {
+  if (schema?.source) return 'library';
+  const files = schema?.files ?? [];
+  if (files.some((file) => file.pasted)) return 'paste';
+  if (files.length > 0) return 'files';
+  return null;
+}
+
+/**
+ * Про схему известно всё, что нужно форме, — показывать можно.
+ *
+ * Не хватать может ровно одного: вкладки у ненастроенного protobuf-топика, и
+ * отвечает на это библиотека. Остальным форматам она не нужна вовсе, так что и
+ * ждать им нечего.
+ */
+export function settledWithoutLibrary(schema: TopicSchema | null): boolean {
+  return schema?.format !== 'proto' || modeFromSchema(schema) !== null;
+}
+
+/** Сколько ждать после последнего нажатия клавиши, прежде чем разбирать текст.
+ *  Разбор идёт на бэкенде в отдельном потоке, но затевать его на каждый символ
+ *  незачем: вставляют контракт целиком, а не набирают. */
+const CHECK_DELAY_MS = 400;
+
+/**
+ * Вид вкладки.
+ *
+ * Поверх shadcn-овского `TabsTrigger`, у которого свои цвета и скругления:
+ * здесь нужны те же, что у остального окна (`font-mono`, `bg-surface`,
+ * `text-strong`). `dark:` для активной подписи задан отдельно — у базового
+ * класса есть своё правило под тёмную тему, и без парного наша бы в ней
+ * проиграла.
+ */
+const TAB_CLASS =
+  // `min-w-0` — та же страховка, что у кнопок выбора источника: подпись не
+  // должна иметь права раздвинуть полоску вкладок шире окна настроек.
+  'min-w-0 font-mono text-xs rounded border border-transparent px-2 py-1.5 text-dim hover:text-soft ' +
+  'data-[state=active]:bg-surface data-[state=active]:border-edge ' +
+  'data-[state=active]:text-strong dark:data-[state=active]:text-strong';
+
+/** Заготовка в пустом поле: из неё видно и что вставлять, и что ждут именно
+ *  текст контракта, а не путь к нему. */
+const PASTE_PLACEHOLDER = `syntax = "proto3";
+
+package orders;
+
+message OrderChanged {
+  string id = 1;
+  int64 at = 2;
+}`;
+
+/**
+ * Что стоит на месте формы, пока схема топика не приехала.
+ *
+ * Заготовка повторяет расстановку настоящей формы — подпись, поле под ней, блок
+ * ниже, — чтобы приехавшая форма встала на то же место, а не подвинула окно.
+ *
+ * Своя, а не `ui/skeleton`: тот красится в `bg-accent`, то есть мимо палитры
+ * этих окон (`surface`/`sunken`/`edge`), и в тёмной теме светится.
+ */
+function Waiting() {
+  return (
+    <div className="space-y-6 min-w-0" aria-hidden>
+      <div className="space-y-2">
+        <div className="h-4 w-28 rounded bg-edge animate-pulse" />
+        <div className="h-9 rounded border border-edge bg-sunken animate-pulse" />
+      </div>
+      <div className="h-24 rounded border border-edge bg-sunken animate-pulse" />
+    </div>
+  );
+}
+
 function chooseMessage(schema: TopicSchema | null): string | null {
   const messages = schema?.messages ?? [];
   if (schema?.message) {
@@ -64,6 +204,8 @@ function chooseMessage(schema: TopicSchema | null): string | null {
 export function TopicConfigModal({
   topic,
   cluster,
+  openTopic,
+  openTopicSchema,
   open,
   onOpenChange,
   onSchemaChanged,
@@ -74,37 +216,241 @@ export function TopicConfigModal({
   /** Идёт разбор .proto на бэкенде: кнопки, которые тоже его затронут,
    *  на это время выключены. */
   const [busy, setBusy] = useState(false);
+  /** Результат подбора типа по телам. null — не подбирали. */
+  const [guess, setGuess] = useState<SchemaGuess | null>(null);
+  const [guessing, setGuessing] = useState(false);
+  /** Библиотека наборов .proto — из чего выбирать, кроме своих файлов. */
+  const [sources, setSources] = useState<SourceView[]>([]);
+  /** За библиотекой уже сходили. Пустой список сам по себе ответа не даёт:
+   *  он одинаков и у пустой библиотеки, и у непрочитанной. */
+  const [sourcesLoaded, setSourcesLoaded] = useState(false);
+  /** Поверх этой формы открыта сама библиотека. Окно источников живёт здесь, а
+   *  не в шапке приложения: источники нужны ровно тогда, когда настраивают
+   *  proto у топика, и других дверей к ним в приложении нет. */
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  /** Какой из трёх способов задать контракт сейчас открыт. */
+  const [mode, setMode] = useState<ProtoMode>('paste');
+  /** Текст контракта во вкладке «Paste text» — то, что в поле, а не то, что
+   *  применено: применённое лежит в `schema.pasted_text`. */
+  const [text, setText] = useState('');
+  /** Чем плох текст в поле. null — разобрался либо ещё не проверяли. */
+  const [textError, setTextError] = useState<string | null>(null);
+  /** Проверка текста идёт прямо сейчас. */
+  const [checking, setChecking] = useState(false);
+  /**
+   * Про какую пару кластер-топик на экране стоит ответ.
+   *
+   * Несовпадение с текущей означает, что в полях чужая схема, — и это ровно то,
+   * что видел человек: переключив формат с avro на proto и открыв настройки, он
+   * две-три секунды смотрел на форму avro, ту самую, которую окно нарисовало в
+   * прошлый раз, после чего она скачком менялась на proto.
+   */
+  const [shown, setShown] = useState<string | null>(null);
+  /** В полях — схема ИМЕННО этого топика, а не ожидание и не чужая. */
+  const [ready, setReady] = useState(false);
+  /** Схему прочитать не удалось вовсе. Форма тогда не рисуется: пустые поля над
+   *  живой кнопкой Save — это приглашение затереть настройку, которую окно так
+   *  и не показало. */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const topicName = topic?.name ?? null;
 
-  // Состояние формы принадлежит паре кластер-топик, а модалка переиспользуется
-  // для любого из них. Без перечитывания при открытии в ней остались бы файлы
-  // и выбор от прошлого топика.
+  /**
+   * Перечитать библиотеку. Возвращает её же: вызывающему она бывает нужна
+   * значением, а не состоянием — выбор вкладки считается по ней сразу.
+   *
+   * Отказ молчит: без библиотеки форма работает как работала — остаются свои
+   * файлы с диска и вставка текстом, — а красный тост поверх открывшихся
+   * настроек читался бы как поломка самих настроек.
+   */
+  const loadSources = useCallback(async (): Promise<SourceView[]> => {
+    try {
+      const library = await api.listSchemaSources();
+      setSources(library);
+      setSourcesLoaded(true);
+      return library;
+    } catch (e) {
+      console.error('Failed to list schema sources', e);
+      return [];
+    }
+  }, []);
+
+  // --- Чья схема сейчас в полях -----------------------------------------------
+  //
+  // Состояние формы принадлежит паре кластер-топик, а окно одно на все топики
+  // списка, и пока новая схема не приехала, в полях остаётся ПРЕЖНЯЯ.
+  //
+  // Сбрасывается оно прямо в рендере, а не эффектом, и это здесь существенно:
+  // эффект отрабатывает уже ПОСЛЕ отрисовки, то есть чужую форму всё равно
+  // успело бы показать — ровно это и происходило. Присваивание состояния во
+  // время рендера React обрывает и начинает рендер заново, ничего не выводя на
+  // экран; это его собственный приём для состояния, которое зависит от пропсов.
+  const wanted = open && cluster && topicName ? `${cluster} ${topicName}` : null;
+  if (!open) {
+    // На закрытии сбрасывается только метка, но не поля: окно закрывается с
+    // анимацией и всё это время ещё нарисовано, а заготовка вместо формы в
+    // уезжающем окне — такая же неправда, как чужая форма во въезжающем. Метки
+    // довольно, чтобы следующее открытие считалось открытием даже у того же
+    // самого топика.
+    if (shown !== null) setShown(null);
+  } else if (wanted !== shown) {
+    setShown(wanted);
+    // Схему открытого топика приложение уже держит — ей и сеем. Сверка по имени
+    // обязательна: `openTopic` говорит, какой топик открыт, а схема приезжает
+    // отдельным ответом, и между этими двумя событиями в ней лежит прежняя.
+    const seed =
+      openTopicSchema && openTopicSchema.cluster === cluster && openTopicSchema.topic === topicName
+        ? openTopicSchema
+        : null;
+    setSchema(seed);
+    setFormat(seed?.format ?? 'json');
+    setMessage(chooseMessage(seed));
+    // В поле — то, что применено. Пусто у топика, настроенного иначе: текст от
+    // ПРОШЛОГО топика в нём был бы приглашением применить чужой контракт.
+    setText(seed?.pasted_text ?? '');
+    setTextError(null);
+    // Подбор относится к паре кластер-топик и к тому, что лежало в буфере в
+    // момент нажатия: показывать его на следующем топике значило бы предлагать
+    // ответ, посчитанный по чужим телам.
+    setGuess(null);
+    setMode(modeFromSchema(seed) ?? 'paste');
+    setReady(!!seed && settledWithoutLibrary(seed));
+    setLoadError(null);
+  }
+
+  // Чтение схемы. Ответ с диска — последнее слово в любом случае: посеянное
+  // лишь избавляет от ожидания, но источником правды не становится.
   useEffect(() => {
     if (!open || !cluster || !topicName) return;
     let cancelled = false;
 
-    api
-      .getTopicSchema(cluster, topicName)
-      .then((loaded) => {
-        if (cancelled) return;
-        setSchema(loaded);
-        setFormat(loaded?.format ?? 'json');
-        setMessage(chooseMessage(loaded));
-        if (loaded?.error) {
-          toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
-        }
-      })
-      .catch((e) => {
+    void (async () => {
+      let loaded: TopicSchema | null;
+      try {
+        loaded = await api.getTopicSchema(cluster, topicName);
+      } catch (e) {
         if (cancelled) return;
         console.error('Failed to load topic schema', e);
-        toast.error(`Failed to load topic settings: ${describeError(e)}`);
-      });
+        // Тоста мало: он уедет, а окно останется — и останется в нём заготовка,
+        // которую не отличить от «ещё грузится». Причина обязана лежать на том
+        // месте, где должна была быть форма.
+        setLoadError(describeError(e));
+        return;
+      }
+      if (cancelled) return;
+
+      setSchema(loaded);
+      setFormat(loaded?.format ?? 'json');
+      setMessage(chooseMessage(loaded));
+      setText(loaded?.pasted_text ?? '');
+      setTextError(null);
+      if (loaded?.error) {
+        toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
+      }
+
+      // Вкладку, на которую отвечает сама схема, ставим здесь же и библиотеку
+      // ради неё не ждём. Ждать приходится ровно в одном случае — у
+      // ненастроенного protobuf-топика, — и тогда до ответа форма показывает
+      // ожидание, а не наугад выбранную вкладку.
+      const decided = modeFromSchema(loaded);
+      if (decided) setMode(decided);
+      if (settledWithoutLibrary(loaded)) setReady(true);
+
+      // Остальным форматам библиотека не нужна вовсе: у avro-топика ходить за
+      // списком protobuf-контрактов незачем.
+      if (loaded?.format !== 'proto') return;
+      const library = await loadSources();
+      if (cancelled || decided) return;
+      setMode(modeOf(loaded, library));
+      setReady(true);
+    })();
 
     return () => {
       cancelled = true;
     };
-  }, [open, cluster, topicName]);
+  }, [open, cluster, topicName, loadSources]);
+
+  /**
+   * Формат переключили прямо здесь — и если это proto, вкладке «Library»
+   * отвечать пока нечем: чтение выше за библиотекой не ходило, топик был
+   * другого формата.
+   *
+   * Отдельным эффектом «когда формат стал proto, а библиотеки нет» это делать
+   * нельзя: при открытии настроек протобафного топика он сработал бы заодно с
+   * чтением, и за списком ушли бы ДВА запроса сразу — а первый после
+   * перезабора дерева стоит полторы секунды, и параллельно их было бы два.
+   * Селектор — единственное место, где формат становится proto без участия
+   * чтения: кнопки загрузки и вставки живут внутри самой вкладки, то есть при
+   * уже протобафном формате.
+   */
+  const handleFormatPick = useCallback(
+    (picked: BodyFormat) => {
+      setFormat(picked);
+      if (picked === 'proto' && !sourcesLoaded) void loadSources();
+    },
+    [sourcesLoaded, loadSources],
+  );
+
+  /**
+   * Разбор текста, пока он ещё в поле.
+   *
+   * Про ошибку в контракте человек должен узнать до того, как настройки топика
+   * им заменены, — и до того, как он потянется к кнопке. Разбор тот же самый,
+   * что и у применения (`check_proto_text` и `add_proto_text` зовут одно и то
+   * же), поэтому ответ здесь не приближение, а именно то, что скажет Apply.
+   *
+   * Гонка ответов разрешается счётчиком: отпущенная клавиша отменяет ожидание,
+   * но не уже улетевший запрос, и ответ на прежний текст обязан не перебить
+   * ответ на нынешний.
+   */
+  const checkSeq = useRef(0);
+  useEffect(() => {
+    if (!open || mode !== 'paste') return;
+    const trimmed = text.trim();
+    if (!trimmed) {
+      setTextError(null);
+      setChecking(false);
+      return;
+    }
+    // Применённый текст уже разобран — иначе он бы не применился. Проверять его
+    // заново при каждом открытии окна значит ходить на бэкенд за ответом,
+    // который и так известен.
+    if (schema?.pasted_text === text) {
+      setTextError(null);
+      setChecking(false);
+      return;
+    }
+
+    // Прежний ответ относился к прежнему тексту и с этого мгновения не значит
+    // ничего. Оставить его на экране значило бы показывать ошибку в строке,
+    // которую только что исправили, — и держать `Apply` выключенным из-за неё.
+    setTextError(null);
+    setChecking(true);
+    const seq = ++checkSeq.current;
+    const timer = setTimeout(() => {
+      api
+        .checkProtoText(text)
+        .then(() => {
+          if (seq === checkSeq.current) setTextError(null);
+        })
+        .catch((e) => {
+          if (seq === checkSeq.current) setTextError(describeError(e));
+        })
+        .finally(() => {
+          if (seq === checkSeq.current) setChecking(false);
+        });
+    }, CHECK_DELAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [open, mode, text, schema?.pasted_text]);
+
+  /**
+   * Этому топику есть по чему подбирать: его тела и лежат в буфере воркера.
+   *
+   * Стоит здесь, до колбэков, а не рядом с разметкой: от него зависит
+   * `handleBind` — подбор после привязки имеет смысл только у открытого топика.
+   */
+  const isOpenTopic = !!topicName && topicName === openTopic;
 
   /**
    * Общий хвост всех операций над файлами. Успех виден сразу: и в форме, и в
@@ -118,26 +464,69 @@ export function TopicConfigModal({
       // подтянуть файлы, которых пользователь не выбирал, и сказать об этом
       // можно только по результату.
       success: string | ((updated: TopicSchema | null) => string),
-    ) => {
-      if (!cluster || !topicName) return;
+      // Что получилось — вызывающему: привязке набора надо знать, проставился
+      // ли тип правилом корня, чтобы при отрицательном ответе добрать его
+      // подбором по телам.
+    ): Promise<{ ok: boolean; message: string | null }> => {
+      if (!cluster || !topicName) return { ok: false, message: null };
       setBusy(true);
       try {
         const updated = await action();
         setSchema(updated);
         setFormat(updated?.format ?? 'json');
         // Файл только что загрузили — если тип в нём один, он и выбран.
-        setMessage(chooseMessage(updated));
+        const chosen = chooseMessage(updated);
+        setMessage(chosen);
+        // В поле — ровно то, что применено. Любая операция здесь меняет ответ
+        // на вопрос «чем декодировать», и если новый ответ — не вставленный
+        // текст, то и поле обязано опустеть: текст в нём иначе выглядел бы
+        // действующим контрактом, хотя топик читается уже не им.
+        setText(updated?.pasted_text ?? '');
+        setTextError(null);
         onSchemaChanged?.(topicName, updated);
         toast.success(typeof success === 'string' ? success : success(updated));
+        return { ok: true, message: chosen };
       } catch (e) {
         console.error('Schema operation failed', e);
         toast.error(describeError(e));
+        return { ok: false, message: null };
       } finally {
         setBusy(false);
       }
     },
     [cluster, topicName, onSchemaChanged],
   );
+
+  /**
+   * В библиотеке что-то изменилось, пока она была открыта поверх этой формы.
+   *
+   * Перечитывается и список источников (от него зависит выпадающий список
+   * контрактов), и схема самого топика: добавленный источник мог быть ровно
+   * тем, которого не хватало привязке, — и тогда топик начинает декодироваться
+   * сию секунду, без Save. По той же причине об этом говорится наружу: открытая
+   * таблица обязана перерисоваться.
+   *
+   * Чего здесь намеренно НЕ делается — не трогается `format`. Его в этой форме
+   * могли только что переключить и ещё не сохранить, и подставить сюда значение
+   * с диска значило бы отменить несохранённый выбор в ответ на действие, к
+   * формату не относящееся вовсе.
+   */
+  const handleSourcesChanged = useCallback(async () => {
+    await loadSources();
+    if (!cluster || !topicName) return;
+    try {
+      const reloaded = await api.getTopicSchema(cluster, topicName);
+      setSchema(reloaded);
+      // С выбором типа так же, как с форматом: он может быть несохранённым, и
+      // если он всё ещё есть среди объявленных, он и остаётся. `chooseMessage`
+      // отвечает на это сам — надо только подсунуть ему не сохранённый выбор, а
+      // тот, что стоит в форме.
+      setMessage(chooseMessage(reloaded && { ...reloaded, message }));
+      onSchemaChanged?.(topicName, reloaded);
+    } catch (e) {
+      console.error('Failed to re-read the topic schema', e);
+    }
+  }, [cluster, topicName, message, onSchemaChanged, loadSources]);
 
   const handleLoadFiles = useCallback(async () => {
     if (!cluster || !topicName) return;
@@ -170,6 +559,43 @@ export function TopicConfigModal({
     );
   }, [cluster, topicName, applySchema]);
 
+  /**
+   * Сделать контрактом топика то, что набрано в поле.
+   *
+   * Применяется сразу, как и загрузка файлов, а не по общей кнопке Save: Save
+   * сохраняет ВЫБОР (формат и тип), а это — сама схема, и разбирается она на
+   * бэкенде. Невалидный текст при этом не сохраняется вовсе: отказ приходит
+   * оттуда же, откуда и предварительная проверка, и схема, которая работала,
+   * остаётся работать.
+   */
+  const handleApplyText = useCallback(async () => {
+    if (!cluster || !topicName) return;
+    setBusy(true);
+    try {
+      const updated = await api.addProtoText(cluster, topicName, text);
+      setSchema(updated);
+      setFormat(updated.format);
+      setMessage(chooseMessage(updated));
+      setText(updated.pasted_text ?? text);
+      setTextError(null);
+      onSchemaChanged?.(topicName, updated);
+      const count = updated.messages.length;
+      toast.success(
+        count === 1
+          ? `Applied the pasted contract — ${updated.messages[0]}`
+          : `Applied the pasted contract — ${count} message types`,
+      );
+    } catch (e) {
+      // Своим путём, не через `applySchema`: тот сообщает об отказе тостом, а
+      // тост уходит — текст же остаётся в поле, и править его будут здесь же.
+      // Причина обязана остаться рядом с тем, к чему относится.
+      console.error('Failed to apply the pasted contract', e);
+      setTextError(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [cluster, topicName, text, onSchemaChanged]);
+
   const handleRefresh = useCallback(
     (name?: string) => {
       if (!cluster || !topicName) return;
@@ -187,6 +613,117 @@ export function TopicConfigModal({
       void applySchema(() => api.removeProtoFile(cluster, topicName, name), `Removed ${name}`);
     },
     [cluster, topicName, applySchema],
+  );
+
+  /**
+   * Подобрать тип по телам топика.
+   *
+   * Ничего не сохраняет и ничего не читает из Kafka: это подсказка, а не
+   * правка. Результат остаётся на экране, пока его не перебьёт следующий
+   * подбор или смена топика.
+   *
+   * `quiet` — подбор затеяло приложение, а не человек: сразу после привязки
+   * набора, у которого корня нет. Тогда отказ молчит и список не показывается.
+   * Отказов там законных хватает — топик не открыт, прочитанного ещё нет, — и
+   * красный тост в ответ на выбор контракта выглядел бы поломкой, хотя не
+   * сломалось ничего.
+   */
+  const runGuess = useCallback(
+    async (quiet: boolean) => {
+      if (!cluster || !topicName) return;
+      setGuessing(true);
+      try {
+        const guessed = await api.guessTopicMessage(cluster, topicName);
+        if (!quiet) setGuess(guessed);
+
+        // Ответ, за которым и нажимали, подставляется в селектор сам.
+        //
+        // Сперва подбор только показывал список, и это было ошибкой: человек
+        // жмёт «подобрать» не затем, чтобы почитать числа, а затем, чтобы тип
+        // оказался выбран. Числа остаются рядом — проверить выбор по ним
+        // можно, — но ставить его руками после того, как приложение уже
+        // назвало ответ, незачем.
+        //
+        // Условия ровно те, при которых ответ ОДИН: кандидат из набора ЭТОГО
+        // топика, равных ему нет, и он либо корень своего .proto, либо разобрал
+        // все тела до единого. Ничья (`tied_at_top > 1`) выбором не
+        // разрешается принципиально: два структурно одинаковых типа по байтам
+        // неразличимы, и молча взять первый значит половину таких топиков
+        // декодировать чужим типом.
+        //
+        // Чего здесь намеренно НЕТ — требования, чтобы тела объяснились целиком
+        // (`fitting > 0`). Сперва оно стояло, и из-за него автовыбор не
+        // срабатывал вообще никогда: загруженный .proto сплошь и рядом УРЕЗАН,
+        // в нём оставлены нужные поля, а остальные выброшены, — и верный тип
+        // оставляет половину байт в полях, которых не объявляет. Это нормальная
+        // работа, а не промах, и запрещать по ней выбор значит запрещать его
+        // всегда.
+        const best = guessed.candidates[0];
+        const sure = !!best && (best.root || best.fit.parsed === best.fit.samples);
+        if (best && best.own && sure && guessed.tied_at_top === 1) {
+          setMessage(best.message);
+          // Молчаливый подбор всё-таки говорит — но только когда ответил.
+          // Иначе поле заполнилось бы само, и откуда там имя, было бы неясно.
+          if (quiet) {
+            toast.success(`Matched ${best.message} by the bodies of ${topicName}`);
+          }
+        } else if (quiet) {
+          // Ответа нет — показываем числа, как при ручном подборе: раз уж
+          // приложение сходило за ним само, пусть будет видно, почему
+          // промолчало.
+          setGuess(guessed);
+        }
+      } catch (e) {
+        console.error('Failed to guess the message type', e);
+        if (!quiet) {
+          toast.error(describeError(e));
+          setGuess(null);
+        }
+      } finally {
+        setGuessing(false);
+      }
+    },
+    [cluster, topicName],
+  );
+
+  const handleGuess = useCallback(() => void runGuess(false), [runGuess]);
+
+  /**
+   * Привязать топик к набору из библиотеки — или отвязать.
+   *
+   * Это и есть то, ради чего библиотека заведена: вместо диалога файлов,
+   * ожидания резолва импортов и выбора типа — один выбор набора. Тип
+   * подставляет правило корня на бэкенде, а если корня нет — подбор по телам,
+   * тут же и молча.
+   *
+   * Стоит ПОСЛЕ `runGuess` не из эстетики: он у неё в зависимостях, и объявлен
+   * он должен быть раньше.
+   */
+  const handleBind = useCallback(
+    async (binding: SourceBinding | null) => {
+      if (!cluster || !topicName) return;
+      const applied = await applySchema(
+        () => api.bindTopicSource(cluster, topicName, binding?.source ?? null, binding?.entry ?? null),
+        binding ? `Bound to ${binding.entry}` : 'Unbound from the library',
+      );
+
+      // Корень набора тип уже проставил — больше спрашивать нечего, и ходить за
+      // телами незачем. А вот когда корня НЕТ (их несколько или ни одного),
+      // выбор остаётся висеть пустым, и единственный, кто может на него
+      // ответить, — сами байты топика.
+      //
+      // Делается это сразу, а не ждёт нажатия: человек выбрал контракт затем,
+      // чтобы топик читался, и отдельная кнопка между выбором и результатом —
+      // это работа, которую приложение умеет сделать само. Тел оно при этом в
+      // Kafka не запрашивает: подбор смотрит в буфер воркера, то есть в уже
+      // прочитанное — на кластере с квотой подсказка не имеет права стоить
+      // столько же, сколько сам топик. Оттуда же и условие `isOpenTopic`: у
+      // закрытого топика буфера нет, и спрашивать не у чего.
+      if (applied.ok && binding && !applied.message && isOpenTopic) {
+        await runGuess(true);
+      }
+    },
+    [cluster, topicName, applySchema, isOpenTopic, runGuess],
   );
 
   const handleSave = useCallback(async () => {
@@ -209,6 +746,70 @@ export function TopicConfigModal({
 
   const files = schema?.files ?? [];
   const messages = schema?.messages ?? [];
+  /**
+   * Файлы, которые показывает вкладка «Local files».
+   *
+   * Вставленный текст из списка убран: файл он и есть файл, но строки «откуда
+   * взяли» у него нет и быть не может, а кнопки ↻ и × относились бы к тому,
+   * чего на диске не существует. Видно его во вкладке «Paste text», и видно
+   * тем, чем он является, — текстом.
+   */
+  const picked = files.filter((file) => !file.pasted);
+
+  /**
+   * Сколько контрактов библиотеки вообще можно выбрать.
+   *
+   * Нужно на один вопрос — показывать ли поле выбора: у пустой библиотеки это
+   * поле, на которое нечего ответить. Сам список строит `SchemaSetSelect`, и
+   * строит он его в два уровня — плоским сорок с лишним контрактов двух
+   * репозиториев уже не читались.
+   *
+   * Наборы с ошибкой разбора не в счёт: привязать к ним нечего, а чинить их
+   * надо в окне библиотеки, где и написано, что именно сломалось.
+   */
+  const usableSets = sources.reduce(
+    (total, source) => total + source.sets.filter((set) => !set.error).length,
+    0,
+  );
+  /**
+   * Сколько наборов библиотеки не разбирается — то есть сколько пропало из
+   * списка выше.
+   *
+   * Молчать про них нельзя, и это стоило разбирательства на живом репозитории:
+   * в окне библиотеки стояло «19 contracts», здесь — один пункт, и ничто не
+   * связывало одно с другим. Отфильтрованы они по-прежнему (привязать к
+   * сломанному набору нечего), но теперь об этом сказано и сказано, куда идти.
+   */
+  const brokenSets = sources.reduce(
+    (total, source) => total + source.sets.filter((set) => set.error).length,
+    0,
+  );
+  const bound = schema?.source ?? null;
+  /**
+   * В библиотеке есть на что отвечать выпадающему списку.
+   *
+   * Сломанные наборы в счёт идут: выбрать их нельзя, но список при них нужен —
+   * рядом с ним стоит объяснение, сколько их и почему их не видно, и показывать
+   * это объяснение под надписью «источников нет» было бы противоречием.
+   */
+  const hasLibrary = usableSets > 0 || !!bound || brokenSets > 0;
+  /**
+   * Привязка указывает на набор, который в библиотеке ЕСТЬ и разбирается.
+   *
+   * `null` — за библиотекой ещё не сходили, и судить не о чем. Третье состояние
+   * здесь не из любви к ним: привязанный топик форма показывает, не дожидаясь
+   * списка контрактов (вкладку ей назвала сама схема), и без этого `null` всё
+   * это время селектор стоял бы у него пустым, а под ним — «контракта больше нет
+   * в библиотеке». То есть окно пугало бы ровно тем, чего не случилось.
+   */
+  const boundIsLive = !sourcesLoaded
+    ? null
+    : !!bound &&
+      sources.some(
+        (source) =>
+          source.id === bound.source &&
+          source.sets.some((set) => set.entry === bound.entry && !set.error),
+      );
 
   /**
    * Типов объявлено несколько, а выбор не сделан.
@@ -242,10 +843,28 @@ export function TopicConfigModal({
             своего min-content. Без этого длинный путь к .proto растягивает
             колонку, и форма вылезает за подложку модалки. */}
         <div className="space-y-6 pt-4 min-w-0">
+          {loadError && (
+            <div className="rounded border border-edge border-dashed p-3 font-mono text-xs text-brand break-words">
+              Could not read the settings of this topic: {loadError}
+            </div>
+          )}
+
+          {!ready && !loadError && <Waiting />}
+
+          {/* Схема ещё не приехала — и до тех пор форма не рисуется вовсе.
+              Показывать в это время ПРЕЖНЮЮ и было той самой бедой: окно
+              открывалось мгновенно, но с формой того формата, которым топик
+              настраивали в прошлый раз.
+
+              Снятием с дерева, а не классом: форма — это не картинка, а живые
+              поля с кнопками, и невидимая, но нажимаемая «Load .proto» успела
+              бы применить файлы не к тому формату. */}
+          {ready && (
+          <>
           {/* Message Type */}
           <div className="space-y-2">
             <Label className="font-mono text-sm text-soft">Message Type</Label>
-            <Select value={format} onValueChange={(v) => setFormat(v as BodyFormat)}>
+            <Select value={format} onValueChange={(v) => handleFormatPick(v as BodyFormat)}>
               <SelectTrigger className="bg-surface border-edge text-strong font-mono">
                 <SelectValue />
               </SelectTrigger>
@@ -266,107 +885,296 @@ export function TopicConfigModal({
           {/* Proto specific fields */}
           {format === 'proto' && (
             <div className="space-y-4">
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label className="font-mono text-sm text-soft">Proto Files</Label>
-                  {files.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => handleRefresh()}
-                      disabled={busy}
-                      className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer"
-                      title="Re-read every file from disk"
-                    >
-                      refresh all
-                    </button>
+              {/* Три способа задать контракт — вкладками.
+
+                  Раньше они лежали подряд, один под другим: выбор набора из
+                  библиотеки сверху, список файлов под ним, а переключались
+                  между ними две еле заметные текстовые ссылки. Читалось это
+                  как «библиотека — основной путь, остальное мелким шрифтом»,
+                  хотя пути равноправны и взаимоисключающи. Вкладки говорят
+                  ровно то, что есть на самом деле: выбрать можно один. */}
+              <Tabs value={mode} onValueChange={(value) => setMode(value as ProtoMode)}>
+                <TabsList className="grid w-full grid-cols-3 h-auto gap-1 rounded border border-edge bg-sunken p-1">
+                  <TabsTrigger value="paste" className={TAB_CLASS}>
+                    <ClipboardType className="size-3.5" />
+                    Paste text
+                  </TabsTrigger>
+                  <TabsTrigger value="files" className={TAB_CLASS}>
+                    <FolderOpen className="size-3.5" />
+                    Local files
+                  </TabsTrigger>
+                  <TabsTrigger value="library" className={TAB_CLASS}>
+                    <Library className="size-3.5" />
+                    Library
+                  </TabsTrigger>
+                </TabsList>
+
+                {/* --- Вставить текстом ------------------------------------ */}
+                {/* Самый прямой путь: контракт прислали в переписке, он лежит в
+                    вики или его только что написали — вставить и применить.
+                    Файл при этом ровно один, и чужие импорты в нём не
+                    разрешатся: рядом с вставленным текстом нет каталога, где
+                    их искать. Об этом и говорит ошибка, когда до неё доходит. */}
+                <TabsContent value="paste" className="space-y-2 pt-2">
+                  <ProtoEditor
+                    value={text}
+                    onChange={setText}
+                    disabled={busy}
+                    placeholder={PASTE_PLACEHOLDER}
+                  />
+                  {/* Разбор — он же проверка: другого способа убедиться, что
+                      текст является контрактом, не существует, а этот ещё и
+                      тот же самый, каким контракт будет применён. Ошибка
+                      остаётся под полем, пока её не исправят. */}
+                  {textError ? (
+                    <div className="font-mono text-xs text-danger break-words whitespace-pre-wrap">
+                      {textError}
+                    </div>
+                  ) : checking ? (
+                    <div className="font-mono text-xs text-dim">checking…</div>
+                  ) : text && text === schema?.pasted_text ? (
+                    <div className="font-mono text-xs text-dim">
+                      This is the contract the topic is read by.
+                    </div>
+                  ) : null}
+                  <Button
+                    onClick={() => void handleApplyText()}
+                    disabled={busy || !text.trim() || !!textError}
+                    className="w-full bg-brand text-surface hover:bg-brand-hover font-mono disabled:pointer-events-auto disabled:cursor-not-allowed"
+                    title={
+                      textError
+                        ? 'Fix the contract first — it does not parse'
+                        : 'Make this text the contract of the topic'
+                    }
+                  >
+                    {busy ? 'Working…' : 'Apply contract'}
+                  </Button>
+                </TabsContent>
+
+                {/* --- Файлы с диска --------------------------------------- */}
+                <TabsContent value="files" className="space-y-2 pt-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="font-mono text-sm text-soft">Proto Files</Label>
+                    {picked.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleRefresh()}
+                        disabled={busy}
+                        className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer"
+                        title="Re-read every file from disk"
+                      >
+                        refresh all
+                      </button>
+                    )}
+                  </div>
+
+                  {picked.length > 0 ? (
+                    <div className="max-h-40 overflow-auto rounded border border-edge divide-y divide-edge">
+                      {picked.map((file) => (
+                        <div key={file.name} className="flex items-center gap-2 p-2">
+                          <FileText
+                            className={`size-3.5 shrink-0 ${file.auto ? 'text-dim/60' : 'text-dim'}`}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <div
+                                className={`font-mono text-xs truncate ${file.auto ? 'text-soft' : 'text-strong'}`}
+                              >
+                                {file.name}
+                              </div>
+                              {/* Файл не выбирали — его нашли по import.
+                                  Сказать об этом надо: иначе в списке появляются
+                                  файлы, которых пользователь туда не клал, и
+                                  непонятно, откуда они и почему без кнопок. */}
+                              {file.auto && (
+                                <span
+                                  className="shrink-0 font-mono text-[10px] text-dim border border-edge rounded px-1"
+                                  title="Found by an import in the selected files"
+                                >
+                                  import
+                                </span>
+                              )}
+                            </div>
+                            {/* Исходный путь: по нему работает «обновить», и
+                                именно он отличает два одноимённых контракта. */}
+                            <div className="font-mono text-[11px] text-dim truncate" title={file.source}>
+                              {file.source}
+                            </div>
+                          </div>
+                          {/* У зависимости кнопок нет. Перечитывать её отдельно
+                              незачем — она читается с диска заново при каждом
+                              изменении набора, — а удалить её нельзя: она
+                              держится импортом и уйдёт вместе с ним. */}
+                          {!file.auto && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => handleRefresh(file.name)}
+                                disabled={busy}
+                                className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                                title="Re-read this file from disk"
+                              >
+                                <RotateCw className="size-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRemove(file.name)}
+                                disabled={busy}
+                                className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                                title="Remove this file"
+                              >
+                                <X className="size-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded border border-edge border-dashed p-3 text-center font-mono text-xs text-dim">
+                      No .proto files loaded
+                    </div>
                   )}
+
+                  <Button
+                    onClick={handleLoadFiles}
+                    disabled={busy}
+                    variant="outline"
+                    className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
+                  >
+                    <Upload className="size-4 mr-2" />
+                    {busy ? 'Working…' : 'Load Proto Files'}
+                  </Button>
+                  {/* Выбрать достаточно корневой файл: импорты доищутся рядом с
+                      ним на диске. Сказать об этом стоит здесь — иначе человек
+                      выбирает весь каталог разом. */}
+                  <div className="font-mono text-[11px] text-dim break-words">
+                    Pick the contract itself — files it imports are found next to it on disk.
+                  </div>
+                </TabsContent>
+
+                {/* --- Библиотека ------------------------------------------ */}
+                {/* То, ради чего она и заведена: вместо диалога файлов, ожидания
+                    резолва импортов и выбора типа — один выбор контракта. Дверь
+                    в саму библиотеку тоже здесь: кнопка в шапке приложения
+                    убрана, потому что источники касаются одного формата из
+                    шести, а шапка общая на всё. */}
+                <TabsContent value="library" className="space-y-2 pt-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <Label className="font-mono text-sm text-soft">Schema source</Label>
+                    {bound && (
+                      <button
+                        type="button"
+                        onClick={() => void handleBind(null)}
+                        disabled={busy}
+                        className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer"
+                        title="Stop reading this topic by a contract from the library"
+                      >
+                        unbind
+                      </button>
+                    )}
+                  </div>
+                  {hasLibrary ? (
+                    <SchemaSetSelect
+                      sources={sources}
+                      value={boundIsLive === false ? null : bound}
+                      onChange={(binding) => void handleBind(binding)}
+                      disabled={busy}
+                    />
+                  ) : (
+                    // Выбирать нечего, но сказать есть что: про саму возможность
+                    // иначе неоткуда узнать, а стоит она одного действия.
+                    <div className="rounded border border-edge border-dashed p-3 font-mono text-xs text-dim break-words">
+                      No sources yet. Add a folder or a repository and its contracts become
+                      selectable here for every topic, without copying .proto files topic by topic.
+                    </div>
+                  )}
+                  {/* Настоящая кнопка, а не текстовая ссылка. Это не украшение:
+                      у пустой библиотеки она единственное, что вообще можно
+                      нажать, и выглядеть подписью она не имеет права. */}
+                  <Button
+                    onClick={() => setSourcesOpen(true)}
+                    variant="outline"
+                    className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
+                    title="Add, re-fetch or remove the folders and repositories that contracts come from"
+                  >
+                    <Library className="size-4 mr-2" />
+                    Configure schema sources
+                  </Button>
+                  {/* Привязка есть, а набора под ней нет: источник убрали или он
+                      перестал разбираться. Промолчать нельзя — топик в этом
+                      состоянии не декодируется, а по виду формы непонятно
+                      почему. */}
+                  {bound && boundIsLive === false && (
+                    <div className="font-mono text-xs text-brand break-words">
+                      This topic is bound to {bound.entry}, but that contract is not in the library
+                      anymore — fetch its source again in Schema sources, or pick another way to
+                      give the topic its contract.
+                    </div>
+                  )}
+                  {/* Сломанные наборы в списке не показываются — привязать к ним
+                      нечего. Но и молчать о них нельзя: иначе список короче
+                      библиотеки без всякого объяснения. */}
+                  {brokenSets > 0 && (
+                    <div className="font-mono text-[11px] text-dim break-words">
+                      {brokenSets} more {brokenSets === 1 ? 'contract' : 'contracts'} in the library{' '}
+                      {brokenSets === 1 ? 'does' : 'do'} not parse and {brokenSets === 1 ? 'is' : 'are'}{' '}
+                      not listed here — open Schema sources to see why.
+                    </div>
+                  )}
+                </TabsContent>
+              </Tabs>
+
+              {/* Сама библиотека — окном поверх этого. Стоит ВНЕ вкладок: Radix
+                  размонтирует содержимое неактивной, а окно обязано пережить
+                  всё, пока оно открыто. В разметке не занимает ничего — Radix
+                  уносит содержимое в портал.
+
+                  Открыта поверх, а не вместо: настройки могли быть уже
+                  наполовину заполнены (формат переключён, тип выбран), и
+                  закрывать их ради похода за источником значило бы терять этот
+                  выбор. Об изменениях библиотека сообщает сюда — список
+                  контрактов и схема топика перечитываются, не дожидаясь, пока
+                  окно закроют. */}
+              <SchemaSourcesModal
+                open={sourcesOpen}
+                onOpenChange={setSourcesOpen}
+                onChanged={() => void handleSourcesChanged()}
+              />
+
+              {/* Схема на диске есть, но не разбирается.
+                  Одним блоком на все вкладки, а не внутри каждой: ошибка
+                  относится к схеме ТОПИКА, а не к способу, которым её задали, —
+                  и у вставленного текста её не бывает вовсе, он бы не
+                  применился. */}
+              {mode !== 'paste' && schema?.error && (
+                <div className="font-mono text-xs text-brand break-words">{schema.error}</div>
+              )}
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <Label className="font-mono text-sm text-soft">Message</Label>
+                  {/* Подбор по телам — единственный способ ответить на вопрос
+                      «каким типом это записано», когда топик голый protobuf: в
+                      теле нет ни имени типа, ни id схемы, а имя топика о типе
+                      ничего не обещает. */}
+                  <button
+                    type="button"
+                    onClick={() => void handleGuess()}
+                    disabled={guessing || busy || !isOpenTopic}
+                    title={
+                      isOpenTopic
+                        ? 'Try every loaded .proto type against the bodies already read'
+                        : 'Open this topic first — the match runs on its own bodies'
+                    }
+                    className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    {guessing ? 'matching…' : 'guess from bodies'}
+                  </button>
                 </div>
 
-                {files.length > 0 ? (
-                  <div className="max-h-40 overflow-auto rounded border border-edge divide-y divide-edge">
-                    {files.map((file) => (
-                      <div key={file.name} className="flex items-center gap-2 p-2">
-                        <FileText
-                          className={`size-3.5 shrink-0 ${file.auto ? 'text-dim/60' : 'text-dim'}`}
-                        />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <div
-                              className={`font-mono text-xs truncate ${file.auto ? 'text-soft' : 'text-strong'}`}
-                            >
-                              {file.name}
-                            </div>
-                            {/* Файл не выбирали — его нашли по import.
-                                Сказать об этом надо: иначе в списке появляются
-                                файлы, которых пользователь туда не кладл, и
-                                непонятно, откуда они и почему без кнопок. */}
-                            {file.auto && (
-                              <span
-                                className="shrink-0 font-mono text-[10px] text-dim border border-edge rounded px-1"
-                                title="Found by an import in the selected files"
-                              >
-                                import
-                              </span>
-                            )}
-                          </div>
-                          {/* Исходный путь: по нему работает «обновить», и
-                              именно он отличает два одноимённых контракта. */}
-                          <div className="font-mono text-[11px] text-dim truncate" title={file.source}>
-                            {file.source}
-                          </div>
-                        </div>
-                        {/* У зависимости кнопок нет. Перечитывать её отдельно
-                            незачем — она читается с диска заново при каждом
-                            изменении набора, — а удалить её нельзя: она
-                            держится импортом и уйдёт вместе с ним. */}
-                        {!file.auto && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => handleRefresh(file.name)}
-                              disabled={busy}
-                              className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                              title="Re-read this file from disk"
-                            >
-                              <RotateCw className="size-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleRemove(file.name)}
-                              disabled={busy}
-                              className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                              title="Remove this file"
-                            >
-                              <X className="size-3.5" />
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="rounded border border-edge border-dashed p-3 text-center font-mono text-xs text-dim">
-                    No .proto files loaded
-                  </div>
-                )}
+                {guess && <GuessResults guess={guess} chosen={message} onPick={setMessage} />}
 
-                {schema?.error && (
-                  <div className="font-mono text-xs text-brand break-words">{schema.error}</div>
-                )}
-
-                <Button
-                  onClick={handleLoadFiles}
-                  disabled={busy}
-                  variant="outline"
-                  className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
-                >
-                  <Upload className="size-4 mr-2" />
-                  {busy ? 'Working…' : 'Load Proto Files'}
-                </Button>
-              </div>
-
-              <div className="space-y-2">
-                <Label className="font-mono text-sm text-soft">Message</Label>
                 <ProtoMessageSelect
                   messages={messages}
                   value={message}
@@ -381,6 +1189,25 @@ export function TopicConfigModal({
                   <div className="font-mono text-xs text-dim">
                     The loaded files declare {messages.length} messages — pick the one this topic
                     carries. Saving is blocked until you do.
+                  </div>
+                )}
+                {/* Выбран не корень набора. Перебивать выбор нельзя — читать
+                    топик вложенным типом законно, — но и промолчать нельзя:
+                    именно так в настройках оказался внутренний тип, а топик
+                    сыпал ошибками декодирования, и понять почему было нечем. */}
+                {schema?.root && message && message !== schema.root && (
+                  <div className="font-mono text-xs text-dim">
+                    Nothing in this .proto contains{' '}
+                    <button
+                      type="button"
+                      onClick={() => setMessage(schema.root)}
+                      disabled={busy}
+                      className="font-mono text-xs text-brand hover:underline disabled:opacity-50 bg-transparent border-none p-0 cursor-pointer"
+                    >
+                      {schema.root}
+                    </button>
+                    , so that is the type this file was written around — topics are normally read
+                    by it.
                   </div>
                 )}
               </div>
@@ -421,6 +1248,8 @@ export function TopicConfigModal({
               file to decode these bodies.
             </div>
           )}
+          </>
+          )}
 
           {/* Action Buttons */}
           <div className="flex gap-3 pt-4">
@@ -435,9 +1264,13 @@ export function TopicConfigModal({
                 кнопки глушит выключенной события, а вместе с ними и `title`.
                 Нажатие от этого не появляется, выключенная кнопка событий
                 click не отдаёт. */}
+            {/* Пока схема не приехала, Save выключен не для красоты: сохранять
+                он будет то, что стоит в полях, а стоит там заготовка — `json`
+                и пустой тип. Нажатие в эту секунду стёрло бы настройку топика
+                вместо того, чтобы её показать. */}
             <Button
               onClick={handleSave}
-              disabled={busy || !cluster || needsMessage}
+              disabled={busy || !cluster || !ready || needsMessage}
               title={needsMessage ? 'Pick the message type this topic carries first' : undefined}
               className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:pointer-events-auto disabled:cursor-not-allowed"
             >

@@ -16,6 +16,13 @@ mod decoder;
 mod files;
 pub mod json;
 pub mod proto;
+/// Библиотека наборов .proto: источник — дерево, набор — входной файл в нём.
+/// Заведена затем, чтобы файлы перестали копироваться на каждый топик и чтобы
+/// их было откуда взять там, где чекаутов нет.
+pub mod source;
+/// Общий HTTP-клиент: доверие корпоративному CA настраивается в одном месте на
+/// всех, кто ходит по сети, — реестр и GitLab за одним и тем же инспектором.
+pub mod http;
 /// Клиент Schema Registry. Реестр в Confluent один на все три формата схем, и
 /// аврошного в HTTP-запросах к нему нет ничего — поэтому модуль общий, а не
 /// внутри `avro`, где он жил, пока формат со схемой в реестре был один.
@@ -35,6 +42,7 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 pub use decoder::Decoder;
+pub use proto::guess::Guess;
 pub use types::{BodyFormat, LensSetting, MessageForm, TopicSchemaView};
 
 use crate::config;
@@ -72,6 +80,36 @@ pub fn add_files(
     sources: &[String],
 ) -> Result<TopicSchemaView, String> {
     store::add_files(&config::config_dir(app)?, cluster, topic, sources)
+}
+
+/// Контракт топика из вставленного текста. См. `store::add_text`.
+pub fn add_text(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    text: &str,
+) -> Result<TopicSchemaView, String> {
+    store::add_text(&config::config_dir(app)?, cluster, topic, text)
+}
+
+/// Разбирает вставленный текст, ничего не сохраняя. См. `store::check_text`.
+///
+/// Каталог настроек ей не нужен вовсе: проверка идёт во временном каталоге и
+/// топика не касается. Обёртка оставлена ради единообразия — все команды схем
+/// ходят через этот модуль.
+pub fn check_text(text: &str) -> Result<(), String> {
+    store::check_text(text)
+}
+
+/// Какими типами может быть записан топик — по его же телам.
+/// См. `store::guess_message`.
+pub fn guess_message(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    samples: &[Vec<u8>],
+) -> Result<Guess, String> {
+    store::guess_message(&config::config_dir(app)?, cluster, topic, samples)
 }
 
 pub fn refresh(
@@ -119,6 +157,251 @@ pub fn set_lens(
     lens: Option<LensSetting>,
 ) -> Result<TopicSchemaView, String> {
     store::set_lens(&config::config_dir(app)?, cluster, topic, lens)
+}
+
+// --- Библиотека наборов .proto -------------------------------------------------
+
+/// Ключ токена источника в системном хранилище.
+///
+/// С префиксом: хранилище у приложения одно на всё (`config::secrets`), и
+/// ключи кластерных учёток — это их идентификаторы. Без префикса два разных
+/// рода секретов делили бы одно пространство имён, и совпадение
+/// идентификаторов стоило бы чужого пароля.
+fn token_key(id: &str) -> String {
+    format!("source:{id}")
+}
+
+/// Ключ токена, общего на весь ХОСТ.
+///
+/// Отдельно от токена источника, и это не дубль. Personal access token заводят
+/// на человека и на инсталляцию, а не на проект: у владельца в GitLab десятки
+/// тысяч репозиториев, и заводить токен заново на каждый добавленный источник
+/// означало бы каждый раз идти в настройки GitLab. Токен источника остаётся
+/// при этом на месте — его `refresh` и берёт, — а этот служит заготовкой для
+/// СЛЕДУЮЩЕГО источника того же хоста.
+///
+/// Удаление источника его не трогает: он тем и ценен, что переживает источники.
+/// Забыть его можно явно — `forget_host_token`.
+///
+/// Провайдер входит в ключ, а не только хост. На одном хосте двух сразу не
+/// бывает, так что различать их по сути незачем, — но имя записи видно человеку
+/// в системной связке ключей, и `github-host:github.com` там честнее, чем
+/// `gitlab-host:github.com`. Заодно сохранённые раньше токены GitLab остаются
+/// на своих местах: ключ у них тот же, что и был.
+fn host_token_key(kind: source::SourceKind, host: &str) -> String {
+    let prefix = match kind {
+        source::SourceKind::Github => "github-host",
+        _ => "gitlab-host",
+    };
+    format!("{prefix}:{host}")
+}
+
+/// Хост из URL проекта — то, чем в хранилище назван общий токен.
+///
+/// Разбирается грубо, без `url`-крейта: нужна одна часть, а зависимость ради
+/// неё не окупается. Регистр приводится к нижнему — иначе `GitLab.example.com`
+/// и `gitlab.example.com` завели бы два токена на один сервер.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .trim()
+        .split_once("://")
+        .map_or(url.trim(), |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next()?.trim();
+    // Порт отбрасывается: токен выдан сервером, а не портом, и `:8443` в ключе
+    // развело бы один и тот же токен по двум записям.
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Чем заполнить форму нового удалённого источника.
+///
+/// Заведение источника — это шесть полей, из которых пять одинаковы у всех
+/// проектов одного сервера. Подставляются хост последнего заведённого источника
+/// ТОГО ЖЕ провайдера и признак сохранённого на него токена; сам токен наружу не
+/// уезжает, как и пароли кластеров.
+///
+/// Провайдера спрашивают отдельно потому, что хост у них разный: подставить
+/// `gitlab.example.com` в форму GitHub значило бы предложить заготовку,
+/// которую первым делом надо стереть.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoDefaults {
+    /// `https://<хост>/` — приставка, которую остаётся дополнить путём проекта.
+    pub url_prefix: Option<String>,
+    pub host: Option<String>,
+    /// На этот хост в хранилище лежит токен, и поле можно оставить пустым.
+    pub has_token: bool,
+}
+
+pub fn repo_defaults(app: &AppHandle, kind: source::SourceKind) -> Result<RepoDefaults, String> {
+    let root = config::config_dir(app)?;
+    // Последний по времени забора, а не по порядку в файле: добавляют источники
+    // вперемешку, а подставить надо тот сервер, с которым работали только что.
+    let host = source::list(&root)?
+        .into_iter()
+        .filter(|s| s.kind == kind)
+        .max_by(|a, b| a.fetched_at.cmp(&b.fetched_at))
+        .and_then(|s| host_of(&s.location));
+
+    // У публичного GitHub хост один на всех, и ждать первого источника, чтобы
+    // его подставить, незачем — это не догадка, а единственный возможный ответ.
+    let host = host.or_else(|| match kind {
+        source::SourceKind::Github => Some("github.com".to_string()),
+        _ => None,
+    });
+
+    let has_token = match &host {
+        Some(host) => config::secrets::read_password(&host_token_key(kind, host))
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    };
+    Ok(RepoDefaults {
+        url_prefix: host.as_ref().map(|host| format!("https://{host}/")),
+        host,
+        has_token,
+    })
+}
+
+/// Забывает общий токен хоста. Токены самих источников остаются при них.
+pub fn forget_host_token(kind: source::SourceKind, host: &str) -> Result<(), String> {
+    config::secrets::delete_password(&host_token_key(kind, host))
+}
+
+pub fn source_views(app: &AppHandle) -> Result<Vec<source::SourceView>, String> {
+    source::views(&config::config_dir(app)?)
+}
+
+/// Заводит источник-папку: .proto копируются к себе, как и выбранные руками.
+pub fn add_folder_source(
+    app: &AppHandle,
+    path: &str,
+) -> Result<source::SchemaSource, String> {
+    let root = config::config_dir(app)?;
+    let folder = std::path::Path::new(path);
+    let record = source::folder_source(new_source_id(), folder);
+    let files = source::read_folder(folder)?;
+    source::add(&root, record, files)
+}
+
+/// Заводит удалённый источник — GitLab или GitHub — и сразу забирает дерево.
+///
+/// Токен кладётся в хранилище ДО похода за деревом (он для него и нужен), а
+/// если поход не удался — убирается: источник не завёлся, и висящий секрет от
+/// него остался бы сиротой.
+///
+/// Пустой токен — не «ходить без токена», а «взять сохранённый на этот хост»
+/// (`host_token_key`). Приватный репозиторий без токена отвечает тем же 404,
+/// что и несуществующий, и заставлять набирать один и тот же PAT на каждый из
+/// десятков тысяч проектов сервера незачем. Заданный токен, наоборот,
+/// запоминается на хост и становится заготовкой для следующего источника.
+pub fn add_repo_source(
+    app: &AppHandle,
+    kind: source::SourceKind,
+    url: &str,
+    git_ref: Option<String>,
+    subdir: Option<String>,
+    ca_bundle_path: Option<String>,
+    token: Option<String>,
+) -> Result<source::SchemaSource, String> {
+    if !kind.is_remote() {
+        return Err("a folder source is added by path, not by URL".to_string());
+    }
+    let root = config::config_dir(app)?;
+    let id = new_source_id();
+    let host = host_of(url);
+    let given = token.filter(|t| !t.trim().is_empty());
+    // Сохранить на хост — до похода: токен нужен ему самому, а не отчёту об
+    // успехе, и неудачный поход за деревом его не портит.
+    if let (Some(token), Some(host)) = (&given, &host) {
+        config::secrets::store_password(&host_token_key(kind, host), token)?;
+    }
+    let token = match given {
+        Some(given) => Some(given),
+        None => host.as_deref().and_then(|host| {
+            config::secrets::read_password(&host_token_key(kind, host))
+                .ok()
+                .flatten()
+        }),
+    };
+    if let Some(token) = &token {
+        config::secrets::store_password(&token_key(&id), token)?;
+    }
+
+    let record = source::repo_source(
+        id.clone(),
+        kind,
+        url,
+        git_ref,
+        subdir,
+        ca_bundle_path,
+        token.is_some(),
+    );
+    let outcome = source::fetch(&record, token.as_deref())
+        .and_then(|files| source::add(&root, record, files));
+    if outcome.is_err() && token.is_some() {
+        let _ = config::secrets::delete_password(&token_key(&id));
+    }
+    outcome
+}
+
+/// Забирает дерево заново. `git_ref` задан — заодно переключает ветку.
+pub fn refresh_source(
+    app: &AppHandle,
+    id: &str,
+    git_ref: Option<String>,
+) -> Result<source::SchemaSource, String> {
+    let root = config::config_dir(app)?;
+    // Метка пересчитывается на каждом перезаборе, а не только при заведении.
+    //
+    // Иначе починить её нечем: правило менялось (было «последний сегмент пути»,
+    // стало «группа/репозиторий» — `contracts` в двух группах не различались
+    // вовсе), а завести источник заново значит получить новый `id` и потерять
+    // все привязки топиков. Переименования руками в приложении нет, так что
+    // своего, набранного человеком имени мы тут не затираем.
+    let record = source::update(&root, id, |source| {
+        if let Some(git_ref) = git_ref {
+            source.git_ref = Some(git_ref).filter(|r| !r.trim().is_empty());
+        }
+        if source.kind.is_remote() {
+            source.label = source::repo_label(&source.location, source.kind);
+        }
+    })?;
+
+    let token = match record.has_token {
+        true => config::secrets::read_password(&token_key(id))?,
+        false => None,
+    };
+    let files = source::fetch(&record, token.as_deref())?;
+    source::replace_tree(&root, id, files)
+}
+
+/// Убирает источник вместе с деревом и токеном.
+pub fn delete_source(app: &AppHandle, id: &str) -> Result<(), String> {
+    let root = config::config_dir(app)?;
+    // Секрет убирается даже если записи уже нет: осиротевший токен в хранилище
+    // — это то, чего из приложения потом не видно вовсе.
+    let _ = config::secrets::delete_password(&token_key(id));
+    source::delete(&root, id)
+}
+
+/// Привязывает топик к набору из библиотеки. `None` — снять привязку.
+pub fn bind_source(
+    app: &AppHandle,
+    cluster: &str,
+    topic: &str,
+    binding: Option<source::SourceBinding>,
+) -> Result<TopicSchemaView, String> {
+    store::bind_source(&config::config_dir(app)?, cluster, topic, binding)
+}
+
+/// Идентификатор источника: случайный и неизменный.
+///
+/// Им названы каталог дерева и ключ токена, поэтому он не должен зависеть ни от
+/// URL (его правят), ни от метки (её переименовывают).
+fn new_source_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 // --- Avro --------------------------------------------------------------------
@@ -434,4 +717,76 @@ pub fn encode(
     parsed
         .write_to_bytes_dyn()
         .map_err(|e| format!("can't serialize {}: {e}", md.full_name()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Хост из URL проекта. Нужен точным: им назван общий токен в хранилище, и
+    /// разъехавшийся регистр или прилипший порт завели бы второй токен на тот
+    /// же сервер — то есть вернули бы ровно ту работу, ради отмены которой он и
+    /// сохраняется.
+    #[test]
+    fn the_host_is_taken_from_whatever_form_the_url_was_pasted_in() {
+        for (url, expected) in [
+            (
+                "https://gitlab.example.com/group/contracts",
+                "gitlab.example.com",
+            ),
+            (
+                "http://gitlab.example.com/group/sub/contracts.git",
+                "gitlab.example.com",
+            ),
+            // Без схемы — так URL и копируют из адресной строки половину раз.
+            ("gitlab.example.com/group/contracts", "gitlab.example.com"),
+            // Регистр и порт не должны разводить один сервер по двум записям.
+            ("https://GitLab.Example.COM/group/x", "gitlab.example.com"),
+            ("https://gitlab.example.com:8443/group/x", "gitlab.example.com"),
+            // Хост сам по себе — тоже ответ: форму заполняют по нему.
+            ("https://gitlab.example.com/", "gitlab.example.com"),
+            ("  https://gitlab.example.com  ", "gitlab.example.com"),
+        ] {
+            assert_eq!(host_of(url).as_deref(), Some(expected), "{url}");
+        }
+    }
+
+    /// Пустой URL хоста не даёт — иначе общий токен лёг бы под ключ
+    /// `gitlab-host:`, то есть стал бы общим на все серверы сразу.
+    #[test]
+    fn an_empty_url_has_no_host() {
+        for url in ["", "   ", "https://", "/group/contracts"] {
+            assert_eq!(host_of(url), None, "{url:?}");
+        }
+    }
+
+    /// Ключи двух токенов не пересекаются ни между собой, ни с кластерными
+    /// учётками: хранилище у приложения одно на всё.
+    #[test]
+    fn the_two_token_keys_live_in_their_own_namespaces() {
+        assert_eq!(token_key("abc"), "source:abc");
+        assert_eq!(
+            host_token_key(source::SourceKind::Gitlab, "gitlab.example.com"),
+            "gitlab-host:gitlab.example.com"
+        );
+        assert_eq!(
+            host_token_key(source::SourceKind::Github, "github.com"),
+            "github-host:github.com"
+        );
+        assert_ne!(
+            token_key("x"),
+            host_token_key(source::SourceKind::Gitlab, "x")
+        );
+    }
+
+    /// Ключ токена GitLab не менялся: сохранённые прошлыми версиями токены
+    /// обязаны остаться на своих местах, иначе владельцу пришлось бы заводить
+    /// PAT заново без всякой на то причины.
+    #[test]
+    fn the_gitlab_token_key_did_not_change_when_github_appeared() {
+        assert_eq!(
+            host_token_key(source::SourceKind::Gitlab, "gitlab.tcsbank.ru"),
+            "gitlab-host:gitlab.tcsbank.ru"
+        );
+    }
 }

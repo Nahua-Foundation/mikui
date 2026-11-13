@@ -683,6 +683,22 @@ pub enum Command {
     },
     /// Сообщение сырыми байтами — для архива сохранённых. См. `Worker::raw`.
     GetRaw(usize, Reply<Result<RawBody, String>>),
+    /// Горсть тел из буфера — для подбора схемы (`schema::proto::guess`).
+    ///
+    /// Берутся из того, что УЖЕ прочитано, и ни одного запроса в Kafka не
+    /// делают. На кластере с квотой на чтение это не мелочь: подсказка «каким
+    /// типом читается этот топик» не имеет права стоить тех же байт, что и сам
+    /// топик.
+    ///
+    /// Имя топика приезжает ради сверки, а не ради выбора: буфер у воркера один,
+    /// и тела в нём от того топика, который открыт. Настройки же открывают у
+    /// любого топика из списка — без сверки подбор для одного молча считался бы
+    /// по телам другого и выдал бы уверенный вздор.
+    SampleBodies {
+        topic: String,
+        count: usize,
+        reply: Reply<Result<Vec<Vec<u8>>, String>>,
+    },
     /// Чем декодировать тела открытого топика и чем — его ключи. `None` —
     /// отдавать как есть.
     ///
@@ -1429,6 +1445,13 @@ impl Worker {
                 }
                 Command::GetRaw(index, reply) => {
                     let _ = reply.send(self.raw(index));
+                }
+                Command::SampleBodies {
+                    topic,
+                    count,
+                    reply,
+                } => {
+                    let _ = reply.send(self.sample_bodies(&topic, count));
                 }
                 Command::SetDecoder {
                     value,
@@ -3205,6 +3228,63 @@ impl Worker {
                 })
                 .collect(),
         })
+    }
+
+    /// Горсть тел из буфера — образцы для подбора схемы.
+    ///
+    /// Три решения, и каждое меняет, что подбор увидит.
+    ///
+    /// Индексы БУФЕРНЫЕ, а не видовые: фильтр и сортировка отвечают на вопрос
+    /// «что показать человеку», а здесь спрашивают «чем записан топик», и
+    /// отвечать на него по отфильтрованному значило бы подбирать тип по той
+    /// горстке сообщений, которая совпала с поисковым запросом.
+    ///
+    /// Обход — с шагом, а не подряд. Соседние сообщения в топике сплошь и рядом
+    /// одного вида (одна ветка `oneof`, один вид события), и двадцать подряд
+    /// дают ровно один сигнал вместо двадцати. Шагов столько же, сколько и
+    /// пропусков, так что каждый индекс навещается ровно один раз: первый
+    /// проход снимает сливки по всей длине буфера, последующие добирают
+    /// недостающее, если на выбранных позициях стояли пустые тела.
+    ///
+    /// Пустые тела пропускаются: такое тело подходит ЛЮБОМУ типу (в proto3
+    /// запись со всеми полями по умолчанию кодируется в ноль байт), и
+    /// засчитывалось бы попаданием всем кандидатам подряд.
+    fn sample_bodies(&self, topic: &str, count: usize) -> Result<Vec<Vec<u8>>, String> {
+        match self.open_topic.as_deref() {
+            None => return Err("no topic is open — open one to match its bodies".into()),
+            // Отказ, а не молчаливая выдача чужих тел: подобранный по ним тип
+            // выглядел бы ровно так же убедительно, как настоящий.
+            Some(open) if open != topic => {
+                return Err(format!(
+                    "{topic} is not the open topic ({open}) — open it to match its bodies"
+                ))
+            }
+            Some(_) => {}
+        }
+        let len = self.store.len();
+        if len == 0 || count == 0 {
+            return Err("nothing has been read yet — read the topic first".into());
+        }
+
+        let stride = (len / count).max(1);
+        let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(count.min(len));
+        'walk: for offset in 0..stride {
+            for index in (offset..len).step_by(stride) {
+                let value = self.store.value(index);
+                if value.is_empty() {
+                    continue;
+                }
+                bodies.push(value.to_vec());
+                if bodies.len() == count {
+                    break 'walk;
+                }
+            }
+        }
+
+        if bodies.is_empty() {
+            return Err("every body in the buffer is empty — there is nothing to match".into());
+        }
+        Ok(bodies)
     }
 }
 

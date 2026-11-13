@@ -633,6 +633,28 @@ async fn add_proto_files(
     blocking(move || schema::add_files(&app, &cluster, &topic, &paths)).await
 }
 
+/// Делает контрактом топика текст, вставленный в настройках.
+///
+/// Как и загрузка файлов, не сохраняет ничего, пока текст не разобрался, и
+/// снимает привязку к библиотеке: способ задать схему у топика один.
+#[tauri::command]
+async fn add_proto_text(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    text: String,
+) -> Result<TopicSchemaView, String> {
+    blocking(move || schema::add_text(&app, &cluster, &topic, &text)).await
+}
+
+/// Разбирает вставленный текст, ничего не сохраняя: форма спрашивает об этом,
+/// пока текст ещё в поле. Ответ тот же самый, что даст применение, — разбор
+/// общий.
+#[tauri::command]
+async fn check_proto_text(text: String) -> Result<(), String> {
+    blocking(move || schema::check_text(&text)).await
+}
+
 /// Перечитывает .proto с диска: `name` — конкретный файл, `None` — все.
 #[tauri::command]
 async fn refresh_proto_files(
@@ -1051,6 +1073,137 @@ async fn proto_message_form(
     blocking(move || schema::message_form(&app, &cluster, &topic, &message)).await
 }
 
+/// Каким типом записан открытый топик — по его собственным телам.
+///
+/// Нужна там, где спросить больше некого: у голого protobuf тело не несёт ни
+/// имени типа, ни id схемы. Перебираются все message всех .proto, загруженных
+/// топикам этого кластера; как считается «подошёл» — в `proto::guess`.
+///
+/// Образцы берутся из буфера воркера, то есть из уже прочитанного, и в Kafka не
+/// уходит ни одного запроса: на кластере с квотой подсказка не имеет права
+/// стоить столько же, сколько сам топик.
+///
+/// Два шага, а не один, потому что они про разное и живут в разных местах:
+/// тела — у воркера, схемы — в каталоге настроек. Разбор уезжает в
+/// `spawn_blocking`: он читает файлы и разбирает .proto десятками.
+#[tauri::command]
+async fn guess_topic_message(
+    app: tauri::AppHandle,
+    worker: tauri::State<'_, WorkerHandle>,
+    cluster: String,
+    topic: String,
+) -> Result<schema::Guess, String> {
+    let samples = worker
+        .call(|reply| Command::SampleBodies {
+            topic: topic.clone(),
+            count: schema::proto::guess::WANTED_SAMPLES,
+            reply,
+        })
+        .await??;
+    blocking(move || schema::guess_message(&app, &cluster, &topic, &samples)).await
+}
+
+// --- Библиотека наборов .proto -------------------------------------------------
+//
+// Источник — дерево .proto, набор — входной файл в нём. Зачем так, а не
+// «репозиторий = набор», — в `schema::source`. Вся тяжесть (сеть, распаковка,
+// разбор десятков файлов) уходит в `blocking`.
+
+#[tauri::command]
+async fn list_schema_sources(
+    app: tauri::AppHandle,
+) -> Result<Vec<schema::source::SourceView>, String> {
+    blocking(move || schema::source_views(&app)).await
+}
+
+/// Папка на диске как источник. Путь выбирают тем же диалогом, что и .proto.
+#[tauri::command]
+async fn add_folder_source(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<schema::source::SchemaSource, String> {
+    blocking(move || schema::add_folder_source(&app, &path)).await
+}
+
+/// Чем заполнить форму нового удалённого источника: хост последнего заведённого
+/// у ТОГО ЖЕ провайдера и признак сохранённого на него токена. Сам токен наружу
+/// не уезжает.
+#[tauri::command]
+async fn repo_source_defaults(
+    app: tauri::AppHandle,
+    kind: schema::source::SourceKind,
+) -> Result<schema::RepoDefaults, String> {
+    blocking(move || schema::repo_defaults(&app, kind)).await
+}
+
+/// Забыть общий токен хоста. Токены самих источников остаются при них.
+#[tauri::command]
+async fn forget_host_token(
+    kind: schema::source::SourceKind,
+    host: String,
+) -> Result<(), String> {
+    blocking(move || schema::forget_host_token(kind, &host)).await
+}
+
+/// Проект GitLab или GitHub как источник.
+///
+/// Токен приезжает сюда один раз, при заведении, и дальше живёт в системном
+/// хранилище: наружу он не возвращается ни в списке источников, ни где-либо
+/// ещё — то же правило, что у паролей кластера. Пустой токен означает «взять
+/// сохранённый на этот хост», а не «идти без токена».
+#[tauri::command]
+async fn add_repo_source(
+    app: tauri::AppHandle,
+    kind: schema::source::SourceKind,
+    url: String,
+    git_ref: Option<String>,
+    subdir: Option<String>,
+    ca_bundle_path: Option<String>,
+    token: Option<String>,
+) -> Result<schema::source::SchemaSource, String> {
+    blocking(move || {
+        schema::add_repo_source(&app, kind, &url, git_ref, subdir, ca_bundle_path, token)
+    })
+    .await
+}
+
+/// Перечитать дерево. `git_ref` задан — заодно переключить ветку.
+#[tauri::command]
+async fn refresh_schema_source(
+    app: tauri::AppHandle,
+    id: String,
+    git_ref: Option<String>,
+) -> Result<schema::source::SchemaSource, String> {
+    blocking(move || schema::refresh_source(&app, &id, git_ref)).await
+}
+
+#[tauri::command]
+async fn delete_schema_source(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    blocking(move || schema::delete_source(&app, &id)).await
+}
+
+/// Привязывает топик к набору. `entry` пуст — привязка снимается, и топик
+/// возвращается к своим файлам.
+#[tauri::command]
+async fn bind_topic_source(
+    app: tauri::AppHandle,
+    cluster: String,
+    topic: String,
+    source: Option<String>,
+    entry: Option<String>,
+) -> Result<schema::TopicSchemaView, String> {
+    blocking(move || {
+        let binding = match (source, entry) {
+            (Some(source), Some(entry)) if !source.is_empty() && !entry.is_empty() => {
+                Some(schema::source::SourceBinding { source, entry })
+            }
+            _ => None,
+        };
+        schema::bind_source(&app, &cluster, &topic, binding)
+    })
+    .await
+}
+
 /// То же самое для Avro. `subject` пуст — взять тот, что назначен топику.
 #[tauri::command]
 async fn avro_message_form(
@@ -1328,6 +1481,8 @@ pub fn run() {
             take_pending_link,
             get_topic_schema,
             add_proto_files,
+            add_proto_text,
+            check_proto_text,
             refresh_proto_files,
             remove_proto_file,
             save_topic_schema,
@@ -1347,6 +1502,15 @@ pub fn run() {
             test_schema_registry,
             list_registry_subjects,
             list_subject_versions,
+            guess_topic_message,
+            list_schema_sources,
+            add_folder_source,
+            add_repo_source,
+            repo_source_defaults,
+            forget_host_token,
+            refresh_schema_source,
+            delete_schema_source,
+            bind_topic_source,
             proto_message_form,
             avro_message_form,
             json_message_form,
