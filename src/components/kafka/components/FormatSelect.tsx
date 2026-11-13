@@ -59,7 +59,9 @@ interface FormatSelectProps {
  */
 export function FormatSelect({ format, onChange, onOpenSchema }: FormatSelectProps) {
   return (
-    <div className="flex flex-row items-center gap-2">
+    // Зазора между селектором и шестерёнкой здесь нет намеренно: его держит
+    // собственный отступ кнопки — см. комментарий у неё.
+    <div className="flex flex-row items-center">
       {/* Два уровня — как у соседнего селектора партиций: подпись постоянной
           ширины сверху, значение под ней. */}
       <DropdownMenu>
@@ -94,9 +96,16 @@ export function FormatSelect({ format, onChange, onOpenSchema }: FormatSelectPro
       </DropdownMenu>
 
       {needsSchema(format) && (
+        // Цель для клика — 32 пикселя, а не 16: отступ живёт на кнопке, как и у
+        // иконок шапки (`IconAction`), иначе попадать в неё приходится пиксель
+        // в пиксель. Отрицательный `-mr-2` возвращает ячейке прежнюю ширину:
+        // правая половина цели уходит в собственный отступ ячейки (`px-4`), то
+        // есть в пустое место, а левая занимает зазор, который раньше задавал
+        // `gap-2` у родителя. Иконка от этого не двигается ни на пиксель, но
+        // нажимается и подсвечивается вся область вокруг неё.
         <button
           onClick={onOpenSchema}
-          className="text-soft hover:text-brand bg-transparent border-none outline-none cursor-pointer p-0 transition-colors"
+          className="text-soft hover:text-brand bg-transparent border-none outline-none cursor-pointer p-2 -mr-2 transition-colors"
           title="Schema settings"
         >
           <Settings2 className="size-4" />

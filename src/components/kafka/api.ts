@@ -26,9 +26,14 @@ import {
   ProduceRequest,
   ProduceResult,
   MessageForm,
+  RepoDefaults,
+  RepoKind,
   RowPreview,
   SavedMessage,
+  SchemaGuess,
   SchemaRegistryConfig,
+  SchemaSource,
+  SourceView,
   SaveFavoriteResult,
   Settings,
   parseFavoriteTopics,
@@ -306,12 +311,109 @@ export const getTopicSchema = (cluster: string, topic: string) =>
 export const addProtoFiles = (cluster: string, topic: string, paths: string[]) =>
   invoke<TopicSchema>('add_proto_files', { cluster, topic, paths });
 
+/**
+ * Делает контрактом топика вставленный текст.
+ *
+ * Как и загрузка файлов: не сохраняет ничего, пока текст не разобрался, и
+ * снимает привязку к библиотеке — способ задать схему у топика один.
+ */
+export const addProtoText = (cluster: string, topic: string, text: string) =>
+  invoke<TopicSchema>('add_proto_text', { cluster, topic, text });
+
+/**
+ * Разбирает вставленный текст, ничего не сохраняя.
+ *
+ * Разбор тот же самый, что и у `addProtoText`, то есть ответ здесь — не
+ * приближение к тому, что скажет применение, а оно само.
+ */
+export const checkProtoText = (text: string) =>
+  invoke<void>('check_proto_text', { text });
+
 /** Перечитывает .proto с диска: `name` — конкретный файл, иначе все. */
 export const refreshProtoFiles = (cluster: string, topic: string, name?: string) =>
   invoke<TopicSchema>('refresh_proto_files', { cluster, topic, name: name ?? null });
 
 export const removeProtoFile = (cluster: string, topic: string, name: string) =>
   invoke<TopicSchema | null>('remove_proto_file', { cluster, topic, name });
+
+/**
+ * Каким типом записан ОТКРЫТЫЙ топик — по его собственным прочитанным телам.
+ *
+ * Ничего не меняет и в Kafka не ходит: образцы берутся из буфера воркера, то
+ * есть из уже прочитанного. Перебираются все message всех .proto, загруженных
+ * топикам этого кластера, — у топика без схемы своих файлов нет, а подбор нужен
+ * как раз ему.
+ */
+export const guessTopicMessage = (cluster: string, topic: string) =>
+  invoke<SchemaGuess>('guess_topic_message', { cluster, topic });
+
+// --- Библиотека наборов .proto ------------------------------------------------
+//
+// Источник — дерево .proto, набор — входной файл в нём. Загрузка, распаковка и
+// разбор идут на бэкенде в фоновом потоке, так что все эти вызовы долгие.
+
+export const listSchemaSources = () => invoke<SourceView[]>('list_schema_sources');
+
+/** Папка на диске как источник: .proto копируются к себе. */
+export const addFolderSource = (path: string) =>
+  invoke<SchemaSource>('add_folder_source', { path });
+
+/**
+ * Проект GitLab или GitHub как источник.
+ *
+ * Токен уезжает один раз, при заведении, и назад не возвращается: он живёт в
+ * системном хранилище, а в списке источников виден только признаком.
+ */
+export const addRepoSource = (params: {
+  kind: RepoKind;
+  url: string;
+  gitRef?: string | null;
+  subdir?: string | null;
+  caBundlePath?: string | null;
+  token?: string | null;
+}) =>
+  invoke<SchemaSource>('add_repo_source', {
+    kind: params.kind,
+    url: params.url,
+    gitRef: params.gitRef ?? null,
+    subdir: params.subdir ?? null,
+    caBundlePath: params.caBundlePath ?? null,
+    token: params.token ?? null,
+  });
+
+/**
+ * Чем заполнить форму нового удалённого источника.
+ *
+ * Хост последнего заведённого источника ТОГО ЖЕ провайдера и признак
+ * сохранённого на него токена. Сам токен сюда не приезжает — то же правило, что
+ * у паролей кластера.
+ */
+export const repoSourceDefaults = (kind: RepoKind) =>
+  invoke<RepoDefaults>('repo_source_defaults', { kind });
+
+/** Забыть общий токен хоста. Токены самих источников остаются при них. */
+export const forgetHostToken = (kind: RepoKind, host: string) =>
+  invoke<void>('forget_host_token', { kind, host });
+
+/** Перечитать дерево. `gitRef` задан — заодно переключить ветку. */
+export const refreshSchemaSource = (id: string, gitRef?: string | null) =>
+  invoke<SchemaSource>('refresh_schema_source', { id, gitRef: gitRef ?? null });
+
+export const deleteSchemaSource = (id: string) =>
+  invoke<void>('delete_schema_source', { id });
+
+/**
+ * Привязывает топик к набору из библиотеки. `entry` пуст — привязка снимается.
+ *
+ * Своих копий файлов у топика после этого не остаётся: два ответа на вопрос
+ * «чем декодировать» — это способ показывать то одно, то другое.
+ */
+export const bindTopicSource = (
+  cluster: string,
+  topic: string,
+  source: string | null,
+  entry: string | null,
+) => invoke<TopicSchema>('bind_topic_source', { cluster, topic, source, entry });
 
 /** Сохраняет выбор из формы: формат тела и основной message. */
 export const saveTopicSchema = (

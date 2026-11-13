@@ -24,6 +24,9 @@ pub struct Pending {
     /// признак едет транзитом, раскладку он не касается никак: и выбранное, и
     /// найденное ложится в каталог одинаково.
     pub auto: bool,
+    /// Текст вставили руками, оригинала на диске нет. См. `SchemaFile::pasted`
+    /// — тоже транзитом: в каталог он ложится ровно так же, как остальные.
+    pub pasted: bool,
 }
 
 impl Pending {
@@ -34,6 +37,22 @@ impl Pending {
             source,
             bytes,
             auto: false,
+            pasted: false,
+        }
+    }
+
+    /// Контракт, текст которого вставили в настройках топика.
+    ///
+    /// `source` пуст НАМЕРЕННО, и это не недосмотр: пустой путь — честный ответ
+    /// на вопрос «откуда файл», а любой непустой был бы выдумкой, по которой
+    /// «перечитать с диска» однажды попыталось бы что-то прочитать.
+    pub fn pasted(name: String, bytes: Vec<u8>) -> Self {
+        Self {
+            name,
+            source: String::new(),
+            bytes,
+            auto: false,
+            pasted: true,
         }
     }
 }
@@ -44,6 +63,7 @@ impl From<&Pending> for SchemaFile {
             name: pending.name.clone(),
             source: pending.source.clone(),
             auto: pending.auto,
+            pasted: pending.pasted,
         }
     }
 }

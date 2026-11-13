@@ -138,25 +138,10 @@ impl Registry {
             return Err("schema registry URL is empty".to_string());
         }
 
-        let tls = match ca_bundle.filter(|p| !p.is_empty()) {
-            Some(path) => ureq::tls::TlsConfig::builder().root_certs(read_roots(path)?),
-            // Системное хранилище, а не подборка Mozilla: корпоративный
-            // TLS-инспектор подписывает свой сертификат внутренним CA, которого
-            // в webpki-roots нет и не будет, а в систему его ставят
-            // централизованно.
-            None => {
-                ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier)
-            }
-        };
-
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
-            // Ответ 404 на «схемы с таким id нет» — это не транспортная ошибка,
-            // а осмысленный ответ, и рассказать о нём надо своими словами. См.
-            // `call`.
-            .http_status_as_error(false)
-            .tls_config(tls.build())
-            .build();
+        // Доверие и потолок ожидания — общие с клиентом GitLab, см.
+        // `schema::http`: оба ходят через один и тот же корпоративный
+        // TLS-инспектор, и два способа настроить доверие расходились бы молча.
+        let agent = super::http::agent(ca_bundle, TIMEOUT)?;
 
         Ok(Self {
             url,
@@ -166,7 +151,7 @@ impl Registry {
                     base64(&format!("{u}:{}", password.unwrap_or("")))
                 )
             }),
-            agent: config.into(),
+            agent,
         })
     }
 
@@ -442,25 +427,6 @@ fn base64(input: &str) -> String {
         }
     }
     out
-}
-
-/// Читает PEM-бандл и оставляет из него сертификаты.
-fn read_roots(path: &str) -> Result<ureq::tls::RootCerts, String> {
-    let pem = std::fs::read(path).map_err(|e| format!("can't read CA bundle {path}: {e}"))?;
-    let mut certs = Vec::new();
-    for item in ureq::tls::parse_pem(&pem) {
-        match item {
-            Ok(ureq::tls::PemItem::Certificate(cert)) => certs.push(cert),
-            // Приватный ключ в бандле корней — не наше дело, но и не ошибка:
-            // такие файлы собирают конкатенацией и кладут в них лишнее.
-            Ok(_) => {}
-            Err(e) => return Err(format!("can't parse CA bundle {path}: {e}")),
-        }
-    }
-    if certs.is_empty() {
-        return Err(format!("{path} contains no certificates"));
-    }
-    Ok(ureq::tls::RootCerts::Specific(std::sync::Arc::new(certs)))
 }
 
 #[cfg(test)]

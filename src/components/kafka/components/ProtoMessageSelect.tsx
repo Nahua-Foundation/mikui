@@ -49,6 +49,13 @@ export function ProtoMessageSelect({
   disabled = false,
   className = 'w-full',
 }: ProtoMessageSelectProps) {
+  // Тексты зашиты обратно: выбором контракта из библиотеки этот компонент
+  // недолго поработал тоже, и ради него подписи были параметрами. Теперь там
+  // стоит `SchemaSetSelect` — список в два уровня, — а здесь остался ровно один
+  // случай, и разводить под него настройки незачем.
+  const placeholder = 'Choose a message';
+  const emptyLabel = 'Load a .proto file first';
+  const searchLabel = 'Search messages…';
   const [open, setOpen] = useState(false);
   const empty = messages.length === 0;
 
@@ -80,7 +87,7 @@ export function ProtoMessageSelect({
           className={`justify-between min-w-0 bg-surface border-edge text-strong font-mono disabled:opacity-50 ${className}`}
         >
           <span className={`truncate ${value ? '' : 'text-dim'}`}>
-            {value ?? (empty ? 'Load a .proto file first' : 'Choose a message')}
+            {value ?? (empty ? emptyLabel : placeholder)}
           </span>
           <ChevronsUpDown className="size-4 shrink-0 opacity-50" />
         </Button>
@@ -93,7 +100,7 @@ export function ProtoMessageSelect({
         className="w-auto min-w-(--radix-popover-trigger-width) max-w-[36rem] p-0 bg-surface border-edge"
       >
         <Command filter={matchesSearch} className="bg-surface">
-          <CommandInput placeholder="Search messages…" className="font-mono text-strong" />
+          <CommandInput placeholder={searchLabel} className="font-mono text-strong" />
           <CommandList>
             <CommandEmpty className="p-3 font-mono text-xs text-dim">Nothing found</CommandEmpty>
             {messages.map((name) => (
