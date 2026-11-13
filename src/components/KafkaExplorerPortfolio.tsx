@@ -128,13 +128,25 @@ export function KafkaExplorerPortfolio() {
   /** Ссылка, принесённая системой. null — окно открыли пунктом в шапке. */
   const [incomingLink, setIncomingLink] = useState<string | null>(null);
   /**
-   * Сообщение, ради которого топик открыли по ссылке, — таблица его подсвечивает.
+   * Сообщение, которое человек сейчас смотрит, — таблица его подсвечивает.
    *
-   * Координатами, а не индексом: индекс живёт до ближайшей смены фильтра или
-   * сортировки, а подсветка переживать их обязана. Гаснет, когда человек сам
-   * доводит до строки курсор, и когда уходит с топика.
+   * Ставится на КАЖДОЕ открытие тела (`showMessageAt`), откуда бы оно ни
+   * пришло: клик по строке, стрелки в окне просмотра, переход по ссылке
+   * `mikui://`. Раньше подсветка была только у третьего случая и гасла, стоило
+   * задеть строку курсором, — это была подсказка «вот она». Теперь это ответ на
+   * другой вопрос: какую из сотни строк ты читаешь сейчас. Поэтому она держится,
+   * пока не откроют другое сообщение, и переживает закрытие окна — закрывают его
+   * как раз затем, чтобы посмотреть на таблицу.
+   *
+   * Координатами, а не индексом строки: индекс живёт до ближайшей смены фильтра
+   * или сортировки, а сообщение от них не перестаёт быть тем, которое открыто.
+   *
+   * Отдельным состоянием, а не полем от `selectedMessage`: то живёт ровно
+   * столько, сколько окно просмотра, и обнулять его при перечитывании топика
+   * нельзя — окно осталось бы с пустым телом. Подсветка же к перечитанной
+   * таблице не относится и гаснуть обязана.
    */
-  const [linkedMessage, setLinkedMessage] = useState<{
+  const [highlightedMessage, setHighlightedMessage] = useState<{
     partition: number;
     offset: number;
   } | null>(null);
@@ -392,6 +404,17 @@ export function KafkaExplorerPortfolio() {
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
   useEffect(() => {
+    // Таблица сейчас наполнится заново, и подсвеченная строка к новому её
+    // содержимому не относится. Гасится именно ЗДЕСЬ, а не у каждого, кто
+    // меняет топик: сюда сходятся все пути — выбор в списке, переход по ссылке,
+    // смена партиций и границ, переподключение под другой учёткой, обычный ↻.
+    // В соседнем топике те же партиция с офсетом — другое сообщение, а после
+    // перечитывания того же топика подсвечивать строку, которой в буфере может
+    // уже и не быть, незачем.
+    //
+    // Стоит до ветки `!selectedTopic` нарочно: закрытие топика — такой же повод.
+    setHighlightedMessage(null);
+
     if (!selectedTopic) {
       setTotal(0);
       setStats(null);
@@ -735,6 +758,15 @@ export function KafkaExplorerPortfolio() {
         if (bodyRequest.current !== ticket || topicRef.current !== topicAtRequest) return;
         setSelectedMessage(message);
         setSelectedIndex(index);
+        // Подсветка ставится здесь, а не у каждого вызывающего: тело открывают
+        // кликом, стрелками и по ссылке, и «подсвечена та строка, которая
+        // открыта» должно быть свойством самого открытия, а не тремя
+        // одинаковыми строчками в трёх местах.
+        //
+        // Координаты берутся из ответа, а не из `index`: по индексу их здесь
+        // неоткуда взять — строки лежат в окнах таблицы, а не тут, — и ответ в
+        // любом случае точнее.
+        setHighlightedMessage({ partition: message.partition, offset: message.offset });
         setIsModalOpen(true);
       })
       .catch((e) => {
@@ -801,10 +833,10 @@ export function KafkaExplorerPortfolio() {
             );
             return;
           }
-          // Подсветка ставится вместе с открытием окна, а не после его
-          // закрытия: закрыть окно можно и мимо кнопки, а найти строку глазами
-          // среди сотни соседей — это ровно то, чего ссылка избавляет.
-          setLinkedMessage({ partition: pending.partition, offset: pending.offset });
+          // Подсветку своей строкой здесь больше не ставим: её ставит само
+          // открытие тела, и для ссылки это ровно то же самое. Найти строку
+          // глазами среди сотни соседей — то, чего ссылка избавляет, — работает
+          // как работало.
           showMessageAt(index);
         })
         .catch((e) => {
@@ -814,10 +846,6 @@ export function KafkaExplorerPortfolio() {
     },
     [showMessageAt],
   );
-
-  /** Стабильный колбэк: иначе каждая перерисовка таблицы меняла бы пропс у
-   *  всех видимых строк и обесценивала их `memo`. */
-  const clearHighlight = useCallback(() => setLinkedMessage(null), []);
 
   const handleConfigClick = useCallback((topic: Topic) => {
     setConfigTopic(topic);
@@ -1272,9 +1300,6 @@ export function KafkaExplorerPortfolio() {
    *  и границ через этот обработчик не идёт и поиск сохранит. */
   const handleSelectTopic = useCallback((topic: Topic | null) => {
     if (topicRef.current !== (topic?.name ?? null)) {
-      // Подсветка принадлежит сообщению того топика, за которым пришли по
-      // ссылке. В соседнем те же партиция с офсетом — другое сообщение.
-      setLinkedMessage(null);
       setSelectedPartitions(null);
       setReadMode((mode) => (mode === 'offset' || mode === 'timestamp' ? 'newest' : mode));
       setRange(EMPTY_RANGE);
@@ -1554,8 +1579,7 @@ export function KafkaExplorerPortfolio() {
                 onStopSearch={handleStopSearch}
                 sort={sort}
                 onSortChange={setSort}
-                highlight={linkedMessage}
-                onHighlightSeen={clearHighlight}
+                highlight={highlightedMessage}
               />
               <StatusBar stats={stats} />
             </>
