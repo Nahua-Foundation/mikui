@@ -23,6 +23,18 @@ interface ProtoMessageSelectProps {
   onChange: (name: string) => void;
   /** Запрет по своей причине — поверх «нечего выбирать». */
   disabled?: boolean;
+  /**
+   * Что написать в триггере, когда выбирать не из чего.
+   *
+   * Параметром, потому что причина у двух мест разная: в форме отправки .proto
+   * и правда надо загрузить, а в настройках топика контракт мог быть задан на
+   * СОСЕДНЕЙ вкладке — и совет «загрузите файл» там был бы неправдой.
+   *
+   * И это не косметика: раньше настройки писали своё объяснение СТРОКОЙ ПОД
+   * селектором, и эта строка была единственным, чем высота блока отличалась от
+   * вкладки к вкладке, — то есть ровно тем, от чего полоска вкладок и прыгала.
+   */
+  emptyLabel?: string;
   /** Классы триггера. Ширину задаёт место, куда его ставят, а не он сам. */
   className?: string;
 }
@@ -47,14 +59,10 @@ export function ProtoMessageSelect({
   value,
   onChange,
   disabled = false,
+  emptyLabel = 'Load a .proto file first',
   className = 'w-full',
 }: ProtoMessageSelectProps) {
-  // Тексты зашиты обратно: выбором контракта из библиотеки этот компонент
-  // недолго поработал тоже, и ради него подписи были параметрами. Теперь там
-  // стоит `SchemaSetSelect` — список в два уровня, — а здесь остался ровно один
-  // случай, и разводить под него настройки незачем.
   const placeholder = 'Choose a message';
-  const emptyLabel = 'Load a .proto file first';
   const searchLabel = 'Search messages…';
   const [open, setOpen] = useState(false);
   const empty = messages.length === 0;

@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '../../ui/button';
-import { ClipboardType, FileText, FolderOpen, Library, RotateCw, Upload, X } from 'lucide-react';
+import { ClipboardType, FileText, FolderOpen, Library, Upload, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Dialog, DialogHeader, DialogTitle } from '../../ui/dialog';
 import { DialogContentNoClose } from '../DialogContentNoClose';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../ui/select';
 import { Label } from '../../ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../../ui/tabs';
 import { AvroSchema } from '../components/AvroSchema';
@@ -17,7 +16,15 @@ import { SchemaSetSelect } from '../components/SchemaSetSelect';
 import { SchemaSourcesModal } from './SchemaSourcesModal';
 import * as api from '../api';
 import { describeError } from '../api';
-import { BodyFormat, SchemaGuess, SourceBinding, SourceView, Topic, TopicSchema } from '../types';
+import {
+  BodyFormat,
+  ProtoPreview,
+  SchemaGuess,
+  SourceBinding,
+  SourceView,
+  Topic,
+  TopicSchema,
+} from '../types';
 
 interface TopicConfigModalProps {
   topic: Topic | null;
@@ -51,33 +58,15 @@ interface TopicConfigModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /**
-   * Схема топика изменилась на диске. Зовётся после КАЖДОЙ удавшейся правки, а
-   * не только по Save: загрузка файла применяется сразу, и если этот топик
-   * открыт, таблица обязана перерисоваться тут же, а не после закрытия окна.
+   * Схема топика изменилась на диске.
+   *
+   * Зовётся по Save — и, кроме него, только из разделов avro и jsonschema, у
+   * которых свои кнопки применения. Протобафная часть окна до Save на диск не
+   * ходит вовсе: в этом и смысл черновика (`Draft`).
    */
   onSchemaChanged?: (topic: string, schema: TopicSchema | null) => void;
 }
 
-/** Все форматы до единого — тот же список, что в шапке (`FormatSelect`).
- *  Формат, выбранный там, но отсутствующий здесь, оставлял бы этот селектор с
- *  пустым триггером: Radix показывает подпись выбранного пункта, а пункта нет. */
-const FORMATS: { value: BodyFormat; label: string }[] = [
-  { value: 'json', label: 'JSON' },
-  { value: 'text', label: 'Text' },
-  { value: 'proto', label: 'Proto' },
-  { value: 'avro', label: 'Avro' },
-  { value: 'jsonschema', label: 'JSON Schema' },
-  { value: 'hex', label: 'Hex' },
-];
-
-/**
- * Какой тип message показать, когда схема приехала с бэкенда.
- *
- * Сохранённый выбор — как есть. Если его нет, а в загруженных .proto объявлен
- * ровно один тип, подставляется он: выбирать там не из чего, а без выбора тела
- * не декодируются вовсе. Когда типов несколько, угадать нельзя — поле остаётся
- * пустым, и тогда его требует `handleSave`.
- */
 /**
  * Откуда топик берёт свой .proto. Три способа, и выбран может быть только один.
  *
@@ -141,6 +130,136 @@ export function settledWithoutLibrary(schema: TopicSchema | null): boolean {
 const CHECK_DELAY_MS = 400;
 
 /**
+ * Контракт, набранный в окне, — по одному на каждый способ его задать.
+ *
+ * Все три живут одновременно, хотя выбран будет один: переключиться на соседнюю
+ * вкладку посмотреть и вернуться — обычное дело, и набранный текст на этом
+ * теряться не должен.
+ */
+export interface Draft {
+  /** «Paste text»: текст в поле. */
+  text: string;
+  /** «Local files»: пути, выбранные в диалоге. Доисканные по импортам сюда не
+   *  попадают — их находит разбор, и приезжают они в `ProtoPreview.files`. */
+  paths: string[];
+  /** «Library»: выбранный контракт. */
+  binding: SourceBinding | null;
+}
+
+const EMPTY_DRAFT: Draft = { text: '', paths: [], binding: null };
+
+/**
+ * Задан ли контракт на этой вкладке.
+ *
+ * От него зависит и то, можно ли сохранять, и то, показывать ли селектор типа:
+ * у пустой вкладки отвечать на вопрос «чем читать» нечем.
+ */
+export function draftFilled(mode: ProtoMode, draft: Draft): boolean {
+  if (mode === 'paste') return draft.text.trim().length > 0;
+  if (mode === 'files') return draft.paths.length > 0;
+  return draft.binding !== null;
+}
+
+/**
+ * Совпадает ли черновик с тем, что у топика уже сохранено.
+ *
+ * Нужно ради одного: у такого черновика разбор УЖЕ известен — он приехал вместе
+ * со схемой, — и спрашивать его у бэкенда заново незачем. Открытие настроек
+ * настроенного топика от этого не стоит ни одного запроса.
+ *
+ * Сравнение по тому, чем контракт задан, а не по его содержимому: текст сверяем
+ * посимвольно, файлы — списком исходных путей (в том же порядке, в каком их
+ * хранит схема), привязку — парой «источник плюс входной файл».
+ */
+export function draftMatchesSchema(
+  mode: ProtoMode,
+  draft: Draft,
+  schema: TopicSchema | null,
+): boolean {
+  if (!schema || modeFromSchema(schema) !== mode) return false;
+  if (mode === 'paste') return draft.text === (schema.pasted_text ?? '');
+  if (mode === 'files') {
+    const stored = pickedPathsOf(schema);
+    return (
+      draft.paths.length === stored.length && draft.paths.every((p, i) => p === stored[i])
+    );
+  }
+  return (
+    draft.binding !== null &&
+    draft.binding.source === schema.source?.source &&
+    draft.binding.entry === schema.source?.entry
+  );
+}
+
+/**
+ * Исходные пути файлов, выбранных руками.
+ *
+ * Доисканные по импортам (`auto`) не в счёт и вставленный текст тоже: у первых
+ * нет самостоятельного выбора, у второго нет оригинала на диске. Это ровно тот
+ * список, который сохранение отдаёт обратно бэкенду, — он доищет импорты сам,
+ * как делал и при первой загрузке.
+ */
+export function pickedPathsOf(schema: TopicSchema | null): string[] {
+  return (schema?.files ?? [])
+    .filter((file) => !file.auto && !file.pasted && file.source)
+    .map((file) => file.source);
+}
+
+/**
+ * Черновик по сохранённой схеме: открыть настройки значит увидеть действующий
+ * контракт, а не чистый лист.
+ *
+ * Заполнена при этом ровно одна вкладка — та, которой топик настроен: контракт
+ * у него один, и показывать его копию в двух местах значило бы предлагать выбор,
+ * которого нет.
+ */
+export function draftFromSchema(schema: TopicSchema | null): Draft {
+  const mode = modeFromSchema(schema);
+  if (!schema || !mode) return EMPTY_DRAFT;
+  if (mode === 'paste') return { ...EMPTY_DRAFT, text: schema.pasted_text ?? '' };
+  if (mode === 'files') return { ...EMPTY_DRAFT, paths: pickedPathsOf(schema) };
+  return { ...EMPTY_DRAFT, binding: schema.source };
+}
+
+/**
+ * Разбор сохранённого контракта — тот, что приехал вместе со схемой.
+ *
+ * Спрашивать его у бэкенда заново незачем: `TopicSchemaView` уже несёт и список
+ * типов, и корень, и список файлов, причём посчитанные тем же разбором. Поэтому
+ * открытие настроек настроенного топика не стоит ни одного запроса — а стоило
+ * бы трёх, считай мы черновик «изменением», которое надо проверить.
+ *
+ * `null` — топик не настроен ничем, и разбирать нечего.
+ */
+export function previewFromSchema(schema: TopicSchema | null): ProtoPreview | null {
+  if (!schema || !modeFromSchema(schema)) return null;
+  return {
+    files: schema.files,
+    messages: schema.messages,
+    root: schema.root,
+  };
+}
+
+/**
+ * Чем заполнить селектор типа, когда разбор контракта обновился.
+ *
+ * Прежний выбор сохраняется, если он в новом наборе есть: человек мог выбрать
+ * вложенный тип намеренно, и перебивать его правилом корня нельзя. Иначе —
+ * корень набора, а его-то обычно и хватает: на настоящих контрактах правило
+ * корня совпало с назначенным вручную 14 раз из 14. Нет корня, а тип один —
+ * берём единственный: выбирать не из чего.
+ */
+export function messageFor(
+  preview: ProtoPreview | null,
+  chosen: string | null,
+): string | null {
+  const messages = preview?.messages ?? [];
+  if (chosen && messages.includes(chosen)) return chosen;
+  if (preview?.root) return preview.root;
+  return messages.length === 1 ? messages[0] : null;
+}
+
+/**
  * Вид вкладки.
  *
  * Поверх shadcn-овского `TabsTrigger`, у которого свои цвета и скругления:
@@ -152,38 +271,120 @@ const CHECK_DELAY_MS = 400;
 const TAB_CLASS =
   // `min-w-0` — та же страховка, что у кнопок выбора источника: подпись не
   // должна иметь права раздвинуть полоску вкладок шире окна настроек.
-  'min-w-0 font-mono text-xs rounded border border-transparent px-2 py-1.5 text-dim hover:text-soft ' +
+  //
+  // `cursor-pointer` — своим: у базового `TabsTrigger` курсор остаётся
+  // стрелкой, то есть вкладка не выглядит нажимаемой, хотя она кнопка. В
+  // остальном окне кнопки его ставят поимённо (`cursor-pointer` у каждой), так
+  // что общего правила, которое бы сюда дотянулось, в проекте нет.
+  'min-w-0 cursor-pointer font-mono text-xs rounded border border-transparent px-2 py-1.5 text-dim hover:text-soft ' +
   'data-[state=active]:bg-surface data-[state=active]:border-edge ' +
   'data-[state=active]:text-strong dark:data-[state=active]:text-strong';
 
+/**
+ * Высота панели под вкладками — одна на все три.
+ *
+ * Без неё окно меняло размер на каждое переключение, причём по-разному: между
+ * «Local files» и «Library» расходились единицы пикселей (список файлов против
+ * поля выбора), а «Paste text» был выше остальных сразу на полторы сотни.
+ * А поскольку модальное окно выровнено по центру экрана, любая смена высоты
+ * двигает и его ВЕРХ — то есть саму полоску вкладок, по которой в этот момент
+ * и целятся.
+ *
+ * Задают её две вкладки вровень. «Paste text»: 8 (`pt-2`) + 226 (поле с рамкой;
+ * `h-56` — ровно столько занимает заготовка из восьми строк при `leading-6`
+ * плюс отступы, и ужать его значило бы её обрезать) + 8 + 16 (строка
+ * состояния) = 258. «Local files» с полным списком: 8 + 14 (подпись) + 8 + 160
+ * (`max-h-40`) + 8 + 36 (кнопка `h-9`) + 8 + 13 (подсказка) + 8 + 16 = 279.
+ * Отсюда 288 — с небольшим запасом на случай, если арифметика где-то на пиксель
+ * врёт.
+ *
+ * Цена — пустое место под содержимым «Library»: там всего подпись, поле выбора
+ * и кнопка. Это осознанный размен: неподвижное окно стоит дороже плотной
+ * вёрстки, потому что по вкладкам ходят, а в пустоту — нет.
+ */
+const TAB_PANEL_CLASS = 'space-y-2 pt-2 min-h-[288px]';
+
 /** Заготовка в пустом поле: из неё видно и что вставлять, и что ждут именно
- *  текст контракта, а не путь к нему. */
+ *  текст контракта, а не путь к нему.
+ *
+ *  Нарочно безотносительно какой-либо предметной области: заготовка стоит перед
+ *  глазами у каждого, кто открыл вкладку, и выдуманные заявки из неё читались бы
+ *  как намёк, что приложение про них. Восемь строк — это ещё и ровно та высота,
+ *  на которую рассчитано поле (см. `TAB_PANEL_CLASS`). */
 const PASTE_PLACEHOLDER = `syntax = "proto3";
 
-package orders;
+package events;
 
-message OrderChanged {
-  string id = 1;
-  int64 at = 2;
+message Event {
+  string event_uid = 1;
+  int64 event_ts = 2;
 }`;
+
+/**
+ * Что сказал разбор черновика. Одна строка под содержимым вкладки.
+ *
+ * Стоит ПОД полем, а не между полем и кнопкой: кнопки у вкладки больше нет, и
+ * появление строки больше ничего не двигает. Раньше под неё приходилось держать
+ * пустое место — иначе «checking…» на каждое затишье в наборе текста толкало
+ * кнопку и всё окно.
+ *
+ * Порядок проверок — от срочного к приятному: сперва причина отказа, потом
+ * признак, что разбор идёт, потом подтверждение, что это и есть действующий
+ * контракт, и только потом — сколько типов нашлось. Последнее не украшение:
+ * иначе про успешный разбор не видно вообще ничего, и непонятно, почему вдруг
+ * ожил селектор типа.
+ */
+function DraftStatus({
+  error,
+  checking,
+  preview,
+  saved,
+}: {
+  error: string | null;
+  checking: boolean;
+  preview: ProtoPreview | null;
+  saved: boolean;
+}) {
+  if (error) {
+    return (
+      <div className="font-mono text-xs text-danger break-words whitespace-pre-wrap">{error}</div>
+    );
+  }
+  if (checking) return <div className="font-mono text-xs text-dim">checking…</div>;
+  if (!preview) return null;
+  if (saved) {
+    return (
+      <div className="font-mono text-xs text-dim">This is the contract the topic is read by.</div>
+    );
+  }
+  const count = preview.messages.length;
+  return (
+    <div className="font-mono text-xs text-dim">
+      Parsed — {count} message {count === 1 ? 'type' : 'types'}. Save to read the topic by it.
+    </div>
+  );
+}
 
 /**
  * Что стоит на месте формы, пока схема топика не приехала.
  *
- * Заготовка повторяет расстановку настоящей формы — подпись, поле под ней, блок
- * ниже, — чтобы приехавшая форма встала на то же место, а не подвинула окно.
+ * Заготовка повторяет расстановку той формы, которая и приедет: полоска вкладок
+ * и панель под ней той же высоты (`TAB_PANEL_CLASS`), — чтобы форма встала на то
+ * же место, а не подвинула окно.
+ *
+ * Видно её ровно в одном случае: у protobuf-топика, не настроенного ничем, —
+ * там вкладку решает библиотека, и до её ответа показывать нечего. Всем
+ * остальным форма достаётся готовой из схемы открытого топика
+ * (`openTopicSchema`), и ждать им нечего вовсе.
  *
  * Своя, а не `ui/skeleton`: тот красится в `bg-accent`, то есть мимо палитры
  * этих окон (`surface`/`sunken`/`edge`), и в тёмной теме светится.
  */
 function Waiting() {
   return (
-    <div className="space-y-6 min-w-0" aria-hidden>
-      <div className="space-y-2">
-        <div className="h-4 w-28 rounded bg-edge animate-pulse" />
-        <div className="h-9 rounded border border-edge bg-sunken animate-pulse" />
-      </div>
-      <div className="h-24 rounded border border-edge bg-sunken animate-pulse" />
+    <div className="space-y-2 min-w-0" aria-hidden>
+      <div className="h-9 rounded border border-edge bg-sunken animate-pulse" />
+      <div className="min-h-[288px] rounded border border-edge bg-sunken animate-pulse" />
     </div>
   );
 }
@@ -230,12 +431,34 @@ export function TopicConfigModal({
   const [sourcesOpen, setSourcesOpen] = useState(false);
   /** Какой из трёх способов задать контракт сейчас открыт. */
   const [mode, setMode] = useState<ProtoMode>('paste');
-  /** Текст контракта во вкладке «Paste text» — то, что в поле, а не то, что
-   *  применено: применённое лежит в `schema.pasted_text`. */
-  const [text, setText] = useState('');
-  /** Чем плох текст в поле. null — разобрался либо ещё не проверяли. */
-  const [textError, setTextError] = useState<string | null>(null);
-  /** Проверка текста идёт прямо сейчас. */
+  /**
+   * Контракт, НАБРАННЫЙ в окне и ещё не сохранённый.
+   *
+   * Это и есть то, чем окно отличается от прежнего: раньше каждый способ
+   * применялся сразу — вставка кнопкой, файлы диалогом, контракт библиотеки
+   * щелчком по списку, — и к моменту, когда человек доходил до Save, на диске
+   * уже лежало всё, кроме выбранного типа. Cancel при этом не отменял ничего.
+   * Теперь на диск не уходит ничто, пока не нажат Save.
+   *
+   * Свой у каждой вкладки, а не один на все: переключиться посмотреть и
+   * вернуться — обычное дело, и терять на этом набранный текст незачем. Выбран
+   * при сохранении будет тот, чья вкладка открыта, — три способа
+   * взаимоисключающи, и это свойство никуда не делось.
+   */
+  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
+  /**
+   * Что дал разбор контракта ОТКРЫТОЙ вкладки. `null` — разбирать нечего либо
+   * не разобралось.
+   *
+   * Отсюда берётся список типов для селектора «чем читать» — и только отсюда.
+   * Раньше он брался из схемы топика, и это было видно глазами: стоишь на
+   * пустой вкладке «Paste text», а в селекторе предлагаются типы из контракта,
+   * привязанного через библиотеку.
+   */
+  const [preview, setPreview] = useState<ProtoPreview | null>(null);
+  /** Чем плох контракт на открытой вкладке. null — разобрался либо пусто. */
+  const [draftError, setDraftError] = useState<string | null>(null);
+  /** Разбор идёт прямо сейчас. */
   const [checking, setChecking] = useState(false);
   /**
    * Про какую пару кластер-топик на экране стоит ответ.
@@ -304,11 +527,13 @@ export function TopicConfigModal({
         : null;
     setSchema(seed);
     setFormat(seed?.format ?? 'json');
-    setMessage(chooseMessage(seed));
-    // В поле — то, что применено. Пусто у топика, настроенного иначе: текст от
-    // ПРОШЛОГО топика в нём был бы приглашением применить чужой контракт.
-    setText(seed?.pasted_text ?? '');
-    setTextError(null);
+    // Черновик заводится из того, чем топик настроен: открыть настройки значит
+    // увидеть действующий контракт, а не чистый лист. Соседние вкладки при этом
+    // пусты — контракт у топика один.
+    setDraft(draftFromSchema(seed));
+    setPreview(previewFromSchema(seed));
+    setMessage(seed?.message ?? null);
+    setDraftError(null);
     // Подбор относится к паре кластер-топик и к тому, что лежало в буфере в
     // момент нажатия: показывать его на следующем топике значило бы предлагать
     // ответ, посчитанный по чужим телам.
@@ -341,9 +566,10 @@ export function TopicConfigModal({
 
       setSchema(loaded);
       setFormat(loaded?.format ?? 'json');
-      setMessage(chooseMessage(loaded));
-      setText(loaded?.pasted_text ?? '');
-      setTextError(null);
+      setDraft(draftFromSchema(loaded));
+      setPreview(previewFromSchema(loaded));
+      setMessage(loaded?.message ?? null);
+      setDraftError(null);
       if (loaded?.error) {
         toast.error(`Schema of ${topicName} is broken: ${loaded.error}`);
       }
@@ -371,33 +597,21 @@ export function TopicConfigModal({
   }, [open, cluster, topicName, loadSources]);
 
   /**
-   * Формат переключили прямо здесь — и если это proto, вкладке «Library»
-   * отвечать пока нечем: чтение выше за библиотекой не ходило, топик был
-   * другого формата.
+   * Разбор черновика открытой вкладки — то, на чём держится вся форма.
    *
-   * Отдельным эффектом «когда формат стал proto, а библиотеки нет» это делать
-   * нельзя: при открытии настроек протобафного топика он сработал бы заодно с
-   * чтением, и за списком ушли бы ДВА запроса сразу — а первый после
-   * перезабора дерева стоит полторы секунды, и параллельно их было бы два.
-   * Селектор — единственное место, где формат становится proto без участия
-   * чтения: кнопки загрузки и вставки живут внутри самой вкладки, то есть при
-   * уже протобафном формате.
-   */
-  const handleFormatPick = useCallback(
-    (picked: BodyFormat) => {
-      setFormat(picked);
-      if (picked === 'proto' && !sourcesLoaded) void loadSources();
-    },
-    [sourcesLoaded, loadSources],
-  );
-
-  /**
-   * Разбор текста, пока он ещё в поле.
+   * Он отвечает сразу на три вопроса: разбирается ли контракт (иначе Save
+   * выключен и под полем стоит причина), какие типы в нём объявлены (ими
+   * заполняется селектор) и какие файлы доискались по импортам. Раньше ответ на
+   * второй и третий давало только ПРИМЕНЕНИЕ — отсюда и бралась кнопка «Apply
+   * contract», и невозможность отменить сделанное.
    *
-   * Про ошибку в контракте человек должен узнать до того, как настройки топика
-   * им заменены, — и до того, как он потянется к кнопке. Разбор тот же самый,
-   * что и у применения (`check_proto_text` и `add_proto_text` зовут одно и то
-   * же), поэтому ответ здесь не приближение, а именно то, что скажет Apply.
+   * Разбор тот же самый, что у сохранения: `check_proto_*` и `add_proto_*`
+   * зовут одно и то же. Поэтому ответ здесь не приближение, а ровно то, что
+   * скажет Save.
+   *
+   * Чего он НЕ делает: не ходит на бэкенд за тем, что уже известно. Черновик,
+   * совпадающий с сохранённой схемой, разобран вместе с ней — у настроенного
+   * топика открытие настроек не стоит ни одного запроса.
    *
    * Гонка ответов разрешается счётчиком: отпущенная клавиша отменяет ожидание,
    * но не уже улетевший запрос, и ответ на прежний текст обязан не перебить
@@ -405,44 +619,65 @@ export function TopicConfigModal({
    */
   const checkSeq = useRef(0);
   useEffect(() => {
-    if (!open || mode !== 'paste') return;
-    const trimmed = text.trim();
-    if (!trimmed) {
-      setTextError(null);
-      setChecking(false);
-      return;
-    }
-    // Применённый текст уже разобран — иначе он бы не применился. Проверять его
-    // заново при каждом открытии окна значит ходить на бэкенд за ответом,
-    // который и так известен.
-    if (schema?.pasted_text === text) {
-      setTextError(null);
+    if (!open || !ready) return;
+
+    // Пусто — разбирать нечего, и это не ошибка: вкладку могли просто открыть
+    // посмотреть.
+    if (!draftFilled(mode, draft)) {
+      ++checkSeq.current;
+      setPreview(null);
+      setDraftError(null);
       setChecking(false);
       return;
     }
 
-    // Прежний ответ относился к прежнему тексту и с этого мгновения не значит
-    // ничего. Оставить его на экране значило бы показывать ошибку в строке,
-    // которую только что исправили, — и держать `Apply` выключенным из-за неё.
-    setTextError(null);
+    if (draftMatchesSchema(mode, draft, schema)) {
+      ++checkSeq.current;
+      setPreview(previewFromSchema(schema));
+      setDraftError(null);
+      setChecking(false);
+      return;
+    }
+
+    // Прежний ответ относился к прежнему черновику и с этого мгновения не
+    // значит ничего. Оставить его на экране значило бы показывать ошибку в
+    // строке, которую только что исправили, — и держать Save выключенным из-за
+    // неё.
+    setDraftError(null);
     setChecking(true);
     const seq = ++checkSeq.current;
+    const settle = (next: ProtoPreview | null, error: string | null) => {
+      if (seq !== checkSeq.current) return;
+      setPreview(next);
+      setDraftError(error);
+      setChecking(false);
+      // Тип выбирается по НОВОМУ набору: прежний остаётся, только если он в нём
+      // есть, иначе его подставляет корень. Считается здесь, а не отдельным
+      // эффектом по `preview`, чтобы выбор и набор менялись одним шагом.
+      setMessage((chosen) => messageFor(next, chosen));
+    };
+
+    // Только текст набирают по буквам — у файлов и привязки задержка ни от чего
+    // не спасает, а ощущается как задумчивость.
+    const delay = mode === 'paste' ? CHECK_DELAY_MS : 0;
     const timer = setTimeout(() => {
-      api
-        .checkProtoText(text)
-        .then(() => {
-          if (seq === checkSeq.current) setTextError(null);
-        })
-        .catch((e) => {
-          if (seq === checkSeq.current) setTextError(describeError(e));
-        })
-        .finally(() => {
-          if (seq === checkSeq.current) setChecking(false);
-        });
-    }, CHECK_DELAY_MS);
+      const checking =
+        mode === 'paste'
+          ? api.checkProtoText(draft.text)
+          : mode === 'files'
+            ? api.checkProtoFiles(draft.paths)
+            : api.checkSchemaSet(draft.binding!.source, draft.binding!.entry);
+      checking
+        .then((parsed) => settle(parsed, null))
+        .catch((e) => settle(null, describeError(e)));
+    }, delay);
 
     return () => clearTimeout(timer);
-  }, [open, mode, text, schema?.pasted_text]);
+    // `sources` в зависимостях нарочно: набор из библиотеки мог только что
+    // появиться или быть перезабран, и его разбор от этого меняется. Лишним это
+    // не выходит — у совпадающего с сохранённым черновика ветка выше обрывает
+    // эффект, не дойдя до запроса.
+  }, [open, ready, mode, draft, schema, sources]);
 
   /**
    * Этому топику есть по чему подбирать: его тела и лежат в буфере воркера.
@@ -453,20 +688,20 @@ export function TopicConfigModal({
   const isOpenTopic = !!topicName && topicName === openTopic;
 
   /**
-   * Общий хвост всех операций над файлами. Успех виден сразу: и в форме, и в
-   * уже открытой таблице. Неудача не меняет ничего — на диске бэкенд её тоже
-   * не применил.
+   * Общий хвост операций разделов avro и jsonschema — единственных, что ещё
+   * применяются сразу, своими кнопками. Протобафная часть окна сюда не ходит:
+   * у неё черновик, и применяет его Save.
+   *
+   * Успех виден сразу: и в форме, и в уже открытой таблице. Неудача не меняет
+   * ничего — на диске бэкенд её тоже не применил.
    */
   const applySchema = useCallback(
     async (
       action: () => Promise<TopicSchema | null>,
-      // Функцией, а не строкой, ради одного случая: загрузка .proto может
+      // Функцией, а не строкой, ради одного случая: загрузка схемы может
       // подтянуть файлы, которых пользователь не выбирал, и сказать об этом
       // можно только по результату.
       success: string | ((updated: TopicSchema | null) => string),
-      // Что получилось — вызывающему: привязке набора надо знать, проставился
-      // ли тип правилом корня, чтобы при отрицательном ответе добрать его
-      // подбором по телам.
     ): Promise<{ ok: boolean; message: string | null }> => {
       if (!cluster || !topicName) return { ok: false, message: null };
       setBusy(true);
@@ -474,15 +709,8 @@ export function TopicConfigModal({
         const updated = await action();
         setSchema(updated);
         setFormat(updated?.format ?? 'json');
-        // Файл только что загрузили — если тип в нём один, он и выбран.
         const chosen = chooseMessage(updated);
         setMessage(chosen);
-        // В поле — ровно то, что применено. Любая операция здесь меняет ответ
-        // на вопрос «чем декодировать», и если новый ответ — не вставленный
-        // текст, то и поле обязано опустеть: текст в нём иначе выглядел бы
-        // действующим контрактом, хотя топик читается уже не им.
-        setText(updated?.pasted_text ?? '');
-        setTextError(null);
         onSchemaChanged?.(topicName, updated);
         toast.success(typeof success === 'string' ? success : success(updated));
         return { ok: true, message: chosen };
@@ -506,10 +734,11 @@ export function TopicConfigModal({
    * сию секунду, без Save. По той же причине об этом говорится наружу: открытая
    * таблица обязана перерисоваться.
    *
-   * Чего здесь намеренно НЕ делается — не трогается `format`. Его в этой форме
-   * могли только что переключить и ещё не сохранить, и подставить сюда значение
-   * с диска значило бы отменить несохранённый выбор в ответ на действие, к
-   * формату не относящееся вовсе.
+   * Чего здесь намеренно НЕ делается — не трогается НАБРАННОЕ: ни формат, ни
+   * выбранный контракт, ни тип. Всё это могли выбрать минуту назад и ещё не
+   * сохранить, а поход за источником к ним не относится вовсе. Разбор
+   * выбранного контракта пересчитается сам — список источников у его эффекта в
+   * зависимостях.
    */
   const handleSourcesChanged = useCallback(async () => {
     await loadSources();
@@ -517,19 +746,21 @@ export function TopicConfigModal({
     try {
       const reloaded = await api.getTopicSchema(cluster, topicName);
       setSchema(reloaded);
-      // С выбором типа так же, как с форматом: он может быть несохранённым, и
-      // если он всё ещё есть среди объявленных, он и остаётся. `chooseMessage`
-      // отвечает на это сам — надо только подсунуть ему не сохранённый выбор, а
-      // тот, что стоит в форме.
-      setMessage(chooseMessage(reloaded && { ...reloaded, message }));
       onSchemaChanged?.(topicName, reloaded);
     } catch (e) {
       console.error('Failed to re-read the topic schema', e);
     }
-  }, [cluster, topicName, message, onSchemaChanged, loadSources]);
+  }, [cluster, topicName, onSchemaChanged, loadSources]);
 
-  const handleLoadFiles = useCallback(async () => {
-    if (!cluster || !topicName) return;
+  /**
+   * Выбрать .proto в диалоге — и только. На диск ничего не уходит: выбранные
+   * пути ложатся в черновик, а разбор следом скажет, что в них объявлено и
+   * какие файлы доискались по импортам.
+   *
+   * Выбрать повторно — значит заменить набор, а не дополнить его: диалог
+   * показывает ровно то, что человек считает контрактом этого топика.
+   */
+  const handlePickFiles = useCallback(async () => {
     let picked: string | string[] | null;
     try {
       picked = await openFileDialog({
@@ -544,76 +775,16 @@ export function TopicConfigModal({
 
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
     if (paths.length === 0) return;
+    setDraft((current) => ({ ...current, paths }));
+  }, []);
 
-    await applySchema(
-      () => api.addProtoFiles(cluster, topicName, paths),
-      (updated) => {
-        const loaded = `Loaded ${paths.length} .proto file${paths.length > 1 ? 's' : ''}`;
-        // Подтянутое по импорту стоит назвать числом: пользователь выбрал один
-        // файл, а в списке их стало шесть, и молчать об этом незачем.
-        const pulled = (updated?.files ?? []).filter((f) => f.auto).length;
-        return pulled > 0
-          ? `${loaded}, ${pulled} more pulled in by imports`
-          : loaded;
-      },
-    );
-  }, [cluster, topicName, applySchema]);
-
-  /**
-   * Сделать контрактом топика то, что набрано в поле.
-   *
-   * Применяется сразу, как и загрузка файлов, а не по общей кнопке Save: Save
-   * сохраняет ВЫБОР (формат и тип), а это — сама схема, и разбирается она на
-   * бэкенде. Невалидный текст при этом не сохраняется вовсе: отказ приходит
-   * оттуда же, откуда и предварительная проверка, и схема, которая работала,
-   * остаётся работать.
-   */
-  const handleApplyText = useCallback(async () => {
-    if (!cluster || !topicName) return;
-    setBusy(true);
-    try {
-      const updated = await api.addProtoText(cluster, topicName, text);
-      setSchema(updated);
-      setFormat(updated.format);
-      setMessage(chooseMessage(updated));
-      setText(updated.pasted_text ?? text);
-      setTextError(null);
-      onSchemaChanged?.(topicName, updated);
-      const count = updated.messages.length;
-      toast.success(
-        count === 1
-          ? `Applied the pasted contract — ${updated.messages[0]}`
-          : `Applied the pasted contract — ${count} message types`,
-      );
-    } catch (e) {
-      // Своим путём, не через `applySchema`: тот сообщает об отказе тостом, а
-      // тост уходит — текст же остаётся в поле, и править его будут здесь же.
-      // Причина обязана остаться рядом с тем, к чему относится.
-      console.error('Failed to apply the pasted contract', e);
-      setTextError(describeError(e));
-    } finally {
-      setBusy(false);
-    }
-  }, [cluster, topicName, text, onSchemaChanged]);
-
-  const handleRefresh = useCallback(
-    (name?: string) => {
-      if (!cluster || !topicName) return;
-      void applySchema(
-        () => api.refreshProtoFiles(cluster, topicName, name),
-        name ? `Re-read ${name}` : 'Re-read all .proto files',
-      );
-    },
-    [cluster, topicName, applySchema],
-  );
-
-  const handleRemove = useCallback(
-    (name: string) => {
-      if (!cluster || !topicName) return;
-      void applySchema(() => api.removeProtoFile(cluster, topicName, name), `Removed ${name}`);
-    },
-    [cluster, topicName, applySchema],
-  );
+  /** Убрать файл из набора. Правка черновика — с диска ничего не исчезает. */
+  const handleDropFile = useCallback((path: string) => {
+    setDraft((current) => ({
+      ...current,
+      paths: current.paths.filter((have) => have !== path),
+    }));
+  }, []);
 
   /**
    * Подобрать тип по телам топика.
@@ -699,62 +870,78 @@ export function TopicConfigModal({
    * Стоит ПОСЛЕ `runGuess` не из эстетики: он у неё в зависимостях, и объявлен
    * он должен быть раньше.
    */
-  const handleBind = useCallback(
-    async (binding: SourceBinding | null) => {
-      if (!cluster || !topicName) return;
-      const applied = await applySchema(
-        () => api.bindTopicSource(cluster, topicName, binding?.source ?? null, binding?.entry ?? null),
-        binding ? `Bound to ${binding.entry}` : 'Unbound from the library',
-      );
+  /** Выбрать контракт в библиотеке — правка черновика. Разбор следом скажет,
+   *  какие в нём типы; на диск он уйдёт по Save. */
+  const handlePickSet = useCallback((binding: SourceBinding | null) => {
+    setDraft((current) => ({ ...current, binding }));
+  }, []);
 
-      // Корень набора тип уже проставил — больше спрашивать нечего, и ходить за
-      // телами незачем. А вот когда корня НЕТ (их несколько или ни одного),
-      // выбор остаётся висеть пустым, и единственный, кто может на него
-      // ответить, — сами байты топика.
-      //
-      // Делается это сразу, а не ждёт нажатия: человек выбрал контракт затем,
-      // чтобы топик читался, и отдельная кнопка между выбором и результатом —
-      // это работа, которую приложение умеет сделать само. Тел оно при этом в
-      // Kafka не запрашивает: подбор смотрит в буфер воркера, то есть в уже
-      // прочитанное — на кластере с квотой подсказка не имеет права стоить
-      // столько же, сколько сам топик. Оттуда же и условие `isOpenTopic`: у
-      // закрытого топика буфера нет, и спрашивать не у чего.
-      if (applied.ok && binding && !applied.message && isOpenTopic) {
-        await runGuess(true);
-      }
-    },
-    [cluster, topicName, applySchema, isOpenTopic, runGuess],
-  );
-
+  /**
+   * Применить всё разом — и это единственное место, где настройки топика
+   * меняются на диске.
+   *
+   * Порядок важен: сперва контракт, потом выбранный тип. Контракт бэкенд
+   * применяет и проверяет одним действием, и если он не разобрался, схема,
+   * которая работала, остаётся работать — а тип записывать уже не по чему.
+   *
+   * Контракт не трогается вовсе, когда он совпадает с сохранённым: пришли
+   * поменять один тип — значит меняется один тип, и пересобирать ради этого
+   * каталог файлов незачем.
+   */
   const handleSave = useCallback(async () => {
     if (!cluster || !topicName) return;
     setBusy(true);
     try {
+      if (!draftMatchesSchema(mode, draft, schema)) {
+        if (mode === 'paste') {
+          await api.addProtoText(cluster, topicName, draft.text);
+        } else if (mode === 'files') {
+          await api.addProtoFiles(cluster, topicName, draft.paths);
+        } else {
+          await api.bindTopicSource(
+            cluster,
+            topicName,
+            draft.binding?.source ?? null,
+            draft.binding?.entry ?? null,
+          );
+        }
+      }
       const saved = await api.saveTopicSchema(cluster, topicName, format, message);
       onSchemaChanged?.(topicName, saved);
       toast.success(`Settings saved for ${topicName}`);
       onOpenChange(false);
     } catch (e) {
       console.error('Failed to save topic settings', e);
+      // Тостом, а не строкой под полем: причина почти всегда не в самом
+      // контракте — его разбор к этому моменту уже удался, — а в том, что файл
+      // исчез с диска или каталог не записывается.
       toast.error(describeError(e));
     } finally {
       setBusy(false);
     }
-  }, [cluster, topicName, format, message, onSchemaChanged, onOpenChange]);
+  }, [cluster, topicName, mode, draft, schema, format, message, onSchemaChanged, onOpenChange]);
 
   if (!topic) return null;
 
-  const files = schema?.files ?? [];
-  const messages = schema?.messages ?? [];
   /**
-   * Файлы, которые показывает вкладка «Local files».
+   * Типы, из которых выбирают, — РАЗБОР ОТКРЫТОЙ ВКЛАДКИ, а не схема топика.
+   *
+   * Разница видна глазами, и ровно на неё и жаловались: стоишь на пустой
+   * вкладке «Paste text», а селектор предлагает типы из контракта, привязанного
+   * через библиотеку, — то есть обещает выбор, который к этой вкладке не
+   * относится никак.
+   */
+  const messages = preview?.messages ?? [];
+  /**
+   * Файлы, которые показывает вкладка «Local files»: выбранные плюс доисканные
+   * по импортам — так их вернул разбор.
    *
    * Вставленный текст из списка убран: файл он и есть файл, но строки «откуда
-   * взяли» у него нет и быть не может, а кнопки ↻ и × относились бы к тому,
-   * чего на диске не существует. Видно его во вкладке «Paste text», и видно
-   * тем, чем он является, — текстом.
+   * взяли» у него нет и быть не может, а кнопка × относилась бы к тому, чего на
+   * диске не существует. Видно его во вкладке «Paste text», и видно тем, чем он
+   * является, — текстом.
    */
-  const picked = files.filter((file) => !file.pasted);
+  const picked = (mode === 'files' ? (preview?.files ?? []) : []).filter((file) => !file.pasted);
 
   /**
    * Сколько контрактов библиотеки вообще можно выбрать.
@@ -784,7 +971,8 @@ export function TopicConfigModal({
     (total, source) => total + source.sets.filter((set) => set.error).length,
     0,
   );
-  const bound = schema?.source ?? null;
+  /** Что выбрано в выпадающем списке контрактов — черновик, а не схема. */
+  const bound = draft.binding;
   /**
    * В библиотеке есть на что отвечать выпадающему списку.
    *
@@ -794,7 +982,7 @@ export function TopicConfigModal({
    */
   const hasLibrary = usableSets > 0 || !!bound || brokenSets > 0;
   /**
-   * Привязка указывает на набор, который в библиотеке ЕСТЬ и разбирается.
+   * Выбранный контракт в библиотеке ЕСТЬ и разбирается.
    *
    * `null` — за библиотекой ещё не сходили, и судить не о чем. Третье состояние
    * здесь не из любви к ним: привязанный топик форма показывает, не дожидаясь
@@ -811,24 +999,80 @@ export function TopicConfigModal({
           source.sets.some((set) => set.entry === bound.entry && !set.error),
       );
 
+  /** На открытой вкладке контракт задан — значит есть чем читать топик и есть
+   *  что сохранять. */
+  const filled = draftFilled(mode, draft);
+  /** Черновик совпадает с тем, что сохранено. Нужно подбору: декодер он строит
+   *  по схеме с диска, а не по набранному здесь. */
+  const savedContract = draftMatchesSchema(mode, draft, schema);
+
   /**
-   * Типов объявлено несколько, а выбор не сделан.
+   * Чего не хватает, чтобы сохранять.
    *
-   * Сохранять такую настройку незачем: без типа protobuf-тело не разобрать —
-   * в .proto нет ничего, что сказало бы, каким из объявленных сообщений
-   * записан топик. Раньше это сохранялось молча, и топик потом показывался
-   * текстом без внятной причины.
+   * `null` — всё на месте. Иначе это текст для подсказки на выключенной кнопке:
+   * выключенная кнопка без объяснения — худший из возможных ответов, человек
+   * остаётся гадать, чего от него хотят.
    *
-   * Про «несколько» — потому что единственный тип подставляет `chooseMessage`,
-   * и пустым поле в этом случае не остаётся. Пустой список .proto тоже не
-   * повод запрещать: файлы можно добавить и позже, а формат назначить сейчас.
+   * Порядок проверок тот же, в каком человек их проходит: сперва контракт,
+   * потом его разбор, потом тип. Тип при этом обязателен не из строгости —
+   * без него protobuf-тело не разобрать вовсе: в .proto нет ничего, что
+   * сказало бы, каким из объявленных сообщений записан топик.
    */
-  const needsMessage = format === 'proto' && messages.length > 1 && !message;
+  const blocked: string | null =
+    format !== 'proto'
+      ? null
+      : !filled
+        ? mode === 'paste'
+          ? 'Paste the contract first'
+          : mode === 'files'
+            ? 'Pick the .proto files first'
+            : 'Pick a contract from the library first'
+        : draftError
+          ? 'Fix the contract first — it does not parse'
+          : checking
+            ? 'Checking the contract…'
+            : !message
+              ? 'Pick the message type this topic carries'
+              : null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
+      {/* Окно стоит по центру экрана, но ТОЧКА ПРИВЯЗКИ не зависит от его
+          содержимого — и в этом вся разница.
+
+          Обычное центрирование (`top-50%` плюс `translate-y-[-50%]`, как у
+          остальных окон) отсчитывает смещение от ФАКТИЧЕСКОЙ высоты элемента.
+          Значит любое изменение содержимого раздвигает окно в обе стороны и
+          двигает верхнюю кромку, а с ней и полоску вкладок. По вкладкам же
+          ходят — от «Library» к «Paste text» и обратно, подряд, — и целиться в
+          уезжающую вверх-вниз полоску невозможно.
+
+          Здесь смещение считается от середины экрана минус половина НОМИНАЛЬНОЙ
+          высоты: 19rem — это примерно половина от 613 px, которые окно занимает
+          в обычном своём виде (24 отступа + 45 шапки + 16 зазора + 504 тела + 24
+          отступа). Выглядит как центрирование, но от содержимого не зависит
+          вовсе. `max(1.5rem, …)` — пол: на низком экране иначе уехало бы под
+          верхнюю кромку.
+
+          Выравнивать вместо этого высоты содержимого — игра в кошки-мышки.
+          Панели вкладок выровнены (`TAB_PANEL_CLASS`), и этого хватило ровно до
+          первого пояснения НИЖЕ них: строка «на этой вкладке контракта нет»
+          стоила двадцати пикселей, и вкладки поехали снова.
+
+          `max-h` с прокруткой — не украшение: окно растёт вниз, а на коротком
+          экране ему надо оставаться доступным до самых кнопок. Попоуверы и
+          выпадающие списки внутри живут в порталах у `body`, так что прокрутка
+          их не обрезает.
+
+          И только у proto: вкладки есть ТОЛЬКО там, а номинальная высота у
+          разделов разная — avro с jsonschema втрое короче, и при той же
+          привязке встали бы заметно выше центра. Переключить формат внутри окна
+          нельзя (селектор убран), так что выбор делается один раз на
+          открытие. */}
       <DialogContentNoClose
-        className="max-w-md bg-surface border-edge text-strong"
+        className={`max-w-md max-h-[86vh] overflow-y-auto bg-surface border-edge text-strong ${
+          format === 'proto' ? 'top-[max(1.5rem,calc(50%_-_19rem))] translate-y-0' : ''
+        }`}
         aria-describedby={undefined}
       >
         {/* Кнопки «в избранное» здесь больше нет: она показывала тост и не
@@ -857,30 +1101,28 @@ export function TopicConfigModal({
               настраивали в прошлый раз.
 
               Снятием с дерева, а не классом: форма — это не картинка, а живые
-              поля с кнопками, и невидимая, но нажимаемая «Load .proto» успела
-              бы применить файлы не к тому формату. */}
+              поля с кнопками, и невидимый, но нажимаемый Save успел бы
+              сохранить заготовку вместо настройки. */}
           {ready && (
           <>
-          {/* Message Type */}
-          <div className="space-y-2">
-            <Label className="font-mono text-sm text-soft">Message Type</Label>
-            <Select value={format} onValueChange={(v) => handleFormatPick(v as BodyFormat)}>
-              <SelectTrigger className="bg-surface border-edge text-strong font-mono">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className="bg-surface border-edge">
-                {FORMATS.map(({ value, label }) => (
-                  <SelectItem
-                    key={value}
-                    value={value}
-                    className="text-strong font-mono focus:bg-edge"
-                  >
-                    {label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+          {/* Селектора формата здесь больше нет, и это не упрощение вёрстки.
+              Он был вторым ответом на вопрос, у которого уже есть первый:
+              формат выбирают в шапке, рядом с топиком, и применяется он сразу,
+              а здесь тот же выбор ждал кнопки Save — два управления на одну
+              настройку расходятся уже тем, когда они срабатывают.
+
+              Открыть это окно иначе как шестерёнкой в шапке нельзя (других
+              входов в приложении нет, см. `handleOpenSchemaSettings`), а она
+              стоит вплотную к тому самому селектору и показывается только у
+              форматов, которым схема нужна. То есть формат к этому моменту
+              выбран всегда, и выбран сознательно — секунду назад.
+
+              Заодно ушла путаница в подписях: здесь стояло «Message Type», и
+              это был ФОРМАТ, а ниже, у выбора protobuf-типа, — «Message».
+
+              Формат по-прежнему известен (`format` приезжает со схемой) и
+              по-прежнему уходит в `handleSave`: он решает, какой из трёх
+              разделов ниже показать, и сохраняется неизменным вместе с типом. */}
 
           {/* Proto specific fields */}
           {format === 'proto' && (
@@ -911,61 +1153,42 @@ export function TopicConfigModal({
 
                 {/* --- Вставить текстом ------------------------------------ */}
                 {/* Самый прямой путь: контракт прислали в переписке, он лежит в
-                    вики или его только что написали — вставить и применить.
+                    вики или его только что написали — вставить и сохранить.
                     Файл при этом ровно один, и чужие импорты в нём не
                     разрешатся: рядом с вставленным текстом нет каталога, где
-                    их искать. Об этом и говорит ошибка, когда до неё доходит. */}
-                <TabsContent value="paste" className="space-y-2 pt-2">
+                    их искать. Об этом и говорит ошибка, когда до неё доходит.
+
+                    Своей кнопки у вкладки больше нет. Раньше здесь стояла
+                    «Apply contract», и стояла вынужденно: узнать, какие типы
+                    объявляет контракт, можно было единственным способом —
+                    применить его. Теперь это говорит разбор (`check_proto_text`),
+                    и применяет контракт общий Save, как и на двух соседних
+                    вкладках. */}
+                <TabsContent value="paste" className={TAB_PANEL_CLASS}>
                   <ProtoEditor
-                    value={text}
-                    onChange={setText}
+                    value={draft.text}
+                    onChange={(text) => setDraft((current) => ({ ...current, text }))}
                     disabled={busy}
                     placeholder={PASTE_PLACEHOLDER}
                   />
-                  {/* Разбор — он же проверка: другого способа убедиться, что
-                      текст является контрактом, не существует, а этот ещё и
-                      тот же самый, каким контракт будет применён. Ошибка
-                      остаётся под полем, пока её не исправят. */}
-                  {textError ? (
-                    <div className="font-mono text-xs text-danger break-words whitespace-pre-wrap">
-                      {textError}
-                    </div>
-                  ) : checking ? (
-                    <div className="font-mono text-xs text-dim">checking…</div>
-                  ) : text && text === schema?.pasted_text ? (
-                    <div className="font-mono text-xs text-dim">
-                      This is the contract the topic is read by.
-                    </div>
-                  ) : null}
-                  <Button
-                    onClick={() => void handleApplyText()}
-                    disabled={busy || !text.trim() || !!textError}
-                    className="w-full bg-brand text-surface hover:bg-brand-hover font-mono disabled:pointer-events-auto disabled:cursor-not-allowed"
-                    title={
-                      textError
-                        ? 'Fix the contract first — it does not parse'
-                        : 'Make this text the contract of the topic'
-                    }
-                  >
-                    {busy ? 'Working…' : 'Apply contract'}
-                  </Button>
+                  <DraftStatus
+                    error={draftError}
+                    checking={checking}
+                    preview={preview}
+                    saved={draftMatchesSchema('paste', draft, schema)}
+                  />
                 </TabsContent>
 
                 {/* --- Файлы с диска --------------------------------------- */}
-                <TabsContent value="files" className="space-y-2 pt-2">
+                <TabsContent value="files" className={TAB_PANEL_CLASS}>
                   <div className="flex items-center justify-between">
                     <Label className="font-mono text-sm text-soft">Proto Files</Label>
-                    {picked.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => handleRefresh()}
-                        disabled={busy}
-                        className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer"
-                        title="Re-read every file from disk"
-                      >
-                        refresh all
-                      </button>
-                    )}
+                    {/* Кнопок «перечитать» здесь больше нет, и они больше не
+                        нужны: файлы читаются с диска в момент Save, то есть
+                        сохранение И ЕСТЬ перечитывание. Раньше набор лежал
+                        копией в каталоге топика с самого момента выбора, и
+                        поправленный на диске контракт приходилось втягивать
+                        заново отдельной кнопкой. */}
                   </div>
 
                   {picked.length > 0 ? (
@@ -1001,49 +1224,37 @@ export function TopicConfigModal({
                               {file.source}
                             </div>
                           </div>
-                          {/* У зависимости кнопок нет. Перечитывать её отдельно
-                              незачем — она читается с диска заново при каждом
-                              изменении набора, — а удалить её нельзя: она
-                              держится импортом и уйдёт вместе с ним. */}
+                          {/* У зависимости кнопки нет: она держится импортом и
+                              уйдёт вместе с ним, а сама по себе из набора не
+                              убирается. */}
                           {!file.auto && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => handleRefresh(file.name)}
-                                disabled={busy}
-                                className="p-1 text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                                title="Re-read this file from disk"
-                              >
-                                <RotateCw className="size-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleRemove(file.name)}
-                                disabled={busy}
-                                className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
-                                title="Remove this file"
-                              >
-                                <X className="size-3.5" />
-                              </button>
-                            </>
+                            <button
+                              type="button"
+                              onClick={() => handleDropFile(file.source)}
+                              disabled={busy}
+                              className="p-1 text-dim hover:text-strong disabled:opacity-50 bg-transparent border-none cursor-pointer shrink-0"
+                              title="Drop this file from the set"
+                            >
+                              <X className="size-3.5" />
+                            </button>
                           )}
                         </div>
                       ))}
                     </div>
                   ) : (
                     <div className="rounded border border-edge border-dashed p-3 text-center font-mono text-xs text-dim">
-                      No .proto files loaded
+                      No .proto files picked
                     </div>
                   )}
 
                   <Button
-                    onClick={handleLoadFiles}
+                    onClick={handlePickFiles}
                     disabled={busy}
                     variant="outline"
                     className="w-full bg-transparent border-edge text-soft hover:bg-edge hover:text-strong font-mono"
                   >
                     <Upload className="size-4 mr-2" />
-                    {busy ? 'Working…' : 'Load Proto Files'}
+                    {busy ? 'Working…' : 'Pick Proto Files'}
                   </Button>
                   {/* Выбрать достаточно корневой файл: импорты доищутся рядом с
                       ним на диске. Сказать об этом стоит здесь — иначе человек
@@ -1051,6 +1262,12 @@ export function TopicConfigModal({
                   <div className="font-mono text-[11px] text-dim break-words">
                     Pick the contract itself — files it imports are found next to it on disk.
                   </div>
+                  <DraftStatus
+                    error={draftError}
+                    checking={checking}
+                    preview={preview}
+                    saved={draftMatchesSchema('files', draft, schema)}
+                  />
                 </TabsContent>
 
                 {/* --- Библиотека ------------------------------------------ */}
@@ -1059,18 +1276,18 @@ export function TopicConfigModal({
                     в саму библиотеку тоже здесь: кнопка в шапке приложения
                     убрана, потому что источники касаются одного формата из
                     шести, а шапка общая на всё. */}
-                <TabsContent value="library" className="space-y-2 pt-2">
+                <TabsContent value="library" className={TAB_PANEL_CLASS}>
                   <div className="flex items-center justify-between gap-2">
                     <Label className="font-mono text-sm text-soft">Schema source</Label>
                     {bound && (
                       <button
                         type="button"
-                        onClick={() => void handleBind(null)}
+                        onClick={() => handlePickSet(null)}
                         disabled={busy}
                         className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer"
-                        title="Stop reading this topic by a contract from the library"
+                        title="Clear the picked contract"
                       >
-                        unbind
+                        clear
                       </button>
                     )}
                   </div>
@@ -1078,7 +1295,7 @@ export function TopicConfigModal({
                     <SchemaSetSelect
                       sources={sources}
                       value={boundIsLive === false ? null : bound}
-                      onChange={(binding) => void handleBind(binding)}
+                      onChange={handlePickSet}
                       disabled={busy}
                     />
                   ) : (
@@ -1122,6 +1339,12 @@ export function TopicConfigModal({
                       not listed here — open Schema sources to see why.
                     </div>
                   )}
+                  <DraftStatus
+                    error={draftError}
+                    checking={checking}
+                    preview={preview}
+                    saved={draftMatchesSchema('library', draft, schema)}
+                  />
                 </TabsContent>
               </Tabs>
 
@@ -1142,12 +1365,16 @@ export function TopicConfigModal({
                 onChanged={() => void handleSourcesChanged()}
               />
 
-              {/* Схема на диске есть, но не разбирается.
-                  Одним блоком на все вкладки, а не внутри каждой: ошибка
-                  относится к схеме ТОПИКА, а не к способу, которым её задали, —
-                  и у вставленного текста её не бывает вовсе, он бы не
-                  применился. */}
-              {mode !== 'paste' && schema?.error && (
+              {/* СОХРАНЁННАЯ схема на диске есть, но не разбирается — обычно
+                  потому, что файлы из-под неё исчезли.
+                  Одним блоком на все вкладки и БЕЗ оглядки на открытую: ошибка
+                  относится к схеме ТОПИКА, а не к способу, которым её задали, и
+                  прятать её на одной из вкладок значило бы прятать состояние
+                  топика от того, кто пришёл его чинить. Заодно это последнее,
+                  чем высота содержимого ниже вкладок от вкладки зависела.
+                  С ошибкой ЧЕРНОВИКА она не путается: та стоит внутри вкладки,
+                  под самим контрактом (`DraftStatus`). */}
+              {schema?.error && (
                 <div className="font-mono text-xs text-brand break-words">{schema.error}</div>
               )}
 
@@ -1158,14 +1385,20 @@ export function TopicConfigModal({
                       «каким типом это записано», когда топик голый protobuf: в
                       теле нет ни имени типа, ни id схемы, а имя топика о типе
                       ничего не обещает. */}
+                  {/* Подбор работает по СОХРАНЁННОЙ схеме топика: декодер он
+                      строит из неё, а не из черновика. Пока черновик от неё
+                      отличается, кнопка выключена — иначе она ранжировала бы
+                      типы прежнего контракта и выдавала бы ответ про него. */}
                   <button
                     type="button"
                     onClick={() => void handleGuess()}
-                    disabled={guessing || busy || !isOpenTopic}
+                    disabled={guessing || busy || !isOpenTopic || !savedContract}
                     title={
-                      isOpenTopic
-                        ? 'Try every loaded .proto type against the bodies already read'
-                        : 'Open this topic first — the match runs on its own bodies'
+                      !isOpenTopic
+                        ? 'Open this topic first — the match runs on its own bodies'
+                        : !savedContract
+                          ? 'Save the contract first — the match runs on the saved one'
+                          : 'Try every type of the saved .proto against the bodies already read'
                     }
                     className="font-mono text-xs text-dim hover:text-brand disabled:opacity-50 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed"
                   >
@@ -1175,36 +1408,53 @@ export function TopicConfigModal({
 
                 {guess && <GuessResults guess={guess} chosen={message} onPick={setMessage} />}
 
+                {/* Типы — из разбора ОТКРЫТОЙ вкладки. Раньше селектор стоял
+                    живым на любой и предлагал типы из контракта, заданного на
+                    ДРУГОЙ: брал он их из схемы топика, а не из того, что перед
+                    глазами.
+
+                    Почему выбирать не из чего — подписью В САМОМ селекторе, а не
+                    строкой под ним: строка была единственным, чем высота этого
+                    блока отличалась от вкладки к вкладке. */}
                 <ProtoMessageSelect
                   messages={messages}
                   value={message}
                   onChange={setMessage}
-                  disabled={busy}
+                  disabled={busy || messages.length === 0}
+                  emptyLabel={
+                    filled
+                      ? draftError
+                        ? 'The contract does not parse'
+                        : 'Reading the contract…'
+                      : 'No contract on this tab yet'
+                  }
                 />
-                {/* Незаполненное обязательное поле, а не совет: без типа
-                    декодировать нечем, и Save заблокирован. Сказать об этом
-                    здесь, у самого поля, дешевле, чем дать гадать, почему
-                    кнопка внизу не нажимается. */}
-                {needsMessage && (
+                {messages.length > 0 && !message && (
                   <div className="font-mono text-xs text-dim">
-                    The loaded files declare {messages.length} messages — pick the one this topic
-                    carries. Saving is blocked until you do.
+                    This contract declares {messages.length} message types — pick the one this
+                    topic carries.
                   </div>
                 )}
                 {/* Выбран не корень набора. Перебивать выбор нельзя — читать
                     топик вложенным типом законно, — но и промолчать нельзя:
                     именно так в настройках оказался внутренний тип, а топик
-                    сыпал ошибками декодирования, и понять почему было нечем. */}
-                {schema?.root && message && message !== schema.root && (
+                    сыпал ошибками декодирования, и понять почему было нечем.
+
+                    Корень берётся из РАЗБОРА открытой вкладки, а не из схемы
+                    топика. Это не придирка: вставив на соседней вкладке другой
+                    контракт, человек сверял бы выбранный тип с корнем прежнего
+                    — и получал бы совет перейти на тип, которого в том, что
+                    перед ним, нет вовсе. */}
+                {preview?.root && message && message !== preview.root && (
                   <div className="font-mono text-xs text-dim">
                     Nothing in this .proto contains{' '}
                     <button
                       type="button"
-                      onClick={() => setMessage(schema.root)}
+                      onClick={() => setMessage(preview.root!)}
                       disabled={busy}
                       className="font-mono text-xs text-brand hover:underline disabled:opacity-50 bg-transparent border-none p-0 cursor-pointer"
                     >
-                      {schema.root}
+                      {preview.root}
                     </button>
                     , so that is the type this file was written around — topics are normally read
                     by it.
@@ -1264,17 +1514,22 @@ export function TopicConfigModal({
                 кнопки глушит выключенной события, а вместе с ними и `title`.
                 Нажатие от этого не появляется, выключенная кнопка событий
                 click не отдаёт. */}
-            {/* Пока схема не приехала, Save выключен не для красоты: сохранять
-                он будет то, что стоит в полях, а стоит там заготовка — `json`
-                и пустой тип. Нажатие в эту секунду стёрло бы настройку топика
-                вместо того, чтобы её показать. */}
+            {/* Единственная кнопка, которая что-то меняет. Пока схема не
+                приехала, она выключена не для красоты: сохранять она будет то,
+                что стоит в полях, а стоит там заготовка — `json` и пустой тип.
+                Нажатие в эту секунду стёрло бы настройку топика вместо того,
+                чтобы её показать.
+
+                Причина, по которой она выключена, всегда названа в подсказке:
+                выключенная кнопка без объяснения — худший из ответов, человек
+                остаётся гадать, чего от него хотят. */}
             <Button
               onClick={handleSave}
-              disabled={busy || !cluster || !ready || needsMessage}
-              title={needsMessage ? 'Pick the message type this topic carries first' : undefined}
+              disabled={busy || !cluster || !ready || !!blocked}
+              title={blocked ?? undefined}
               className="flex-1 bg-brand text-surface hover:bg-brand-hover font-mono disabled:pointer-events-auto disabled:cursor-not-allowed"
             >
-              Save
+              {busy ? 'Saving…' : 'Save'}
             </Button>
           </div>
         </div>

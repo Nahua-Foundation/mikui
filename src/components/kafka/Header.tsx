@@ -41,7 +41,7 @@ import { Tab } from './components/Tab';
 import { MenuItem } from './components/MenuItem';
 import { IconAction } from './components/IconAction';
 import { FormatSelect, needsSchema } from './components/FormatSelect';
-import { LensSelect } from './components/LensSelect';
+import { hasEnvelope, LensSelect } from './components/LensSelect';
 import { ReadOrder } from './components/ReadOrder';
 import { ThemeToggle } from './components/ThemeToggle';
 
@@ -513,8 +513,12 @@ export function HeaderDesktop({
         {/* Конверт. Отдельным селектором рядом с форматом, а не пунктом внутри
             него: настройки независимые — формат решает, как превратить байты в
             JSON, линза — что из этого JSON показать. Debezium с
-            Avro-сериализатором обычное дело, и их сочетание должно выражаться. */}
-        {topic && (
+            Avro-сериализатором обычное дело, и их сочетание должно выражаться.
+
+            Скрывается он ровно у одного формата — `hex`, где снимать конверт
+            не с чего в принципе. Остальным он нужен всем, включая proto:
+            см. `hasEnvelope`. */}
+        {topic && hasEnvelope(format) && (
           <MenuItem>
             <div className="box-border content-stretch flex flex-row gap-2.5 items-center justify-center px-4 py-4 relative shrink-0">
               <LensSelect lens={lens} onChange={onLensChange} />

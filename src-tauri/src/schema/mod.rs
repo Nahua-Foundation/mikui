@@ -43,7 +43,7 @@ use tauri::AppHandle;
 
 pub use decoder::Decoder;
 pub use proto::guess::Guess;
-pub use types::{BodyFormat, LensSetting, MessageForm, TopicSchemaView};
+pub use types::{BodyFormat, LensSetting, MessageForm, ProtoPreview, TopicSchemaView};
 
 use crate::config;
 use crate::config::SchemaRegistry;
@@ -97,8 +97,18 @@ pub fn add_text(
 /// Каталог настроек ей не нужен вовсе: проверка идёт во временном каталоге и
 /// топика не касается. Обёртка оставлена ради единообразия — все команды схем
 /// ходят через этот модуль.
-pub fn check_text(text: &str) -> Result<(), String> {
+pub fn check_text(text: &str) -> Result<ProtoPreview, String> {
     store::check_text(text)
+}
+
+/// Пробный разбор выбранных в диалоге .proto — ничего не записывая топику.
+pub fn check_files(paths: &[String]) -> Result<ProtoPreview, String> {
+    store::check_files(paths)
+}
+
+/// То же для набора из библиотеки.
+pub fn check_set(app: &AppHandle, source: &str, entry: &str) -> Result<ProtoPreview, String> {
+    store::check_set(&config::config_dir(app)?, source, entry)
 }
 
 /// Какими типами может быть записан топик — по его же телам.

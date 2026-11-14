@@ -5,7 +5,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '../../ui/dropdown-menu';
-import { LensSetting } from '../types';
+import { BodyFormat, LensSetting } from '../types';
 
 /** `null` — «не выбирали»: конверт распознаётся по самому телу. */
 type Choice = LensSetting | null;
@@ -36,6 +36,28 @@ const LENSES: { value: Choice; label: string; icon: typeof Eye; hint: string }[]
     hint: 'Show the payload instead of the schema that precedes it',
   },
 ];
+
+/**
+ * Есть ли у этого формата конверт, который линзе было бы что снимать.
+ *
+ * Ответ почти всегда «да», и это не недосмотр: линза ОРТОГОНАЛЬНА формату.
+ * Формат отвечает на вопрос «как превратить байты в JSON», линза — «что из
+ * этого JSON показать», и работает она поверх декодера, по уже разобранному
+ * телу (`kafka::worker::window`). А конверты Debezium и Kafka Connect ездят
+ * через все три сериализатора Confluent — Avro, Protobuf и JSON Schema, — так
+ * что у protobuf-топика `before`/`after`/`op` оказываются ровно там же, где у
+ * джейсонного, и распознаются тем же правилом.
+ *
+ * Исключение ровно одно — `hex`. Его «декодер» печатает байты парами цифр
+ * (`0A 15 08 C8`), и никаким JSON это не станет ни при каком теле: ни разбор не
+ * удастся, ни поиск ключей конверта по сырой строке (`lens::sniff`) не совпадёт
+ * — в ней одни заглавные цифры и пробелы. Селектор там не «редко нужен», а
+ * мёртв, и показывать его значит предлагать настройку, которая ни на что не
+ * влияет.
+ */
+export function hasEnvelope(format: BodyFormat): boolean {
+  return format !== 'hex';
+}
 
 interface LensSelectProps {
   lens: Choice;
