@@ -31,17 +31,24 @@ import { HeaderDesktop } from './kafka';
 import { TopicsPanel } from './kafka';
 import { MessagesPanel } from './kafka';
 import { StatusBar } from './kafka/StatusBar';
+// Эти два окна лежат в стартовом куске бандла: первое — то, ради чего
+// приложение открывают, второе — вместе с ним на пути холодного старта по
+// ссылке. Остальные приезжают своими кусками (см. `kafka/lazy`).
 import { MessageDetailsModal } from './kafka';
-import { TopicConfigModal } from './kafka';
-import { TopicInfoModal } from './kafka';
-import { ClusterConfigModal } from './kafka';
-import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
-import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
-import { FavoritesModal } from './kafka';
-import { SavedMessageModal } from './kafka';
-import { ShareLinkModal } from './kafka';
 import { OpenLinkModal } from './kafka';
-import { ProduceMessageModal } from './kafka/modals/ProduceMessageModal';
+import {
+  ClusterArchiveModal,
+  ClusterConfigModal,
+  ClusterUsersModal,
+  Deferred,
+  FavoritesModal,
+  ProduceMessageModal,
+  SavedMessageModal,
+  ShareLinkModal,
+  TopicConfigModal,
+  TopicInfoModal,
+  usePreloadModals,
+} from './kafka/lazy';
 import { useMessageWindow } from './kafka/useMessageWindow';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -128,13 +135,25 @@ export function KafkaExplorerPortfolio() {
   /** Ссылка, принесённая системой. null — окно открыли пунктом в шапке. */
   const [incomingLink, setIncomingLink] = useState<string | null>(null);
   /**
-   * Сообщение, ради которого топик открыли по ссылке, — таблица его подсвечивает.
+   * Сообщение, которое человек сейчас смотрит, — таблица его подсвечивает.
    *
-   * Координатами, а не индексом: индекс живёт до ближайшей смены фильтра или
-   * сортировки, а подсветка переживать их обязана. Гаснет, когда человек сам
-   * доводит до строки курсор, и когда уходит с топика.
+   * Ставится на КАЖДОЕ открытие тела (`showMessageAt`), откуда бы оно ни
+   * пришло: клик по строке, стрелки в окне просмотра, переход по ссылке
+   * `mikui://`. Раньше подсветка была только у третьего случая и гасла, стоило
+   * задеть строку курсором, — это была подсказка «вот она». Теперь это ответ на
+   * другой вопрос: какую из сотни строк ты читаешь сейчас. Поэтому она держится,
+   * пока не откроют другое сообщение, и переживает закрытие окна — закрывают его
+   * как раз затем, чтобы посмотреть на таблицу.
+   *
+   * Координатами, а не индексом строки: индекс живёт до ближайшей смены фильтра
+   * или сортировки, а сообщение от них не перестаёт быть тем, которое открыто.
+   *
+   * Отдельным состоянием, а не полем от `selectedMessage`: то живёт ровно
+   * столько, сколько окно просмотра, и обнулять его при перечитывании топика
+   * нельзя — окно осталось бы с пустым телом. Подсветка же к перечитанной
+   * таблице не относится и гаснуть обязана.
    */
-  const [linkedMessage, setLinkedMessage] = useState<{
+  const [highlightedMessage, setHighlightedMessage] = useState<{
     partition: number;
     offset: number;
   } | null>(null);
@@ -341,6 +360,10 @@ export function KafkaExplorerPortfolio() {
       .catch((e) => console.error('Failed to check the panic log', e));
   }, []);
 
+  // Куски с кодом окон — когда движку нечем заняться. Стоит после стартовых
+  // запросов нарочно: они уже в полёте, и разбор чужого кода не должен
+  // конкурировать с первой отрисовкой.
+  usePreloadModals();
 
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
@@ -392,6 +415,17 @@ export function KafkaExplorerPortfolio() {
   // Открытие топика: вычитка в буфер Rust. Наружу приезжают только счётчики,
   // сами строки подтягиваются окнами по мере прокрутки.
   useEffect(() => {
+    // Таблица сейчас наполнится заново, и подсвеченная строка к новому её
+    // содержимому не относится. Гасится именно ЗДЕСЬ, а не у каждого, кто
+    // меняет топик: сюда сходятся все пути — выбор в списке, переход по ссылке,
+    // смена партиций и границ, переподключение под другой учёткой, обычный ↻.
+    // В соседнем топике те же партиция с офсетом — другое сообщение, а после
+    // перечитывания того же топика подсвечивать строку, которой в буфере может
+    // уже и не быть, незачем.
+    //
+    // Стоит до ветки `!selectedTopic` нарочно: закрытие топика — такой же повод.
+    setHighlightedMessage(null);
+
     if (!selectedTopic) {
       setTotal(0);
       setStats(null);
@@ -735,6 +769,15 @@ export function KafkaExplorerPortfolio() {
         if (bodyRequest.current !== ticket || topicRef.current !== topicAtRequest) return;
         setSelectedMessage(message);
         setSelectedIndex(index);
+        // Подсветка ставится здесь, а не у каждого вызывающего: тело открывают
+        // кликом, стрелками и по ссылке, и «подсвечена та строка, которая
+        // открыта» должно быть свойством самого открытия, а не тремя
+        // одинаковыми строчками в трёх местах.
+        //
+        // Координаты берутся из ответа, а не из `index`: по индексу их здесь
+        // неоткуда взять — строки лежат в окнах таблицы, а не тут, — и ответ в
+        // любом случае точнее.
+        setHighlightedMessage({ partition: message.partition, offset: message.offset });
         setIsModalOpen(true);
       })
       .catch((e) => {
@@ -801,10 +844,10 @@ export function KafkaExplorerPortfolio() {
             );
             return;
           }
-          // Подсветка ставится вместе с открытием окна, а не после его
-          // закрытия: закрыть окно можно и мимо кнопки, а найти строку глазами
-          // среди сотни соседей — это ровно то, чего ссылка избавляет.
-          setLinkedMessage({ partition: pending.partition, offset: pending.offset });
+          // Подсветку своей строкой здесь больше не ставим: её ставит само
+          // открытие тела, и для ссылки это ровно то же самое. Найти строку
+          // глазами среди сотни соседей — то, чего ссылка избавляет, — работает
+          // как работало.
           showMessageAt(index);
         })
         .catch((e) => {
@@ -814,10 +857,6 @@ export function KafkaExplorerPortfolio() {
     },
     [showMessageAt],
   );
-
-  /** Стабильный колбэк: иначе каждая перерисовка таблицы меняла бы пропс у
-   *  всех видимых строк и обесценивала их `memo`. */
-  const clearHighlight = useCallback(() => setLinkedMessage(null), []);
 
   const handleConfigClick = useCallback((topic: Topic) => {
     setConfigTopic(topic);
@@ -1272,9 +1311,6 @@ export function KafkaExplorerPortfolio() {
    *  и границ через этот обработчик не идёт и поиск сохранит. */
   const handleSelectTopic = useCallback((topic: Topic | null) => {
     if (topicRef.current !== (topic?.name ?? null)) {
-      // Подсветка принадлежит сообщению того топика, за которым пришли по
-      // ссылке. В соседнем те же партиция с офсетом — другое сообщение.
-      setLinkedMessage(null);
       setSelectedPartitions(null);
       setReadMode((mode) => (mode === 'offset' || mode === 'timestamp' ? 'newest' : mode));
       setRange(EMPTY_RANGE);
@@ -1554,8 +1590,7 @@ export function KafkaExplorerPortfolio() {
                 onStopSearch={handleStopSearch}
                 sort={sort}
                 onSortChange={setSort}
-                highlight={linkedMessage}
-                onHighlightSeen={clearHighlight}
+                highlight={highlightedMessage}
               />
               <StatusBar stats={stats} />
             </>
@@ -1588,24 +1623,26 @@ export function KafkaExplorerPortfolio() {
 
       {/* Ссылка на открытое сообщение — поверх его окна: делятся, не закрывая
           того, чем делятся. */}
-      <ShareLinkModal
-        url={shareLink}
-        open={isShareOpen}
-        onOpenChange={setIsShareOpen}
-        description={
-          selectedTopic && selectedMessage ? (
-            <>
-              <span className="text-dim">{connectedName ?? 'unnamed cluster'}</span>
-              <span className="text-dim"> / </span>
-              <span className="text-brand">{selectedTopic.name}</span>
-              <span className="text-dim">
-                {' '}
-                · partition {selectedMessage.partition} · offset {selectedMessage.offset}
-              </span>
-            </>
-          ) : undefined
-        }
-      />
+      <Deferred open={isShareOpen}>
+        <ShareLinkModal
+          url={shareLink}
+          open={isShareOpen}
+          onOpenChange={setIsShareOpen}
+          description={
+            selectedTopic && selectedMessage ? (
+              <>
+                <span className="text-dim">{connectedName ?? 'unnamed cluster'}</span>
+                <span className="text-dim"> / </span>
+                <span className="text-brand">{selectedTopic.name}</span>
+                <span className="text-dim">
+                  {' '}
+                  · partition {selectedMessage.partition} · offset {selectedMessage.offset}
+                </span>
+              </>
+            ) : undefined
+          }
+        />
+      </Deferred>
 
       {/* Переход по ссылке. Не под условием подключения: по ссылке приходят с
           пустого приложения чаще, чем с открытого топика. */}
@@ -1622,112 +1659,128 @@ export function KafkaExplorerPortfolio() {
       {/* Сохранённое сообщение — в своём окне: у него другое происхождение и
           другой формат тела, а топика, из которого оно взято, может не быть
           открытым вовсе. */}
-      <SavedMessageModal
-        favorite={savedFavorite}
-        message={savedMessage}
-        open={isSavedModalOpen}
-        onOpenChange={setIsSavedModalOpen}
-      />
+      <Deferred open={isSavedModalOpen}>
+        <SavedMessageModal
+          favorite={savedFavorite}
+          message={savedMessage}
+          open={isSavedModalOpen}
+          onOpenChange={setIsSavedModalOpen}
+        />
+      </Deferred>
 
       {/* Схема — та же, что применена к открытому топику: форма отправки
           предлагает те же типы, которыми таблица прямо сейчас читает, и
           второй раз ходить за ней на диск незачем. */}
-      <ProduceMessageModal
-        topic={selectedTopic}
-        cluster={schemaCluster}
-        schema={openSchema}
-        open={isProduceModalOpen}
-        onOpenChange={setIsProduceModalOpen}
-      />
+      <Deferred open={isProduceModalOpen}>
+        <ProduceMessageModal
+          topic={selectedTopic}
+          cluster={schemaCluster}
+          schema={openSchema}
+          open={isProduceModalOpen}
+          onOpenChange={setIsProduceModalOpen}
+        />
+      </Deferred>
 
       {/* Библиотеки наборов .proto здесь больше нет: окно переехало внутрь
           настроек топика, откуда его и открывают. Перечитать схему после правок
           в ней — тоже забота настроек: там это делается полностью, с новым
           списком контрактов, а не одним лишь перезапуском декодера. */}
-      <TopicConfigModal
-        topic={configTopic}
-        cluster={schemaCluster}
-        openTopic={selectedTopic?.name ?? null}
-        // Схема открытого топика — чтобы у него настройки открывались сразу
-        // настроенными, без секунд ожидания с формой прошлого формата. Окно
-        // сверяет её с именем топика и кластера само, так что прежняя схема,
-        // лежащая здесь между выбором топика и ответом, не посеется.
-        openTopicSchema={openSchema}
-        open={isConfigModalOpen}
-        onOpenChange={setIsConfigModalOpen}
-        onSchemaChanged={handleSchemaChanged}
-      />
+      <Deferred open={isConfigModalOpen}>
+        <TopicConfigModal
+          topic={configTopic}
+          cluster={schemaCluster}
+          openTopic={selectedTopic?.name ?? null}
+          // Схема открытого топика — чтобы у него настройки открывались сразу
+          // настроенными, без секунд ожидания с формой прошлого формата. Окно
+          // сверяет её с именем топика и кластера само, так что прежняя схема,
+          // лежащая здесь между выбором топика и ответом, не посеется.
+          openTopicSchema={openSchema}
+          open={isConfigModalOpen}
+          onOpenChange={setIsConfigModalOpen}
+          onSchemaChanged={handleSchemaChanged}
+        />
+      </Deferred>
 
-      <TopicInfoModal
-        topic={infoTopic}
-        open={isTopicInfoOpen}
-        onOpenChange={setIsTopicInfoOpen}
-      />
+      <Deferred open={isTopicInfoOpen}>
+        <TopicInfoModal
+          topic={infoTopic}
+          open={isTopicInfoOpen}
+          onOpenChange={setIsTopicInfoOpen}
+        />
+      </Deferred>
 
-      <ClusterArchiveModal
-        open={isClusterArchiveModalOpen}
-        onOpenChange={setIsClusterArchiveModalOpen}
-        clusters={clusters}
-        connectedClusterId={connectedClusterId}
-        onDeleteCluster={handleDeleteCluster}
-        onCreateNew={handleCreateNewCluster}
-        onEditCluster={handleEditCluster}
-        onConnectToCluster={handleConnectToCluster}
-        onDisconnect={() => {
-          disconnect().then(() => toast.info('Disconnected'));
-        }}
-      />
+      <Deferred open={isClusterArchiveModalOpen}>
+        <ClusterArchiveModal
+          open={isClusterArchiveModalOpen}
+          onOpenChange={setIsClusterArchiveModalOpen}
+          clusters={clusters}
+          connectedClusterId={connectedClusterId}
+          onDeleteCluster={handleDeleteCluster}
+          onCreateNew={handleCreateNewCluster}
+          onEditCluster={handleEditCluster}
+          onConnectToCluster={handleConnectToCluster}
+          onDisconnect={() => {
+            disconnect().then(() => toast.info('Disconnected'));
+          }}
+        />
+      </Deferred>
 
-      <ClusterConfigModal
-        open={isClusterConfigModalOpen}
-        onOpenChange={setIsClusterConfigModalOpen}
-        cluster={selectedCluster}
-        mode={clusterConfigMode}
-        onBack={handleBackToArchive}
-        onSaved={handleClusterSaved}
-        onConnect={connect}
-        onManageUsers={(cluster) => handleManageUsers(cluster, true)}
-        isConnected={!!selectedCluster && selectedCluster.id === connectedClusterId}
-        onApply={handleApplyClusterSettings}
-      />
+      <Deferred open={isClusterConfigModalOpen}>
+        <ClusterConfigModal
+          open={isClusterConfigModalOpen}
+          onOpenChange={setIsClusterConfigModalOpen}
+          cluster={selectedCluster}
+          mode={clusterConfigMode}
+          onBack={handleBackToArchive}
+          onSaved={handleClusterSaved}
+          onConnect={connect}
+          onManageUsers={(cluster) => handleManageUsers(cluster, true)}
+          isConnected={!!selectedCluster && selectedCluster.id === connectedClusterId}
+          onApply={handleApplyClusterSettings}
+        />
+      </Deferred>
 
-      <ClusterUsersModal
-        open={isClusterUsersModalOpen}
-        onOpenChange={setIsClusterUsersModalOpen}
-        cluster={usersModalCluster}
-        activeUserId={usersModalClusterId === connectedClusterId ? connectedUserId : null}
-        onChanged={handleClusterSaved}
-        // Правка учётки, под которой мы сейчас подключены, — это смена
-        // действующих кредов. Прежнее соединение при этом рвётся безусловно,
-        // даже если новый пароль неверен: иначе чтение продолжало бы работать
-        // по паролю, которого больше нет, и смена пароля выглядела бы фикцией.
-        onReconnect={(user) => connectAsUser(user, { replace: true })}
-        // Удалили учётку, на которой держалось подключение: сеанс аутентифицирован
-        // паролем, которого больше нет, и оставлять его работающим — та же
-        // фикция, что была со сменой пароля.
-        onDisconnect={() => {
-          disconnect().then(() => toast.info('Disconnected: the active user was deleted'));
-        }}
-        // Из настроек кластера сюда приходят через кнопку — значит есть куда
-        // вернуться. Из шапки списком заведуют напрямую, и кнопки нет.
-        onBack={
-          usersModalFromConfig
-            ? () => {
-                setIsClusterUsersModalOpen(false);
-                setIsClusterConfigModalOpen(true);
-              }
-            : undefined
-        }
-      />
+      <Deferred open={isClusterUsersModalOpen}>
+        <ClusterUsersModal
+          open={isClusterUsersModalOpen}
+          onOpenChange={setIsClusterUsersModalOpen}
+          cluster={usersModalCluster}
+          activeUserId={usersModalClusterId === connectedClusterId ? connectedUserId : null}
+          onChanged={handleClusterSaved}
+          // Правка учётки, под которой мы сейчас подключены, — это смена
+          // действующих кредов. Прежнее соединение при этом рвётся безусловно,
+          // даже если новый пароль неверен: иначе чтение продолжало бы работать
+          // по паролю, которого больше нет, и смена пароля выглядела бы фикцией.
+          onReconnect={(user) => connectAsUser(user, { replace: true })}
+          // Удалили учётку, на которой держалось подключение: сеанс аутентифицирован
+          // паролем, которого больше нет, и оставлять его работающим — та же
+          // фикция, что была со сменой пароля.
+          onDisconnect={() => {
+            disconnect().then(() => toast.info('Disconnected: the active user was deleted'));
+          }}
+          // Из настроек кластера сюда приходят через кнопку — значит есть куда
+          // вернуться. Из шапки списком заведуют напрямую, и кнопки нет.
+          onBack={
+            usersModalFromConfig
+              ? () => {
+                  setIsClusterUsersModalOpen(false);
+                  setIsClusterConfigModalOpen(true);
+                }
+              : undefined
+          }
+        />
+      </Deferred>
 
-      <FavoritesModal
-        favorites={favorites}
-        open={isFavoritesModalOpen}
-        onOpenChange={setIsFavoritesModalOpen}
-        onRemoveFavorite={handleRemoveFavorite}
-        onClearFavorites={handleClearFavorites}
-        onSelectMessage={handleOpenFavorite}
-      />
+      <Deferred open={isFavoritesModalOpen}>
+        <FavoritesModal
+          favorites={favorites}
+          open={isFavoritesModalOpen}
+          onOpenChange={setIsFavoritesModalOpen}
+          onRemoveFavorite={handleRemoveFavorite}
+          onClearFavorites={handleClearFavorites}
+          onSelectMessage={handleOpenFavorite}
+        />
+      </Deferred>
     </div>
   );
 }

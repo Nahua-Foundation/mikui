@@ -25,6 +25,7 @@ import {
   PayloadIssue,
   ProduceRequest,
   ProduceResult,
+  ProtoPreview,
   MessageForm,
   RepoDefaults,
   RepoKind,
@@ -320,14 +321,34 @@ export const addProtoFiles = (cluster: string, topic: string, paths: string[]) =
 export const addProtoText = (cluster: string, topic: string, text: string) =>
   invoke<TopicSchema>('add_proto_text', { cluster, topic, text });
 
-/**
- * Разбирает вставленный текст, ничего не сохраняя.
- *
- * Разбор тот же самый, что и у `addProtoText`, то есть ответ здесь — не
- * приближение к тому, что скажет применение, а оно само.
- */
+// --- Пробный разбор ------------------------------------------------------------
+//
+// Три способа задать контракт — три проверки, и ни одна не трогает ни диск, ни
+// таблицу: они отвечают, что в наборе объявлено, ДО того как он стал схемой
+// топика. На них и держится то, что настройки работают как форма — правка видна
+// и проверена сразу, а применяется по Save.
+//
+// Разбор у них тот же самый, что у применения, так что ответ здесь — не
+// приближение к тому, что скажет Save, а оно само.
+
+/** Разбирает вставленный текст, ничего не сохраняя. */
 export const checkProtoText = (text: string) =>
-  invoke<void>('check_proto_text', { text });
+  invoke<ProtoPreview>('check_proto_text', { text });
+
+/** То же для выбранных в диалоге файлов. В ответе и доисканные по импортам. */
+export const checkProtoFiles = (paths: string[]) =>
+  invoke<ProtoPreview>('check_proto_files', { paths });
+
+/** То же для набора из библиотеки. Своего разбора не делает — набор уже
+ *  разобран ради списка контрактов, ответ приходит из кэша. */
+export const checkSchemaSet = (source: string, entry: string) =>
+  invoke<ProtoPreview>('check_schema_set', { source, entry });
+
+// Две команды ниже интерфейс больше не зовёт, и это следствие того, что
+// настройки топика стали формой: файлы читаются с диска в момент Save, то есть
+// сохранение и есть перечитывание, а убрать файл — это правка черновика, с
+// диска при ней ничего не исчезает. Команды оставлены как есть: они проверены
+// тестами, и у avro с jsonschema свои такие же, которые зовутся.
 
 /** Перечитывает .proto с диска: `name` — конкретный файл, иначе все. */
 export const refreshProtoFiles = (cluster: string, topic: string, name?: string) =>

@@ -16,6 +16,13 @@ export { MessagesPanel } from './MessagesPanel';
 export { StatusBar } from './StatusBar';
 
 // Modals
+//
+// Отсюда статически берут только два окна — `MessageDetailsModal` и
+// `OpenLinkModal`. Остальные `KafkaExplorerPortfolio` загружает отдельными
+// кусками бандла через `./lazy`, и в стартовый кусок они не попадают только
+// потому, что статических импортов на них больше не осталось: достаточно взять
+// любое из них отсюда обычным `import`, и кусок вернётся в старт молча, ничего
+// не сломав. Новым местам, которым понадобится окно, — тоже через `./lazy`.
 export { MessageDetailsModal } from './modals/MessageDetailsModal';
 export { ProduceMessageModal } from './modals/ProduceMessageModal';
 export { TopicConfigModal } from './modals/TopicConfigModal';

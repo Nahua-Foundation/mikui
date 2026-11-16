@@ -647,12 +647,39 @@ async fn add_proto_text(
     blocking(move || schema::add_text(&app, &cluster, &topic, &text)).await
 }
 
+// --- Пробный разбор ------------------------------------------------------------
+//
+// Три команды на три способа задать контракт, и все три не трогают ни диск, ни
+// воркер: они отвечают на вопрос «что в этом наборе объявлено» ДО того, как он
+// стал схемой топика. На них и держится то, что настройки топика работают как
+// форма — правка видна и проверена сразу, а применяется по Save.
+//
+// Разбор у них тот же самый, что у применения, поэтому ответ здесь не
+// приближение: что сказала проверка, то скажет и Save.
+
 /// Разбирает вставленный текст, ничего не сохраняя: форма спрашивает об этом,
-/// пока текст ещё в поле. Ответ тот же самый, что даст применение, — разбор
-/// общий.
+/// пока текст ещё в поле.
 #[tauri::command]
-async fn check_proto_text(text: String) -> Result<(), String> {
+async fn check_proto_text(text: String) -> Result<schema::ProtoPreview, String> {
     blocking(move || schema::check_text(&text)).await
+}
+
+/// То же для файлов, выбранных в диалоге. В ответе и доисканные по импортам —
+/// их пользователь не выбирал, и увидеть их он должен до Save, а не после.
+#[tauri::command]
+async fn check_proto_files(paths: Vec<String>) -> Result<schema::ProtoPreview, String> {
+    blocking(move || schema::check_files(&paths)).await
+}
+
+/// То же для набора из библиотеки. Своего разбора не делает — набор уже
+/// разобран ради списка контрактов, и ответ приходит из кэша.
+#[tauri::command]
+async fn check_schema_set(
+    app: tauri::AppHandle,
+    source: String,
+    entry: String,
+) -> Result<schema::ProtoPreview, String> {
+    blocking(move || schema::check_set(&app, &source, &entry)).await
 }
 
 /// Перечитывает .proto с диска: `name` — конкретный файл, `None` — все.
@@ -1483,6 +1510,8 @@ pub fn run() {
             add_proto_files,
             add_proto_text,
             check_proto_text,
+            check_proto_files,
+            check_schema_set,
             refresh_proto_files,
             remove_proto_file,
             save_topic_schema,

@@ -19,8 +19,8 @@ use super::proto::{imports, linked, resolve, ProtoDecoder};
 use super::registry::{Registry, SchemaKind, SubjectAnswer};
 use super::source::{self, SourceBinding};
 use super::types::{
-    AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, LensSetting, SchemaFile, TopicSchema,
-    TopicSchemaView,
+    AvroBinding, AvroView, BodyFormat, JsonBinding, JsonView, LensSetting, ProtoPreview, SchemaFile,
+    TopicSchema, TopicSchemaView,
 };
 use crate::config;
 use crate::config::SchemaRegistry;
@@ -658,23 +658,80 @@ pub fn add_text(
 /// проверка идёт на каждое затишье в наборе текста, и трогать то, чем топик
 /// читается прямо сейчас, она не имеет права. `Staged` без `commit` уносит за
 /// собой всё сам.
-pub fn check_text(text: &str) -> Result<(), String> {
+pub fn check_text(text: &str) -> Result<ProtoPreview, String> {
     if text.trim().is_empty() {
         return Err("the pasted contract is empty".to_string());
     }
 
     let pending = vec![Pending::pasted(PASTED_NAME.to_string(), text.as_bytes().to_vec())];
-    let listing: Vec<SchemaFile> = pending.iter().map(SchemaFile::from).collect();
-    // Имя уникальное: проверка может идти одновременно с применением, и общий
-    // каталог означал бы, что одна операция сносит каталог другой на полуслове.
+    preview(&pending).map_err(|e| match explain_pasted_imports(text.as_bytes()) {
+        Some(why) => format!("{why}\n\n{e}"),
+        None => e,
+    })
+}
+
+/// Пробный разбор файлов, выбранных в диалоге, — без единой записи у топика.
+///
+/// Делает то же, что `add_files`, и ровно до того места, где та начинает
+/// менять схему: собирает набор, доискивает импорты рядом с выбранным на диске
+/// и разбирает. Отсюда и список файлов в ответе — доисканные пользователь не
+/// выбирал, и показать их надо ДО Save, а не после.
+pub fn check_files(sources: &[String]) -> Result<ProtoPreview, String> {
+    if sources.is_empty() {
+        return Err("no .proto files selected".to_string());
+    }
+
+    let mut picked = Vec::with_capacity(sources.len());
+    for source in sources {
+        let bytes = std::fs::read(source).map_err(|e| format!("can't read {source}: {e}"))?;
+        // Тот же файл, выбранный повторно, — это «перечитать», а не дубликат.
+        picked.retain(|(have, _): &(String, Vec<u8>)| have != source);
+        picked.push((source.clone(), bytes));
+    }
+
+    let (pending, explained) = assemble(picked);
+    preview(&pending).map_err(|e| match explained {
+        Some(why) => format!("{why}\n\n{e}"),
+        None => e,
+    })
+}
+
+/// Разбирает набор во ВРЕМЕННОМ каталоге и выбрасывает его.
+///
+/// Каталог временный и с уникальным именем: проверка идёт одновременно с чем
+/// угодно, и общий каталог означал бы, что одна операция сносит каталог другой
+/// на полуслове. Уносит его `Drop` у `Staged` — `commit` здесь не зовётся
+/// никогда, в этом весь смысл.
+///
+/// Парсер иначе не умеет: API разбора из памяти у `protobuf-parse` нет, он
+/// принимает только пути, — так что выложить текст на диск приходится даже
+/// затем, чтобы просто его проверить.
+fn preview(pending: &[Pending]) -> Result<ProtoPreview, String> {
+    let files: Vec<SchemaFile> = pending.iter().map(SchemaFile::from).collect();
     let target = std::env::temp_dir().join(format!("mikui-proto-check-{}", uuid::Uuid::new_v4()));
-    let staged = Staged::write(target, &pending)?;
-    linked::parse(staged.path(), &listing)
-        .map(|_| ())
-        .map_err(|e| match explain_pasted_imports(text.as_bytes()) {
-            Some(why) => format!("{why}\n\n{e}"),
-            None => e,
-        })
+    let staged = Staged::write(target, pending)?;
+    let linked = linked::parse(staged.path(), &files)?;
+    Ok(ProtoPreview {
+        files,
+        messages: linked.messages.clone(),
+        root: linked.root.clone(),
+    })
+}
+
+/// То же для набора из библиотеки: что в нём объявлено и каков его корень.
+///
+/// Своего разбора здесь нет вовсе — набор уже разобран ради списка контрактов
+/// (`source::views`), и `linked_set` отдаёт тот же результат из кэша.
+pub fn check_set(root: &Path, source: &str, entry: &str) -> Result<ProtoPreview, String> {
+    let (include, inputs) = source::set_inputs(root, source, entry);
+    let linked = linked::linked_set(&include, &inputs)?;
+    Ok(ProtoPreview {
+        // Файлы набора лежат в дереве источника и топику не принадлежат:
+        // в этом и смысл библиотеки — копий не возникает.
+        files: Vec::new(),
+        messages: linked.messages.clone(),
+        root: linked.root.clone(),
+    })
 }
 
 /// Чем объяснить отказ, когда вставленный текст импортирует чужие файлы.
@@ -2603,15 +2660,72 @@ mod tests {
     /// и тот же. Иначе форма обещала бы одно, а кнопка делала другое.
     #[test]
     fn checking_the_text_answers_the_same_as_applying_it() {
-        assert!(check_text("syntax = \"proto3\"; message A { string id = 1; }").is_ok());
+        let text = "syntax = \"proto3\"; package demo; message Event { string id = 1; }";
+        let checked = check_text(text).unwrap();
+
+        let sandbox = Sandbox::new("paste-check-matches-apply");
+        let applied = sandbox.paste(text).unwrap();
+        assert_eq!(checked.messages, applied.messages);
+        assert_eq!(checked.root, applied.root);
+        assert_eq!(checked.files.len(), applied.files.len());
+
         assert!(check_text("syntax = \"proto3\"; message Broken {").is_err());
         assert!(check_text("   ").is_err());
+    }
 
-        // И ничего при этом не остаётся: временный каталог уносит за собой
-        // `Staged`, а каталога топика проверка не касается вовсе.
-        let sandbox = Sandbox::new("paste-check-leaves-nothing");
-        check_text("syntax = \"proto3\"; message A { string id = 1; }").unwrap();
-        assert!(sandbox.stored().is_empty());
+    /// Главное свойство пробного разбора: он не оставляет СЛЕДА.
+    ///
+    /// На нём держится вся форма: правку видно и проверено до Save, а схема
+    /// топика до Save не меняется вовсе — значит Cancel и правда отменяет.
+    #[test]
+    fn a_trial_parse_leaves_the_topic_untouched() {
+        let sandbox = Sandbox::new("check-leaves-nothing");
+        // У топика уже есть рабочий контракт — проверка не имеет права его
+        // тронуть, чем бы её ни кормили.
+        sandbox
+            .paste("syntax = \"proto3\"; package before; message Kept { string id = 1; }")
+            .unwrap();
+
+        let other = sandbox.author("other.proto", "syntax = \"proto3\"; package after; message New {}");
+        check_text("syntax = \"proto3\"; package after; message New {}").unwrap();
+        check_files(&[other]).unwrap();
+        let _ = check_text("syntax = \"proto3\"; message Broken {");
+
+        let view = view(&sandbox.root, CLUSTER, TOPIC).unwrap().unwrap();
+        assert_eq!(view.messages, ["before.Kept"]);
+        assert!(view.pasted_text.as_deref().unwrap().contains("message Kept"));
+        assert_eq!(view.files.len(), 1);
+    }
+
+    /// Пробный разбор файлов отвечает тем же, чем ответит загрузка, — включая
+    /// доисканные по импортам. Их пользователь не выбирал, и увидеть их он
+    /// должен ДО Save: иначе список файлов после сохранения вырастет сам.
+    #[test]
+    fn checking_files_answers_the_same_as_loading_them() {
+        let sandbox = Sandbox::new("check-files");
+        let orders = sandbox.author("orders.proto", ORDERS);
+        sandbox.author("common/types.proto", MONEY);
+
+        let checked = check_files(&[orders.clone()]).unwrap();
+        let applied = sandbox.add(&[orders]).unwrap();
+
+        assert_eq!(checked.messages, applied.messages);
+        assert_eq!(checked.root, applied.root);
+        // Два файла, и второй — подтянутый импортом.
+        assert_eq!(checked.files.len(), 2);
+        assert_eq!(checked.files.iter().filter(|f| f.auto).count(), 1);
+        assert_eq!(
+            checked.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            applied.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Нечитаемый путь и пустой выбор — отказ, а не пустой разбор: форме надо
+    /// сказать, что именно не вышло, а не показать набор без типов.
+    #[test]
+    fn checking_files_refuses_what_it_cannot_read() {
+        assert!(check_files(&[]).is_err());
+        assert!(check_files(&["/nowhere/absent.proto".to_string()]).is_err());
     }
 
     /// Чужой импорт во вставленном тексте — не «файл не найден», а «искать было

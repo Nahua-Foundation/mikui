@@ -157,14 +157,20 @@ None of them are code-signed — that needs a paid Apple Developer account for
 macOS and a code-signing certificate for Windows, which this project doesn't
 have — so the OS will warn on first run. See below for how to get past that.
 
+The installed application is called **Mikui - Kafka UI** — that is the name of
+the `.app` on macOS, of the install folder on Windows and of the executable
+itself. Artifact file names follow it, so they carry spaces; GitHub may show
+them with the spaces substituted on the release page. Releases up to and
+including 0.2.4 were named `mikui`.
+
 | File | Platform | Notes |
 | --- | --- | --- |
-| `mikui_<version>_x64-setup.exe` | Windows x64 | NSIS installer |
-| `mikui_<version>_aarch64.dmg` | macOS, Apple Silicon (M1 and later) | won't run on an Intel Mac |
-| `mikui_<version>_x64.dmg` | macOS, Intel | also runs on Apple Silicon via Rosetta 2, just slower than the native build |
-| `mikui_<version>_amd64.deb` | Linux, Debian/Ubuntu-based (x86_64) | |
-| `mikui-<version>-1.x86_64.rpm` | Linux, Fedora/RHEL/openSUSE-based (x86_64) | |
-| `mikui_<version>_amd64.AppImage` | Linux, any x86_64 distro | no installation needed, but needs FUSE |
+| `Mikui - Kafka UI_<version>_x64-setup.exe` | Windows x64 | NSIS installer |
+| `Mikui - Kafka UI_<version>_aarch64.dmg` | macOS, Apple Silicon (M1 and later) | won't run on an Intel Mac |
+| `Mikui - Kafka UI_<version>_x64.dmg` | macOS, Intel | also runs on Apple Silicon via Rosetta 2, just slower than the native build |
+| `Mikui - Kafka UI_<version>_amd64.deb` | Linux, Debian/Ubuntu-based (x86_64) | package name `mikui-kafka-ui` |
+| `Mikui - Kafka UI-<version>-1.x86_64.rpm` | Linux, Fedora/RHEL/openSUSE-based (x86_64) | package name `mikui-kafka-ui` |
+| `Mikui - Kafka UI_<version>_amd64.AppImage` | Linux, any x86_64 distro | no installation needed, but needs FUSE |
 
 ### macOS
 
@@ -176,7 +182,7 @@ similar). Two ways around it:
   confirm in the dialog that appears. One-time step per app.
 - Or clear the quarantine flag from the terminal:
   ```sh
-  xattr -cr /Applications/mikui.app
+  xattr -cr "/Applications/Mikui - Kafka UI.app"
   ```
 
 Pick the `.dmg` that matches your Mac's chip (Apple menu → *About This Mac*):
@@ -207,38 +213,49 @@ not.
 #### Installing for the whole machine
 
 The installer is built in **per-machine mode only**: it always goes to
-`C:\Program Files\mikui`, registers `mikui://` under `HKLM`, and adds a Start
-menu entry every account on the machine can see. Administrator rights are
-required, so expect a UAC prompt — and run it from an elevated shell when
-scripting, since a silent install has no dialog to accept an elevation with.
+`C:\Program Files\Mikui - Kafka UI`, registers `mikui://` under `HKLM`, and
+adds a Start menu entry every account on the machine can see. Administrator
+rights are required, so expect a UAC prompt — and run it from an elevated shell
+when scripting, since a silent install has no dialog to accept an elevation
+with.
 
-Per-machine was chosen over the per-user alternative (`%LOCALAPPDATA%\mikui`,
-`HKCU`) because it is the only one that works on a shared or managed machine:
+Per-machine was chosen over the per-user alternative
+(`%LOCALAPPDATA%\Mikui - Kafka UI`, `HKCU`) because it is the only one that
+works on a shared or managed machine:
 one copy serves every account instead of one per profile, and `Program Files`
 is where execution policies such as AppLocker allow programs to run by
 default. A per-user install is also invisible to other accounts and awkward to
 roll out — there is no way to select it any more.
 
 ```bat
-mikui_<version>_x64-setup.exe /S /D=C:\Program Files\mikui
+"Mikui - Kafka UI_<version>_x64-setup.exe" /S /D=C:\Program Files\Mikui - Kafka UI
 ```
 
 `/S` is silent and `/P` is passive (progress, no questions). `/D=` sets the
 target directory and, being an NSIS built-in, has to come **last** and
-**unquoted** even when the path contains spaces. `/NS` skips the shortcuts,
-`/UPDATE` upgrades in place without recreating them. Uninstalling works the
-same way: `"C:\Program Files\mikui\uninstall.exe" /S`.
+**unquoted** even when the path contains spaces — which it now does by default.
+`/NS` skips the shortcuts, `/UPDATE` upgrades in place without recreating them.
+Uninstalling works the same way:
+`"C:\Program Files\Mikui - Kafka UI\uninstall.exe" /S`.
 
 Two things worth knowing before running this over an existing install: the
-installer closes a running mikui first — silently, when `/S` is in play — and
+installer closes a running copy first — silently, when `/S` is in play — and
 the uninstaller only clears the settings of the account that runs it, and only
 when asked to. Other accounts keep theirs.
 
-Note for machines carrying a per-user install from **0.2.4 or earlier**: the
-per-machine installer looks for a previous installation under `HKLM` and will
-not see one made under `HKCU`. It installs cleanly alongside it, leaving the
-old copy in `%LOCALAPPDATA%\mikui` behind — remove it with the uninstaller
-sitting in that folder.
+Note for machines carrying an install from **0.2.4 or earlier**, when the app
+was called `mikui`. The installer finds a previous installation by the app's
+name, so it does not recognise those at all and installs cleanly alongside
+them. Two entries end up in *Apps & features* and two folders on disk, and
+`mikui://` links go to the new copy. Remove the old one through its own
+uninstaller:
+
+- a per-machine install from 0.2.4 — `"C:\Program Files\mikui\uninstall.exe"`;
+- a per-user install from before that — the uninstaller in
+  `%LOCALAPPDATA%\mikui`.
+
+Settings are not affected either way: they live under the application
+identifier, which has not changed.
 
 ### Linux
 
@@ -246,16 +263,16 @@ sitting in that folder.
   `dpkg -i` / `rpm -i`, so missing shared-library dependencies (mainly
   `webkit2gtk`) get resolved automatically:
   ```sh
-  sudo apt install ./mikui_<version>_amd64.deb      # Debian/Ubuntu
-  sudo dnf install ./mikui-<version>-1.x86_64.rpm   # Fedora
+  sudo apt install "./Mikui - Kafka UI_<version>_amd64.deb"      # Debian/Ubuntu
+  sudo dnf install "./Mikui - Kafka UI-<version>-1.x86_64.rpm"   # Fedora
   ```
   These packages need a fairly recent `webkit2gtk` (the `4.1` series, i.e.
   Ubuntu 22.04+/Debian 12+ or equivalent); older distros only ship
   `webkit2gtk-4.0` and won't satisfy the dependency.
 - **`.AppImage`** — make it executable, then run it directly:
   ```sh
-  chmod +x mikui_<version>_amd64.AppImage
-  ./mikui_<version>_amd64.AppImage
+  chmod +x "Mikui - Kafka UI_<version>_amd64.AppImage"
+  "./Mikui - Kafka UI_<version>_amd64.AppImage"
   ```
   Recent distros (Ubuntu 22.04+ and others) don't ship `libfuse2` by default,
   which AppImage needs to mount itself. If you get a FUSE error, either
