@@ -31,17 +31,24 @@ import { HeaderDesktop } from './kafka';
 import { TopicsPanel } from './kafka';
 import { MessagesPanel } from './kafka';
 import { StatusBar } from './kafka/StatusBar';
+// Эти два окна лежат в стартовом куске бандла: первое — то, ради чего
+// приложение открывают, второе — вместе с ним на пути холодного старта по
+// ссылке. Остальные приезжают своими кусками (см. `kafka/lazy`).
 import { MessageDetailsModal } from './kafka';
-import { TopicConfigModal } from './kafka';
-import { TopicInfoModal } from './kafka';
-import { ClusterConfigModal } from './kafka';
-import { ClusterArchiveModal } from './kafka/modals/ClusterArchiveModal';
-import { ClusterUsersModal } from './kafka/modals/ClusterUsersModal';
-import { FavoritesModal } from './kafka';
-import { SavedMessageModal } from './kafka';
-import { ShareLinkModal } from './kafka';
 import { OpenLinkModal } from './kafka';
-import { ProduceMessageModal } from './kafka/modals/ProduceMessageModal';
+import {
+  ClusterArchiveModal,
+  ClusterConfigModal,
+  ClusterUsersModal,
+  Deferred,
+  FavoritesModal,
+  ProduceMessageModal,
+  SavedMessageModal,
+  ShareLinkModal,
+  TopicConfigModal,
+  TopicInfoModal,
+  usePreloadModals,
+} from './kafka/lazy';
 import { useMessageWindow } from './kafka/useMessageWindow';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -353,6 +360,10 @@ export function KafkaExplorerPortfolio() {
       .catch((e) => console.error('Failed to check the panic log', e));
   }, []);
 
+  // Куски с кодом окон — когда движку нечем заняться. Стоит после стартовых
+  // запросов нарочно: они уже в полёте, и разбор чужого кода не должен
+  // конкурировать с первой отрисовкой.
+  usePreloadModals();
 
   const partitionsKey = selectedPartitions ? selectedPartitions.join(',') : 'all';
   const rangeKey = `${readMode}:${range.from_offset}:${range.to_offset}:${range.from_timestamp}:${range.to_timestamp}`;
@@ -1612,24 +1623,26 @@ export function KafkaExplorerPortfolio() {
 
       {/* Ссылка на открытое сообщение — поверх его окна: делятся, не закрывая
           того, чем делятся. */}
-      <ShareLinkModal
-        url={shareLink}
-        open={isShareOpen}
-        onOpenChange={setIsShareOpen}
-        description={
-          selectedTopic && selectedMessage ? (
-            <>
-              <span className="text-dim">{connectedName ?? 'unnamed cluster'}</span>
-              <span className="text-dim"> / </span>
-              <span className="text-brand">{selectedTopic.name}</span>
-              <span className="text-dim">
-                {' '}
-                · partition {selectedMessage.partition} · offset {selectedMessage.offset}
-              </span>
-            </>
-          ) : undefined
-        }
-      />
+      <Deferred open={isShareOpen}>
+        <ShareLinkModal
+          url={shareLink}
+          open={isShareOpen}
+          onOpenChange={setIsShareOpen}
+          description={
+            selectedTopic && selectedMessage ? (
+              <>
+                <span className="text-dim">{connectedName ?? 'unnamed cluster'}</span>
+                <span className="text-dim"> / </span>
+                <span className="text-brand">{selectedTopic.name}</span>
+                <span className="text-dim">
+                  {' '}
+                  · partition {selectedMessage.partition} · offset {selectedMessage.offset}
+                </span>
+              </>
+            ) : undefined
+          }
+        />
+      </Deferred>
 
       {/* Переход по ссылке. Не под условием подключения: по ссылке приходят с
           пустого приложения чаще, чем с открытого топика. */}
@@ -1646,112 +1659,128 @@ export function KafkaExplorerPortfolio() {
       {/* Сохранённое сообщение — в своём окне: у него другое происхождение и
           другой формат тела, а топика, из которого оно взято, может не быть
           открытым вовсе. */}
-      <SavedMessageModal
-        favorite={savedFavorite}
-        message={savedMessage}
-        open={isSavedModalOpen}
-        onOpenChange={setIsSavedModalOpen}
-      />
+      <Deferred open={isSavedModalOpen}>
+        <SavedMessageModal
+          favorite={savedFavorite}
+          message={savedMessage}
+          open={isSavedModalOpen}
+          onOpenChange={setIsSavedModalOpen}
+        />
+      </Deferred>
 
       {/* Схема — та же, что применена к открытому топику: форма отправки
           предлагает те же типы, которыми таблица прямо сейчас читает, и
           второй раз ходить за ней на диск незачем. */}
-      <ProduceMessageModal
-        topic={selectedTopic}
-        cluster={schemaCluster}
-        schema={openSchema}
-        open={isProduceModalOpen}
-        onOpenChange={setIsProduceModalOpen}
-      />
+      <Deferred open={isProduceModalOpen}>
+        <ProduceMessageModal
+          topic={selectedTopic}
+          cluster={schemaCluster}
+          schema={openSchema}
+          open={isProduceModalOpen}
+          onOpenChange={setIsProduceModalOpen}
+        />
+      </Deferred>
 
       {/* Библиотеки наборов .proto здесь больше нет: окно переехало внутрь
           настроек топика, откуда его и открывают. Перечитать схему после правок
           в ней — тоже забота настроек: там это делается полностью, с новым
           списком контрактов, а не одним лишь перезапуском декодера. */}
-      <TopicConfigModal
-        topic={configTopic}
-        cluster={schemaCluster}
-        openTopic={selectedTopic?.name ?? null}
-        // Схема открытого топика — чтобы у него настройки открывались сразу
-        // настроенными, без секунд ожидания с формой прошлого формата. Окно
-        // сверяет её с именем топика и кластера само, так что прежняя схема,
-        // лежащая здесь между выбором топика и ответом, не посеется.
-        openTopicSchema={openSchema}
-        open={isConfigModalOpen}
-        onOpenChange={setIsConfigModalOpen}
-        onSchemaChanged={handleSchemaChanged}
-      />
+      <Deferred open={isConfigModalOpen}>
+        <TopicConfigModal
+          topic={configTopic}
+          cluster={schemaCluster}
+          openTopic={selectedTopic?.name ?? null}
+          // Схема открытого топика — чтобы у него настройки открывались сразу
+          // настроенными, без секунд ожидания с формой прошлого формата. Окно
+          // сверяет её с именем топика и кластера само, так что прежняя схема,
+          // лежащая здесь между выбором топика и ответом, не посеется.
+          openTopicSchema={openSchema}
+          open={isConfigModalOpen}
+          onOpenChange={setIsConfigModalOpen}
+          onSchemaChanged={handleSchemaChanged}
+        />
+      </Deferred>
 
-      <TopicInfoModal
-        topic={infoTopic}
-        open={isTopicInfoOpen}
-        onOpenChange={setIsTopicInfoOpen}
-      />
+      <Deferred open={isTopicInfoOpen}>
+        <TopicInfoModal
+          topic={infoTopic}
+          open={isTopicInfoOpen}
+          onOpenChange={setIsTopicInfoOpen}
+        />
+      </Deferred>
 
-      <ClusterArchiveModal
-        open={isClusterArchiveModalOpen}
-        onOpenChange={setIsClusterArchiveModalOpen}
-        clusters={clusters}
-        connectedClusterId={connectedClusterId}
-        onDeleteCluster={handleDeleteCluster}
-        onCreateNew={handleCreateNewCluster}
-        onEditCluster={handleEditCluster}
-        onConnectToCluster={handleConnectToCluster}
-        onDisconnect={() => {
-          disconnect().then(() => toast.info('Disconnected'));
-        }}
-      />
+      <Deferred open={isClusterArchiveModalOpen}>
+        <ClusterArchiveModal
+          open={isClusterArchiveModalOpen}
+          onOpenChange={setIsClusterArchiveModalOpen}
+          clusters={clusters}
+          connectedClusterId={connectedClusterId}
+          onDeleteCluster={handleDeleteCluster}
+          onCreateNew={handleCreateNewCluster}
+          onEditCluster={handleEditCluster}
+          onConnectToCluster={handleConnectToCluster}
+          onDisconnect={() => {
+            disconnect().then(() => toast.info('Disconnected'));
+          }}
+        />
+      </Deferred>
 
-      <ClusterConfigModal
-        open={isClusterConfigModalOpen}
-        onOpenChange={setIsClusterConfigModalOpen}
-        cluster={selectedCluster}
-        mode={clusterConfigMode}
-        onBack={handleBackToArchive}
-        onSaved={handleClusterSaved}
-        onConnect={connect}
-        onManageUsers={(cluster) => handleManageUsers(cluster, true)}
-        isConnected={!!selectedCluster && selectedCluster.id === connectedClusterId}
-        onApply={handleApplyClusterSettings}
-      />
+      <Deferred open={isClusterConfigModalOpen}>
+        <ClusterConfigModal
+          open={isClusterConfigModalOpen}
+          onOpenChange={setIsClusterConfigModalOpen}
+          cluster={selectedCluster}
+          mode={clusterConfigMode}
+          onBack={handleBackToArchive}
+          onSaved={handleClusterSaved}
+          onConnect={connect}
+          onManageUsers={(cluster) => handleManageUsers(cluster, true)}
+          isConnected={!!selectedCluster && selectedCluster.id === connectedClusterId}
+          onApply={handleApplyClusterSettings}
+        />
+      </Deferred>
 
-      <ClusterUsersModal
-        open={isClusterUsersModalOpen}
-        onOpenChange={setIsClusterUsersModalOpen}
-        cluster={usersModalCluster}
-        activeUserId={usersModalClusterId === connectedClusterId ? connectedUserId : null}
-        onChanged={handleClusterSaved}
-        // Правка учётки, под которой мы сейчас подключены, — это смена
-        // действующих кредов. Прежнее соединение при этом рвётся безусловно,
-        // даже если новый пароль неверен: иначе чтение продолжало бы работать
-        // по паролю, которого больше нет, и смена пароля выглядела бы фикцией.
-        onReconnect={(user) => connectAsUser(user, { replace: true })}
-        // Удалили учётку, на которой держалось подключение: сеанс аутентифицирован
-        // паролем, которого больше нет, и оставлять его работающим — та же
-        // фикция, что была со сменой пароля.
-        onDisconnect={() => {
-          disconnect().then(() => toast.info('Disconnected: the active user was deleted'));
-        }}
-        // Из настроек кластера сюда приходят через кнопку — значит есть куда
-        // вернуться. Из шапки списком заведуют напрямую, и кнопки нет.
-        onBack={
-          usersModalFromConfig
-            ? () => {
-                setIsClusterUsersModalOpen(false);
-                setIsClusterConfigModalOpen(true);
-              }
-            : undefined
-        }
-      />
+      <Deferred open={isClusterUsersModalOpen}>
+        <ClusterUsersModal
+          open={isClusterUsersModalOpen}
+          onOpenChange={setIsClusterUsersModalOpen}
+          cluster={usersModalCluster}
+          activeUserId={usersModalClusterId === connectedClusterId ? connectedUserId : null}
+          onChanged={handleClusterSaved}
+          // Правка учётки, под которой мы сейчас подключены, — это смена
+          // действующих кредов. Прежнее соединение при этом рвётся безусловно,
+          // даже если новый пароль неверен: иначе чтение продолжало бы работать
+          // по паролю, которого больше нет, и смена пароля выглядела бы фикцией.
+          onReconnect={(user) => connectAsUser(user, { replace: true })}
+          // Удалили учётку, на которой держалось подключение: сеанс аутентифицирован
+          // паролем, которого больше нет, и оставлять его работающим — та же
+          // фикция, что была со сменой пароля.
+          onDisconnect={() => {
+            disconnect().then(() => toast.info('Disconnected: the active user was deleted'));
+          }}
+          // Из настроек кластера сюда приходят через кнопку — значит есть куда
+          // вернуться. Из шапки списком заведуют напрямую, и кнопки нет.
+          onBack={
+            usersModalFromConfig
+              ? () => {
+                  setIsClusterUsersModalOpen(false);
+                  setIsClusterConfigModalOpen(true);
+                }
+              : undefined
+          }
+        />
+      </Deferred>
 
-      <FavoritesModal
-        favorites={favorites}
-        open={isFavoritesModalOpen}
-        onOpenChange={setIsFavoritesModalOpen}
-        onRemoveFavorite={handleRemoveFavorite}
-        onClearFavorites={handleClearFavorites}
-        onSelectMessage={handleOpenFavorite}
-      />
+      <Deferred open={isFavoritesModalOpen}>
+        <FavoritesModal
+          favorites={favorites}
+          open={isFavoritesModalOpen}
+          onOpenChange={setIsFavoritesModalOpen}
+          onRemoveFavorite={handleRemoveFavorite}
+          onClearFavorites={handleClearFavorites}
+          onSelectMessage={handleOpenFavorite}
+        />
+      </Deferred>
     </div>
   );
 }
